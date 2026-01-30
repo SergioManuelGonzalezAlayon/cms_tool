@@ -1,5 +1,6 @@
 import pytest
 import logging
+from time import sleep
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
 
@@ -14,9 +15,25 @@ def BLEDut():
         SerialConnector("COM4"),
         BGAPI_SDK_PATH)
 
-    if dev.open() is None:
-        yield dev
-        
+    dev.open()
+    dev.bt.system.reset(0)
+    sleep(0.5)
+
+    checkBLEDev(dev)
+
+    yield dev
+    dev.close()
+
+@pytest.fixture
+def BLETester():
+    res = dev = BGLib(
+        SerialConnector("COM5"),
+        BGAPI_SDK_PATH)
+    
+    dev.open()
+    dev.bt.system.reset(0)
+    checkBLEDev(dev)
+    yield dev
     dev.close()
 
 @pytest.fixture
@@ -24,18 +41,45 @@ def StartAdv(BLEDut):
     rsp = BLEDut.bt.advertiser.create_set()
     assert rsp
 
-def test_bgapi(BLEDut):
-    log.info("Testing serial connection")
-    rsp = BLEDut.bt.system.hello()
-
-    if rsp is not None:
-        log.info(f"RSP: {rsp}")
+def checkBLEDev(dev):
+    if dev is not None:
+        rsp = dev.bt.system.hello()
+        if rsp is not None:
+            log.info(f"RSP: {rsp}")
 
     assert rsp is not None
 
+def test_bgapi(BLEDut,
+               BLETester):
+    log.info("Testing serial connection")
+    checkBLEDev(BLEDut)
+    checkBLEDev(BLETester)
+
+advertiser_configuration = {
+    "set" : 0,
+    "min_interval" : 100,
+    "max_interval" : 250,
+}
+
+def advertiser_configure(dev,
+                         advertiser_configuration):
+    log.info("Configuring DUT Advertiser")
+    rsp = dev.bt.advertiser.create_set()
+    advertiser_configuration["set"] = rsp.handle
+    assert rsp.result == 0
+
+    rsp = dev.bt.advertiser.set_timing(advertiser_configuration["set"],
+                                       advertiser_configuration["min_interval"],
+                                       advertiser_configuration["max_interval"],
+                                       0,
+                                       0)
+    assert rsp.result == 0
+    log.info("DUT Advertiser configured")
+
 # TODO - Beacon/Non-Connectable Advertising test
 def test_beacon(BLEDut):
-    assert 1 == 0
+    advertiser_configure(BLEDut,
+                         advertiser_configuration)
 
 # TODO - Connectable Advertising - Central
 def test_connAdv_central(BLEDut):
