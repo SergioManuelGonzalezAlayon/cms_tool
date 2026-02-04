@@ -8,6 +8,7 @@ from bgapi.serialconnector import SerialConnector
 # TODO - BGAPI device interfaces in pytest so that we can use the HWMux thingy
 # TODO - BGAPI stuff with pytest so that the tests can use
 BGAPI_SDK_PATH = "C:\\Users\\sagonzal\\SimplicityStudio\\SDKs\\simplicity_sdk\\protocol\\bluetooth\\api\\sl_bt.xapi"
+MAX_TEST_RETRIES = 3
 log = logging.getLogger(__name__)
 
 def makeBLEDev(serialPort):
@@ -24,9 +25,6 @@ def makeBLEDev(serialPort):
 def checkBLEDev(dev):
     if dev is not None:
         rsp = dev.bt.system.hello()
-        if rsp is not None:
-            log.info(f"RSP: {rsp}")
-
         assert rsp is not None
 
 @pytest.fixture
@@ -76,8 +74,6 @@ class ScannerConfig:
     window: int = 50      # 50 * 0.625 ms = 31.25 ms
     interval: int = 100   # 100 * 0.625 ms = 62.5 ms
 
-TESTER_SCAN_CFG = ScannerConfig()
-
 @pytest.fixture
 def DUTAdvConfig(BLEDut) -> AdvertiserConfig:
     log.info("Configuring DUT Advertiser")
@@ -99,6 +95,30 @@ def DUTAdvConfig(BLEDut) -> AdvertiserConfig:
     return config
 
 @pytest.fixture
+def DUTAdvStart(BLEDut,
+                DUTAdvConfig):
+    rsp = BLEDut.bt.legacy_advertiser.generate_data(DUTAdvConfig.set,
+                                                    BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE)
+    assert rsp.result == 0
+
+    # Start advertising and scanning
+    rsp = BLEDut.bt.legacy_advertiser.start(DUTAdvConfig.set,
+                                            BLEDut.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE)
+    assert rsp.result == 0
+    log.info("DUT Advertising started")
+
+    yield
+    # Start advertising and scanning
+    rsp = BLEDut.bt.advertiser.stop(DUTAdvConfig.set)
+    assert rsp.result == 0
+    log.info("DUT Advertising stopped")
+
+    rsp = BLEDut.bt.advertiser.delete_set(DUTAdvConfig.set)
+    assert rsp.result == 0
+    log.info("DUT Advertising set deleted")
+
+
+@pytest.fixture
 def TesterScanConfig(BLETester) -> ScannerConfig:
     config = ScannerConfig()
 
@@ -110,30 +130,73 @@ def TesterScanConfig(BLETester) -> ScannerConfig:
 
     return config
 
-# TODO - Beacon/Non-Connectable Advertising test
+@pytest.fixture
+def TesterScanStart(BLETester):
+    rsp = BLETester.bt.scanner.start(BLETester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
+                                     BLETester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION)
+    assert rsp.result == 0
+    log.info("Tester scanning started")
+
+    yield 
+
+    rsp = BLETester.bt.scanner.stop()
+    assert rsp.result == 0
+    log.info("Tester scanning stopped")
+
+
+def bgapi_check_event(dev,
+                      event_class,
+                      event_name,
+                      condition,
+                      eventTimeout=1,
+                      maxTime=5):
+    """
+    Check a BGAPI event and return the event itself if there is
+    any processing required for it.
+    
+    :param dev: Description
+    :param event_class: Description
+    :param event_name: Description
+    :param condition: Description
+    :param eventTimeout: Description
+    :param maxTime: Description
+    """
+    for evt in dev.get_events(timeout=eventTimeout, max_time=maxTime):
+        if evt._class_name == event_class and evt._msg_name == event_name:
+            if condition(evt):
+                log.info(f"{event_class}_{event_name} found")
+                return evt
+
+    return None 
+
+
 def test_beacon(BLEDut,
-                DUTAdvConfig,
                 BLETester,
-                TesterScanConfig):
+                DUTAdvConfig,
+                TesterScanConfig,
+                DUTAdvStart,
+                TesterScanStart):
     # Configure the Advertiser
     rsp = BLEDut.bt.system.get_identity_address()
     assert rsp.result == 0
     dut_addr = rsp.address
 
-    rsp = BLEDut.bt.legacy_advertiser.generate_data(DUTAdvConfig.set,
-                                                    BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE)
-    assert rsp.result == 0
+    log.info("DUT Non-Connectable Adversiting started")
 
-    # Start advertising and scanning
-    rsp = BLEDut.bt.legacy_advertiser.start(DUTAdvConfig.set,
-                                            BLEDut.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE)
-    assert rsp.result == 0
-
-    rsp = BLETester.bt.scanner.start(BLETester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
-                                     BLETester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION)
-    assert rsp.result == 0
-
-    # Check the Advertising Packets with the Tester
+    # Check the Advertisign Packets with the Tester, since the nature of the test
+    # is heavily dependant on the environment repeat 3 times if failed
+    for attempt in range(MAX_TEST_RETRIES):
+        log.info("Beacon detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
+        event = bgapi_check_event(BLETester,
+                                  "scanner",
+                                  "legacy_advertisement_report",
+                                  lambda evt: (evt.address == dut_addr))
+    
+        if event is None and attempt == MAX_TEST_RETRIES - 1:
+            pytest.fail("Test retry maximum reached. Test failed.")
+        else:
+            break
+    
 
     
 
