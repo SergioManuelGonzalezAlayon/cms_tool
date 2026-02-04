@@ -4,10 +4,11 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-bgapi = "*"
 numpy = "*"
 matplotlib = "*"
 pyjoulescope-driver = "*"
+pytest = "*"
+pybgapi = "*"
 
 [dev-packages]
 
