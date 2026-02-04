@@ -1,5 +1,6 @@
 import pytest
 import logging
+from dataclasses import dataclass
 from time import sleep
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
@@ -58,35 +59,83 @@ def test_bgapi(BLEDut,
     checkBLEDev(BLEDut)
     checkBLEDev(BLETester)
 
-advertiser_configuration = {
-    "set" : 0,
-    "min_interval" : 100,
-    "max_interval" : 250,
-    "payload" : 20,
-}
+from dataclasses import dataclass
 
-def advertiser_configure(dev,
-                         advertiser_configuration):
+@dataclass
+class AdvertiserConfig:
+    set: int = -1
+    min_interval: int = 100
+    max_interval: int = 250
+    payload: int = 20
+    duration: int = 0               # Default value : no duration limit
+    max_events: int = 0             # Default value : no event limit
+
+
+@dataclass
+class ScannerConfig:
+    window: int = 50      # 50 * 0.625 ms = 31.25 ms
+    interval: int = 100   # 100 * 0.625 ms = 62.5 ms
+
+TESTER_SCAN_CFG = ScannerConfig()
+
+@pytest.fixture
+def DUTAdvConfig(BLEDut) -> AdvertiserConfig:
     log.info("Configuring DUT Advertiser")
-    rsp = dev.bt.advertiser.create_set()
-    advertiser_configuration["set"] = rsp.handle
+
+    config = AdvertiserConfig()
+
+    rsp = BLEDut.bt.advertiser.create_set()
+    config.set = rsp.handle
     assert rsp.result == 0
 
-    rsp = dev.bt.advertiser.set_timing(advertiser_configuration["set"],
-                                       advertiser_configuration["min_interval"],
-                                       advertiser_configuration["max_interval"],
-                                       0,
-                                       0)
+    rsp = BLEDut.bt.advertiser.set_timing(config.set,
+                                          config.min_interval,
+                                          config.max_interval,
+                                          config.duration,
+                                          config.max_events)
     assert rsp.result == 0
     log.info("DUT Advertiser configured")    
 
-# TODO - Beacon/Non-Connectable Advertising test
-def test_beacon(BLEDut):
-    advertiser_configure(BLEDut,
-                         advertiser_configuration)
+    return config
 
-    rsp = BLEDut.bt.legacy_advertiser.generate_data(advertiser_configuration["payload"])
-    log.info(f"Data is {rsp}")
+@pytest.fixture
+def TesterScanConfig(BLETester) -> ScannerConfig:
+    config = ScannerConfig()
+
+    # Configure the scanner
+    rsp = BLETester.bt.scanner.set_parameters(BLETester.bt.scanner.SCAN_MODE_SCAN_MODE_PASSIVE,
+                                            config.interval,
+                                            config.window)
+    assert rsp.result == 0 
+
+    return config
+
+# TODO - Beacon/Non-Connectable Advertising test
+def test_beacon(BLEDut,
+                DUTAdvConfig,
+                BLETester,
+                TesterScanConfig):
+    # Configure the Advertiser
+    rsp = BLEDut.bt.system.get_identity_address()
+    assert rsp.result == 0
+    dut_addr = rsp.address
+
+    rsp = BLEDut.bt.legacy_advertiser.generate_data(DUTAdvConfig.set,
+                                                    BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE)
+    assert rsp.result == 0
+
+    # Start advertising and scanning
+    rsp = BLEDut.bt.legacy_advertiser.start(DUTAdvConfig.set,
+                                            BLEDut.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE)
+    assert rsp.result == 0
+
+    rsp = BLETester.bt.scanner.start(BLETester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
+                                     BLETester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION)
+    assert rsp.result == 0
+
+    # Check the Advertising Packets with the Tester
+
+    
 
 # TODO - Connectable Advertising - Central
 def test_connAdv_central(BLEDut):
