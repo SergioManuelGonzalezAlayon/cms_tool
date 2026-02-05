@@ -141,6 +141,56 @@ def TesterScanConfig(BLETester) -> ScannerConfig:
     return config
 
 @pytest.fixture
+def TesterAdvConfig(BLETester) -> AdvertiserConfig:
+    log.info("Configuring Tester Advertiser")
+
+    config = AdvertiserConfig()
+
+    rsp = BLETester.bt.advertiser.create_set()
+    config.set = rsp.handle
+    assert rsp.result == 0
+
+    rsp = BLETester.bt.advertiser.set_timing(config.set,
+                                             config.min_interval,
+                                             config.max_interval,
+                                             config.duration,
+                                             config.max_events)
+    assert rsp.result == 0
+    log.info("Tester Advertiser configured")
+
+    return config
+
+@pytest.fixture
+def TesterAdvStart(BLETester,
+                   TesterAdvConfig):
+    started = False
+
+    def start(*, discover_mode, connectable_mode):
+        nonlocal started
+        rsp = BLETester.bt.legacy_advertiser.generate_data(TesterAdvConfig.set, discover_mode)
+        assert rsp.result == 0
+
+        rsp = BLETester.bt.legacy_advertiser.start(TesterAdvConfig.set, connectable_mode)
+        assert rsp.result == 0
+        log.info("Tester Advertising started")
+        started = True
+
+    yield start
+
+    if started:
+        try:
+            rsp = BLETester.bt.advertiser.stop(TesterAdvConfig.set)
+            assert rsp.result == 0
+            log.info("Tester Advertising stopped")
+        finally:
+            rsp = BLETester.bt.advertiser.delete_set(TesterAdvConfig.set)
+            assert rsp.result == 0
+            log.info("Tester Advertising set deleted")
+    else:
+        rsp = BLETester.bt.advertiser.delete_set(TesterAdvConfig.set)
+        assert rsp.result == 0
+
+@pytest.fixture
 def TesterScanStart(BLETester):
     rsp = BLETester.bt.scanner.start(BLETester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
                                      BLETester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION)
@@ -221,8 +271,67 @@ def test_beacon(BLEDut,
 
 
 # TODO - Connectable Advertising - Central
-def test_connAdv_central(BLEDut):
-    assert 1 == 0
+def test_connAdv_central(BLEDut,
+                         BLETester,
+                         TesterAdvStart):
+    TesterAdvStart(
+        discover_mode=BLETester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
+        connectable_mode=BLETester.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+    )
+
+    dut_addr = get_device_addr(BLEDut)
+    tester_addr = get_device_addr(BLETester)
+
+    BLEDut.bt.connection.open(
+        tester_addr,
+        BLEDut.bt.gap.ADDRESS_TYPE_PUBLIC_ADDRESS,
+        BLEDut.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
+    )
+
+    dut_conn_evt = bgapi_check_event(
+        BLEDut,
+        "connection",
+        "opened",
+        lambda evt: evt.address == tester_addr,
+        eventTimeout=1,
+        maxTime=10,
+    )
+    assert dut_conn_evt.connection != 0
+
+    tester_conn_evt = bgapi_check_event(
+        BLETester,
+        "connection",
+        "opened",
+        lambda evt: evt.address == dut_addr,
+        eventTimeout=1,
+        maxTime=10,
+    )
+    assert tester_conn_evt.connection != 0
+
+    # Sleep for 500ms to allow the connection for the idle state
+    sleep(0.5)
+
+    BLEDut.bt.connection.close(dut_conn_evt.connection)
+
+    conn_closed_evt = bgapi_check_event(
+        BLEDut,
+        "connection",
+        "closed",
+        lambda evt: evt.connection == dut_conn_evt.connection,
+        eventTimeout=1,
+        maxTime=10
+    )
+    assert conn_closed_evt is not None
+
+    conn_closed_evt = bgapi_check_event(
+        BLETester,
+        "connection",
+        "closed",
+        lambda evt: evt.connection == tester_conn_evt.connection,
+        eventTimeout=1,
+        maxTime=10
+    )
+    assert conn_closed_evt is not None
 
 # TODO - Connectable Advertising - Peripheral
 def test_connAdv_peripheral(BLEDut,
