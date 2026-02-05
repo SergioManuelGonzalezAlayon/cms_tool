@@ -45,12 +45,6 @@ def BLETester():
 
     dev.close()
 
-@pytest.fixture
-def StartAdv(BLEDut):
-    rsp = BLEDut.bt.advertiser.create_set()
-    assert rsp
-
-
 def test_bgapi(BLEDut,
                BLETester):
     log.info("Testing serial connection")
@@ -72,6 +66,12 @@ class AdvertiserConfig:
 class ScannerConfig:
     window: int = 50      # 50 * 0.625 ms = 31.25 ms
     interval: int = 100   # 100 * 0.625 ms = 62.5 ms
+
+@dataclass
+class ConnectionParameters:
+    min_interval : int = 100
+    max_interval : int = 250
+    # TODO - Fill all the Connection Parameters for the dataclass
 
 @pytest.fixture
 def DUTAdvConfig(BLEDut) -> AdvertiserConfig:
@@ -218,15 +218,72 @@ def test_beacon(BLEDut,
             pytest.fail("Test retry maximum reached. Test failed.")
         else:
             break
-    
 
-    
 
 # TODO - Connectable Advertising - Central
 def test_connAdv_central(BLEDut):
     assert 1 == 0
 
 # TODO - Connectable Advertising - Peripheral
+def test_connAdv_peripheral(BLEDut,
+                            BLETester,
+                            DUTAdvStart):
+    DUTAdvStart(
+        discover_mode=BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
+        connectable_mode=BLEDut.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+    )
+
+    dut_addr = get_device_addr(BLEDut)
+    tester_addr = get_device_addr(BLETester)
+
+    rsp = BLETester.bt.connection.open(
+        dut_addr,
+        BLETester.bt.gap.ADDRESS_TYPE_PUBLIC_ADDRESS,
+        BLETester.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
+    )
+
+    tester_conn_evt = bgapi_check_event(BLETester,
+                                 "connection",
+                                 "opened",
+                                 lambda evt: evt.address == dut_addr,
+                                 eventTimeout=1,
+                                 maxTime=10,
+                                 )
+    assert tester_conn_evt.connection != 0
+
+    dut_conn_evt = bgapi_check_event(BLEDut,
+                                 "connection",
+                                 "opened",
+                                 lambda evt: evt.address == tester_addr,
+                                 eventTimeout=1,
+                                 maxTime=10,
+                                 )
+    assert dut_conn_evt.connection != 0
+
+    # Sleep for 500ms to allow the connection for the idle state
+    sleep(0.5)
+
+    rsp = BLETester.bt.connection.close(tester_conn_evt.connection)
+
+    conn_closed_evt = bgapi_check_event(
+        BLETester,
+        "connection",
+        "closed",
+        lambda evt: evt.connection == tester_conn_evt.connection,
+        eventTimeout=1,
+        maxTime=10
+    )
+    assert conn_closed_evt is not None
+
+    conn_closed_evt = bgapi_check_event(
+        BLEDut,
+        "connection",
+        "closed",
+        lambda evt: evt.connection == dut_conn_evt.connection,
+        eventTimeout=1,
+        maxTime=10
+    )
+    assert conn_closed_evt is not None
 
 # TODO - Scanning
 def test_scanner(BLEDut):
