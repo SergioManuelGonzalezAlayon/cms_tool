@@ -68,7 +68,6 @@ class AdvertiserConfig:
     duration: int = 0               # Default value : no duration limit
     max_events: int = 0             # Default value : no event limit
 
-
 @dataclass
 class ScannerConfig:
     window: int = 50      # 50 * 0.625 ms = 31.25 ms
@@ -97,25 +96,36 @@ def DUTAdvConfig(BLEDut) -> AdvertiserConfig:
 @pytest.fixture
 def DUTAdvStart(BLEDut,
                 DUTAdvConfig):
-    rsp = BLEDut.bt.legacy_advertiser.generate_data(DUTAdvConfig.set,
-                                                    BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE)
-    assert rsp.result == 0
+    started = False
 
-    # Start advertising and scanning
-    rsp = BLEDut.bt.legacy_advertiser.start(DUTAdvConfig.set,
-                                            BLEDut.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE)
-    assert rsp.result == 0
-    log.info("DUT Advertising started")
+    def start(*, discover_mode, connectable_mode):
+        nonlocal started
+        rsp = BLEDut.bt.legacy_advertiser.generate_data(DUTAdvConfig.set, discover_mode)
+                                                        # BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE)
+        assert rsp.result == 0
 
-    yield
-    # Start advertising and scanning
-    rsp = BLEDut.bt.advertiser.stop(DUTAdvConfig.set)
-    assert rsp.result == 0
-    log.info("DUT Advertising stopped")
+        # Start advertising and scanning
+        rsp = BLEDut.bt.legacy_advertiser.start(DUTAdvConfig.set, connectable_mode)
+                                                # BLEDut.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE)
+        assert rsp.result == 0
+        log.info("DUT Advertising started")
+        started = True
 
-    rsp = BLEDut.bt.advertiser.delete_set(DUTAdvConfig.set)
-    assert rsp.result == 0
-    log.info("DUT Advertising set deleted")
+    yield start
+
+    if started:
+        try:
+            rsp = BLEDut.bt.advertiser.stop(DUTAdvConfig.set)
+            assert rsp.result == 0
+            log.info("DUT Advertising stopped")
+        finally:
+            rsp = BLEDut.bt.advertiser.delete_set(DUTAdvConfig.set)
+            assert rsp.result == 0
+            log.info("DUT Advertising set deleted")
+    else:
+        # even if never started, still delete the set
+        rsp = BLEDut.bt.advertiser.delete_set(DUTAdvConfig.set)
+        assert rsp.result == 0
 
 
 @pytest.fixture
@@ -143,12 +153,20 @@ def TesterScanStart(BLETester):
     assert rsp.result == 0
     log.info("Tester scanning stopped")
 
+@pytest.fixture
+def TesterOpenConnection(BLETester):
+    connHandle = -1
+    # Open connection with DUT
+
+    yield connHandle
+
+    # Close connection with DUT
 
 def bgapi_check_event(dev,
                       event_class,
                       event_name,
                       condition,
-                      eventTimeout=1,
+                      eventTimeout=0,
                       maxTime=5):
     """
     Check a BGAPI event and return the event itself if there is
@@ -169,6 +187,10 @@ def bgapi_check_event(dev,
 
     return None 
 
+def get_device_addr(dev):
+    rsp = dev.bt.system.get_identity_address()
+    assert rsp.result == 0
+    return rsp.address
 
 def test_beacon(BLEDut,
                 BLETester,
@@ -176,14 +198,14 @@ def test_beacon(BLEDut,
                 TesterScanConfig,
                 DUTAdvStart,
                 TesterScanStart):
-    # Configure the Advertiser
-    rsp = BLEDut.bt.system.get_identity_address()
-    assert rsp.result == 0
-    dut_addr = rsp.address
+    DUTAdvStart(
+        discover_mode=BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
+        connectable_mode=BLEDut.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
+    )
 
-    log.info("DUT Non-Connectable Adversiting started")
+    dut_addr = get_device_addr(BLEDut)
 
-    # Check the Advertisign Packets with the Tester, since the nature of the test
+    # Check the Advertising Packets with the Tester, since the nature of the test
     # is heavily dependant on the environment repeat 3 times if failed
     for attempt in range(MAX_TEST_RETRIES):
         log.info("Beacon detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
@@ -205,8 +227,6 @@ def test_connAdv_central(BLEDut):
     assert 1 == 0
 
 # TODO - Connectable Advertising - Peripheral
-def test_connAdv_peripheral(BLEDut):
-    assert 1 == 0
 
 # TODO - Scanning
 def test_scanner(BLEDut):
