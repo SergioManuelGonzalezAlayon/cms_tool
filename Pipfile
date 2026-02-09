@@ -8,7 +8,9 @@ numpy = "*"
 matplotlib = "*"
 pyjoulescope-driver = "*"
 pytest = "*"
+pyserial = "*"
 pybgapi = "*"
+current-measurement = {path = ".", editable = true}
 
 [dev-packages]
 
