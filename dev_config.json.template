@@ -1,0 +1,13 @@
+{
+  "Joulescope": {
+    "serial_port": "scope"
+  },
+  "dut": {
+    "serial_port": "dut",
+    "baudrate": 115200
+  },
+  "tester": {
+    "serial_port": "tester",
+    "baudrate": 115200
+  }
+}

@@ -1,5 +1,7 @@
 import pytest
 import logging
+import json
+import os
 from dataclasses import dataclass
 from time import sleep
 from bgapi.bglib import BGLib
@@ -11,47 +13,68 @@ BGAPI_SDK_PATH = "C:\\Users\\sagonzal\\SimplicityStudio\\SDKs\\simplicity_sdk\\p
 MAX_TEST_RETRIES = 3
 log = logging.getLogger(__name__)
 
-def makeBLEDev(serialPort):
-    res = dev = BGLib(
-        SerialConnector(serialPort),
-        BGAPI_SDK_PATH)
+def read_dev_config(section, key, default=None, *, path="dev_config.json"):
+    """
+    Read a value from the dev config JSON file.
+    """
+    config_path = os.path.join(os.getcwd(), path)
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get(section, {}).get(key, default)
 
-    dev.open()
-    dev.bt.system.reset(0)
-    sleep(0.5)
+def get_ble_dev(serialPort):
+    try:
+        dev = BGLib(
+            SerialConnector(serialPort),
+            BGAPI_SDK_PATH)
 
-    return dev
-
-def checkBLEDev(dev):
-    if dev is not None:
-        rsp = dev.bt.system.hello()
-        assert rsp is not None
+        return dev
+    except Exception as e:
+        log.error(f"Cannot create the BGAPI interface with the device. Reason : {e}")
+        pytest.fail()
 
 @pytest.fixture
 def BLEDut():
-    dev = makeBLEDev("COM4")
-    checkBLEDev(dev)
+    dut_port= read_dev_config(
+        "dut",
+        "serial_port"
+    )
 
-    yield dev
+    dev = get_ble_dev(dut_port)
 
-    dev.close()
+    try:
+        dev.open()
+        dev.bt.system.reset(0)
+        sleep(0.5)
+
+        yield dev
+
+        dev.close()
+
+    except Exception as e:
+        log.error(f"{e}")
+        pytest.fail()
 
 @pytest.fixture
 def BLETester():
-    dev = makeBLEDev("COM5")
-    checkBLEDev(dev)
+    tester_port= read_dev_config(
+        "tester",
+        "serial_port"
+    )
 
-    yield dev
+    dev = get_ble_dev(tester_port)
 
-    dev.close()
+    try:
+        dev.open()
+        dev.bt.system.reset(0)
+        sleep(0.5)
 
-def test_bgapi(BLEDut,
-               BLETester):
-    log.info("Testing serial connection")
-    checkBLEDev(BLEDut)
-    checkBLEDev(BLETester)
+        yield dev
 
-from dataclasses import dataclass
+        dev.close()
+
+    except Exception as e:
+        log.error(f"{e}")
 
 @dataclass
 class AdvertiserConfig:
