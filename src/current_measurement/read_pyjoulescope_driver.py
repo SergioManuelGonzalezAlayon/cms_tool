@@ -15,6 +15,10 @@ import numpy as np
 
 SIGNAL_MAP = _signal_name_map()
 
+# Note on driver publish/subscribe:
+# pyjoulescope_driver uses an internal topic bus (like ROS topics, but local to this process).
+# publish(...) sets device controls or enables streams, subscribe(...) registers callbacks for data topics.
+
 class Joulescope:
     """
     The Joulescope class is a Python object for capturing and processing data from Joulescope devices.
@@ -51,59 +55,88 @@ class Joulescope:
         self.verbose = verbose
         self.irange = irange
         self.retval = None
+        self.driver = None
+        self.capture_data = None
 
     def _verbose(self, msg):
         if self.verbose:
             print(msg)
 
+    def create_driver(self):
+        self.driver = Driver()
+        return self.driver
+
+    def open_devices(self):
+        self.device_paths, self.signals_full = self._open_devices(self.driver)
+
+    def close_driver(self):
+        if self.driver is None:
+            return
+
+        # close devices first
+        for p in getattr(self, "device_paths", []):
+            try:
+                self.driver.close(p)
+            except Exception:
+                pass
+
+        self.driver.finalize()
+        self.driver = None
+
+    def _require_driver(self):
+        if self.driver is None:
+            raise RuntimeError('Driver not initialized')
+
+    def _open_devices(self, jsdrv: Driver):
+        jsdrv.log_level = 'WARNING'
+        device_paths = sorted(jsdrv.device_paths())
+        if self.serial_number is not None:
+            serial_number_suffix = '/' + self.serial_number.lower()
+            device_paths = [p for p in device_paths if p.lower().endswith(serial_number_suffix)]
+        if len(device_paths) == 0:
+            raise RuntimeError('Device not found')
+        signals_full = []
+        device_paths_success = []
+        for device_path in device_paths:
+            jsdrv.open(device_path, mode=self.open_mode)
+            if self.open_mode == 'defaults':
+                if 'js110' in device_path:
+                    jsdrv.publish(f'{device_path}/s/v/range/select', '15 V')
+                elif 'js220' in device_path:
+                    jsdrv.publish(f'{device_path}/s/v/range/mode', 'auto')
+                else:
+                    print(f'Unsupported device {device_path}: ignore')
+                    jsdrv.close(device_path)
+                    continue
+
+            # Set current range
+            if self.irange == 'auto':
+                if 'js110' in device_path:
+                    jsdrv.publish(f'{device_path}/s/i/range/select', 'auto')
+                elif 'js220' in device_path:
+                    jsdrv.publish(f'{device_path}/s/i/range/mode', 'auto')
+            else:
+                if 'js110' in device_path:
+                    jsdrv.publish(f'{device_path}/s/i/range/select', self.irange)
+                elif 'js220' in device_path:
+                    jsdrv.publish(f'{device_path}/s/i/range/mode', 'manual')
+                    jsdrv.publish(f'{device_path}/s/i/range/select', self.irange)
+
+            gpio_list = [0, 1, 2, 3]
+            for gpio_num in gpio_list:
+                if str(gpio_num) in [s.lower() for s in self.signals]:
+                    jsdrv.publish(f'{device_path}/c/gpio/vref', self.vref)
+                    jsdrv.publish(f'{device_path}/s/gpi/{gpio_num}/ctrl', 'on')
+            if self.frequency is not None:
+                jsdrv.publish(f'{device_path}/h/fs', int(self.frequency))
+            signals_full.extend([(device_path, signal) for signal in self.signals])
+            device_paths_success.append(device_path)
+        return device_paths_success, signals_full
+
     def run(self):
         data_list = []
         with Driver() as jsdrv:
-            jsdrv.log_level = 'WARNING'
-            device_paths = sorted(jsdrv.device_paths())
-            if self.serial_number is not None:
-                serial_number_suffix = '/' + self.serial_number.lower()
-                device_paths = [p for p in device_paths if p.lower().endswith(serial_number_suffix)]
-            if len(device_paths) == 0:
-                raise RuntimeError('Device not found')
-            signals_full = []
-            device_paths_success = []
-            for device_path in device_paths:
-                jsdrv.open(device_path, mode=self.open_mode)
-                if self.open_mode == 'defaults':
-                    if 'js110' in device_path:
-                        jsdrv.publish(f'{device_path}/s/v/range/select', '15 V')
-                    elif 'js220' in device_path:
-                        jsdrv.publish(f'{device_path}/s/v/range/mode', 'auto')
-                    else:
-                        print(f'Unsupported device {device_path}: ignore')
-                        jsdrv.close(device_path)
-                        continue
-
-                # Set current range
-                if self.irange == 'auto':
-                    if 'js110' in device_path:
-                        jsdrv.publish(f'{device_path}/s/i/range/select', 'auto')
-                    elif 'js220' in device_path:
-                        jsdrv.publish(f'{device_path}/s/i/range/mode', 'auto')
-                else:
-                    if 'js110' in device_path:
-                        jsdrv.publish(f'{device_path}/s/i/range/select', self.irange)
-                    elif 'js220' in device_path:
-                        jsdrv.publish(f'{device_path}/s/i/range/mode', 'manual')
-                        jsdrv.publish(f'{device_path}/s/i/range/select', self.irange)
-
-
-                gpio_list = [0, 1, 2, 3]
-                for gpio_num in gpio_list:
-                    if str(gpio_num) in [s.lower() for s in self.signals]:
-                        jsdrv.publish(f'{device_path}/c/gpio/vref', self.vref)
-                        jsdrv.publish(f'{device_path}/s/gpi/{gpio_num}/ctrl', 'on')
-                if self.frequency is not None:
-                    jsdrv.publish(f'{device_path}/h/fs', int(self.frequency))
-                signals_full.extend([(device_path, signal) for signal in self.signals])
-                device_paths_success.append(device_path)
-            device_paths = device_paths_success
+            device_paths, signals_full = self._open_devices(jsdrv)
             try:
                 data = self.read(jsdrv, signals_full, duration=self.duration)
                 data_list.append(data)
@@ -123,7 +156,7 @@ class Joulescope:
 
         :param jsdrv: The pyjoulescope_driver.Driver instance.
         :param signals: The list of signals strings given as either
-            signal (presumes only one device connected) or
+            oignal (presumes only one device connected) or
             tuple of (device_prefix, signal).
         :param duration: The capture duration in float seconds.
         :param on_progress: The optional callable(fract) to call with
@@ -267,6 +300,21 @@ class Joulescope:
             signal['close'](utc_range)
 
         return read_state
+    
+    def capture(self, seconds: float, on_progress=None):
+        """
+        Capture for N seconds using the already-initialized driver and already-open devices.
+        Returns the same structure as read(): read_state mapping.
+        """
+        if self.driver is None:
+            raise RuntimeError("Driver not initialized")
+
+        # if you stored this when you opened devices:
+        if not getattr(self, "signals_full", None):
+            raise RuntimeError("signals_full not set; did you open devices first?")
+
+        self.capture_data = self.read(self.driver, self.signals_full, duration=float(seconds), on_progress=on_progress)
+
 
 def verbose(args, msg):
     if args.verbose:
@@ -297,8 +345,9 @@ def post_process_average(args, data):
                        'units': units}
     return retval
 
-def get_profile(args, data):
-    verbose(args, 'Returning the current profile for each channel')
+def get_profile(args, data, is_verbose=False):
+    if is_verbose:
+        verbose(args, 'Returning the current profile for each channel')
 
     retval = dict()
     for key, value in data.items():

@@ -266,7 +266,8 @@ def get_device_addr(dev):
     assert rsp.result == 0
     return rsp.address
 
-def test_beacon(BLEDut,
+def test_beacon(JoulescopeDev,
+                BLEDut,
                 BLETester,
                 DUTAdvConfig,
                 TesterScanConfig,
@@ -292,6 +293,9 @@ def test_beacon(BLEDut,
             pytest.fail("Test retry maximum reached. Test failed.")
         else:
             break
+
+    # Run the capture and store it
+    JoulescopeDev.capture(1.0)
 
 
 # TODO - Connectable Advertising - Central
