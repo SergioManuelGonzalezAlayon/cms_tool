@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from time import sleep
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
+from joulescope_interface import JoulescopeDev
 
 # TODO - BGAPI device interfaces in pytest so that we can use the HWMux thingy
 # TODO - BGAPI stuff with pytest so that the tests can use
