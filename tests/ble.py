@@ -1,4 +1,4 @@
-import pytest
+﻿import pytest
 import logging
 import json
 import os
@@ -7,107 +7,61 @@ from time import sleep
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
 from joulescope_interface import JoulescopeDev
+from utils.bgapi_utils import *
 
 # TODO - BGAPI device interfaces in pytest so that we can use the HWMux thingy
 # TODO - BGAPI stuff with pytest so that the tests can use
-BGAPI_SDK_PATH = "C:\\Users\\sagonzal\\SimplicityStudio\\SDKs\\simplicity_sdk\\protocol\\bluetooth\\api\\sl_bt.xapi"
 MAX_TEST_RETRIES = 3
 log = logging.getLogger(__name__)
 
-def read_dev_config(section, key, default=None, *, path="dev_config.json"):
-    """
-    Read a value from the dev config JSON file.
-    """
-    config_path = os.path.join(os.getcwd(), path)
-    with open(config_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return data.get(section, {}).get(key, default)
+@pytest.fixture
+def BLEDev():
+    created =[]
 
-def get_ble_dev(serialPort):
-    try:
-        dev = BGLib(
-            SerialConnector(serialPort),
-            BGAPI_SDK_PATH)
+    def _create_ble_dev(device : str):
+        port= read_dev_config(device, "serial_port" )
+
+        if port is None:
+            raise RuntimeError("No serial_port found")
+
+        dev = get_ble_dev(port)
+
+        dev.open()
+        dev.bt.system.reset(0)
+        sleep(0.5)
+        
+        created.append((device, port, dev))
 
         return dev
-    except Exception as e:
-        log.error(f"Cannot create the BGAPI interface with the device. Reason : {e}")
-        pytest.fail()
+
+    yield _create_ble_dev
+    
+    for dev_name, dev_port, dev in reversed(created):
+        try:
+            dev.close()
+        except Exception as e:
+            log.exception(f"Failed to close BGAPI connection on:\n{e}")
+            log.exception(f"Device {dev_name} on port {dev_port}.\n")
 
 @pytest.fixture
-def BLEDut():
-    dut_port= read_dev_config(
-        "dut",
-        "serial_port"
-    )
-
-    dev = get_ble_dev(dut_port)
-
-    try:
-        dev.open()
-        dev.bt.system.reset(0)
-        sleep(0.5)
-
-        yield dev
-
-        dev.close()
-
-    except Exception as e:
-        log.error(f"{e}")
-        pytest.fail()
+def DUT(BLEDev):
+    yield BLEDev("dut")
 
 @pytest.fixture
-def BLETester():
-    tester_port= read_dev_config(
-        "tester",
-        "serial_port"
-    )
-
-    dev = get_ble_dev(tester_port)
-
-    try:
-        dev.open()
-        dev.bt.system.reset(0)
-        sleep(0.5)
-
-        yield dev
-
-        dev.close()
-
-    except Exception as e:
-        log.error(f"{e}")
-
-@dataclass
-class AdvertiserConfig:
-    set: int = -1
-    min_interval: int = 100
-    max_interval: int = 250
-    payload: int = 20
-    duration: int = 0               # Default value : no duration limit
-    max_events: int = 0             # Default value : no event limit
-
-@dataclass
-class ScannerConfig:
-    window: int = 50      # 50 * 0.625 ms = 31.25 ms
-    interval: int = 100   # 100 * 0.625 ms = 62.5 ms
-
-@dataclass
-class ConnectionParameters:
-    min_interval : int = 100
-    max_interval : int = 250
-    # TODO - Fill all the Connection Parameters for the dataclass
+def Tester(BLEDev):
+    yield BLEDev("tester")
 
 @pytest.fixture
-def DUTAdvConfig(BLEDut) -> AdvertiserConfig:
+def DUTAdvConfig(DUT) -> AdvertiserConfig:
     log.info("Configuring DUT Advertiser")
 
     config = AdvertiserConfig()
 
-    rsp = BLEDut.bt.advertiser.create_set()
+    rsp = DUT.bt.advertiser.create_set()
     config.set = rsp.handle
     assert rsp.result == 0
 
-    rsp = BLEDut.bt.advertiser.set_timing(config.set,
+    rsp = DUT.bt.advertiser.set_timing(config.set,
                                           config.min_interval,
                                           config.max_interval,
                                           config.duration,
@@ -118,19 +72,19 @@ def DUTAdvConfig(BLEDut) -> AdvertiserConfig:
     return config
 
 @pytest.fixture
-def DUTAdvStart(BLEDut,
+def DUTAdvStart(DUT,
                 DUTAdvConfig):
     started = False
 
     def start(*, discover_mode, connectable_mode):
         nonlocal started
-        rsp = BLEDut.bt.legacy_advertiser.generate_data(DUTAdvConfig.set, discover_mode)
-                                                        # BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE)
+        rsp = DUT.bt.legacy_advertiser.generate_data(DUTAdvConfig.set, discover_mode)
+                                                        # DUT.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE)
         assert rsp.result == 0
 
         # Start advertising and scanning
-        rsp = BLEDut.bt.legacy_advertiser.start(DUTAdvConfig.set, connectable_mode)
-                                                # BLEDut.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE)
+        rsp = DUT.bt.legacy_advertiser.start(DUTAdvConfig.set, connectable_mode)
+                                                # DUT.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE)
         assert rsp.result == 0
         log.info("DUT Advertising started")
         started = True
@@ -139,25 +93,25 @@ def DUTAdvStart(BLEDut,
 
     if started:
         try:
-            rsp = BLEDut.bt.advertiser.stop(DUTAdvConfig.set)
+            rsp = DUT.bt.advertiser.stop(DUTAdvConfig.set)
             assert rsp.result == 0
             log.info("DUT Advertising stopped")
         finally:
-            rsp = BLEDut.bt.advertiser.delete_set(DUTAdvConfig.set)
+            rsp = DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
             assert rsp.result == 0
             log.info("DUT Advertising set deleted")
     else:
         # even if never started, still delete the set
-        rsp = BLEDut.bt.advertiser.delete_set(DUTAdvConfig.set)
+        rsp = DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
         assert rsp.result == 0
 
 
 @pytest.fixture
-def TesterScanConfig(BLETester) -> ScannerConfig:
+def TesterScanConfig(Tester) -> ScannerConfig:
     config = ScannerConfig()
 
     # Configure the scanner
-    rsp = BLETester.bt.scanner.set_parameters(BLETester.bt.scanner.SCAN_MODE_SCAN_MODE_PASSIVE,
+    rsp = Tester.bt.scanner.set_parameters(Tester.bt.scanner.SCAN_MODE_SCAN_MODE_PASSIVE,
                                             config.interval,
                                             config.window)
     assert rsp.result == 0 
@@ -165,16 +119,16 @@ def TesterScanConfig(BLETester) -> ScannerConfig:
     return config
 
 @pytest.fixture
-def TesterAdvConfig(BLETester) -> AdvertiserConfig:
+def TesterAdvConfig(Tester) -> AdvertiserConfig:
     log.info("Configuring Tester Advertiser")
 
     config = AdvertiserConfig()
 
-    rsp = BLETester.bt.advertiser.create_set()
+    rsp = Tester.bt.advertiser.create_set()
     config.set = rsp.handle
     assert rsp.result == 0
 
-    rsp = BLETester.bt.advertiser.set_timing(config.set,
+    rsp = Tester.bt.advertiser.set_timing(config.set,
                                              config.min_interval,
                                              config.max_interval,
                                              config.duration,
@@ -185,16 +139,16 @@ def TesterAdvConfig(BLETester) -> AdvertiserConfig:
     return config
 
 @pytest.fixture
-def TesterAdvStart(BLETester,
+def TesterAdvStart(Tester,
                    TesterAdvConfig):
     started = False
 
     def start(*, discover_mode, connectable_mode):
         nonlocal started
-        rsp = BLETester.bt.legacy_advertiser.generate_data(TesterAdvConfig.set, discover_mode)
+        rsp = Tester.bt.legacy_advertiser.generate_data(TesterAdvConfig.set, discover_mode)
         assert rsp.result == 0
 
-        rsp = BLETester.bt.legacy_advertiser.start(TesterAdvConfig.set, connectable_mode)
+        rsp = Tester.bt.legacy_advertiser.start(TesterAdvConfig.set, connectable_mode)
         assert rsp.result == 0
         log.info("Tester Advertising started")
         started = True
@@ -203,32 +157,32 @@ def TesterAdvStart(BLETester,
 
     if started:
         try:
-            rsp = BLETester.bt.advertiser.stop(TesterAdvConfig.set)
+            rsp = Tester.bt.advertiser.stop(TesterAdvConfig.set)
             assert rsp.result == 0
             log.info("Tester Advertising stopped")
         finally:
-            rsp = BLETester.bt.advertiser.delete_set(TesterAdvConfig.set)
+            rsp = Tester.bt.advertiser.delete_set(TesterAdvConfig.set)
             assert rsp.result == 0
             log.info("Tester Advertising set deleted")
     else:
-        rsp = BLETester.bt.advertiser.delete_set(TesterAdvConfig.set)
+        rsp = Tester.bt.advertiser.delete_set(TesterAdvConfig.set)
         assert rsp.result == 0
 
 @pytest.fixture
-def TesterScanStart(BLETester):
-    rsp = BLETester.bt.scanner.start(BLETester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
-                                     BLETester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION)
+def TesterScanStart(Tester):
+    rsp = Tester.bt.scanner.start(Tester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
+                                     Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION)
     assert rsp.result == 0
     log.info("Tester scanning started")
 
     yield 
 
-    rsp = BLETester.bt.scanner.stop()
+    rsp = Tester.bt.scanner.stop()
     assert rsp.result == 0
     log.info("Tester scanning stopped")
 
 @pytest.fixture
-def TesterOpenConnection(BLETester):
+def TesterOpenConnection(Tester):
     connHandle = -1
     # Open connection with DUT
 
@@ -236,55 +190,25 @@ def TesterOpenConnection(BLETester):
 
     # Close connection with DUT
 
-def bgapi_check_event(dev,
-                      event_class,
-                      event_name,
-                      condition,
-                      eventTimeout=0,
-                      maxTime=5):
-    """
-    Check a BGAPI event and return the event itself if there is
-    any processing required for it.
-    
-    :param dev: Description
-    :param event_class: Description
-    :param event_name: Description
-    :param condition: Description
-    :param eventTimeout: Description
-    :param maxTime: Description
-    """
-    for evt in dev.get_events(timeout=eventTimeout, max_time=maxTime):
-        if evt._class_name == event_class and evt._msg_name == event_name:
-            if condition(evt):
-                log.info(f"{event_class}_{event_name} found")
-                return evt
-
-    return None 
-
-def get_device_addr(dev):
-    rsp = dev.bt.system.get_identity_address()
-    assert rsp.result == 0
-    return rsp.address
-
 def test_beacon(JoulescopeDev,
-                BLEDut,
-                BLETester,
+                DUT,
+                Tester,
                 DUTAdvConfig,
                 TesterScanConfig,
                 DUTAdvStart,
                 TesterScanStart):
     DUTAdvStart(
-        discover_mode=BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
-        connectable_mode=BLEDut.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
+        discover_mode=DUT.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
+        connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
     )
 
-    dut_addr = get_device_addr(BLEDut)
+    dut_addr = get_device_addr(DUT)
 
     # Check the Advertising Packets with the Tester, since the nature of the test
     # is heavily dependant on the environment repeat 3 times if failed
     for attempt in range(MAX_TEST_RETRIES):
         log.info("Beacon detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
-        event = bgapi_check_event(BLETester,
+        event = bgapi_check_event(Tester,
                                   "scanner",
                                   "legacy_advertisement_report",
                                   lambda evt: (evt.address == dut_addr))
@@ -295,29 +219,29 @@ def test_beacon(JoulescopeDev,
             break
 
     # Run the capture and store it
-    JoulescopeDev.capture(1.0)
+    JoulescopeDev.capture(0.2)
 
 
 # TODO - Connectable Advertising - Central
-def test_connAdv_central(BLEDut,
-                         BLETester,
+def test_connAdv_central(DUT,
+                         Tester,
                          TesterAdvStart):
     TesterAdvStart(
-        discover_mode=BLETester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
-        connectable_mode=BLETester.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+        discover_mode=Tester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
+        connectable_mode=Tester.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
 
-    dut_addr = get_device_addr(BLEDut)
-    tester_addr = get_device_addr(BLETester)
+    dut_addr = get_device_addr(DUT)
+    tester_addr = get_device_addr(Tester)
 
-    BLEDut.bt.connection.open(
+    DUT.bt.connection.open(
         tester_addr,
-        BLEDut.bt.gap.ADDRESS_TYPE_PUBLIC_ADDRESS,
-        BLEDut.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
+        DUT.bt.gap.ADDRESS_TYPE_PUBLIC_ADDRESS,
+        DUT.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
     )
 
     dut_conn_evt = bgapi_check_event(
-        BLEDut,
+        DUT,
         "connection",
         "opened",
         lambda evt: evt.address == tester_addr,
@@ -327,7 +251,7 @@ def test_connAdv_central(BLEDut,
     assert dut_conn_evt.connection != 0
 
     tester_conn_evt = bgapi_check_event(
-        BLETester,
+        Tester,
         "connection",
         "opened",
         lambda evt: evt.address == dut_addr,
@@ -339,10 +263,10 @@ def test_connAdv_central(BLEDut,
     # Sleep for 500ms to allow the connection for the idle state
     sleep(0.5)
 
-    BLEDut.bt.connection.close(dut_conn_evt.connection)
+    DUT.bt.connection.close(dut_conn_evt.connection)
 
     conn_closed_evt = bgapi_check_event(
-        BLEDut,
+        DUT,
         "connection",
         "closed",
         lambda evt: evt.connection == dut_conn_evt.connection,
@@ -352,7 +276,7 @@ def test_connAdv_central(BLEDut,
     assert conn_closed_evt is not None
 
     conn_closed_evt = bgapi_check_event(
-        BLETester,
+        Tester,
         "connection",
         "closed",
         lambda evt: evt.connection == tester_conn_evt.connection,
@@ -362,24 +286,24 @@ def test_connAdv_central(BLEDut,
     assert conn_closed_evt is not None
 
 # TODO - Connectable Advertising - Peripheral
-def test_connAdv_peripheral(BLEDut,
-                            BLETester,
+def test_connAdv_peripheral(DUT,
+                            Tester,
                             DUTAdvStart):
     DUTAdvStart(
-        discover_mode=BLEDut.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
-        connectable_mode=BLEDut.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+        discover_mode=DUT.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
+        connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
 
-    dut_addr = get_device_addr(BLEDut)
-    tester_addr = get_device_addr(BLETester)
+    dut_addr = get_device_addr(DUT)
+    tester_addr = get_device_addr(Tester)
 
-    rsp = BLETester.bt.connection.open(
+    rsp = Tester.bt.connection.open(
         dut_addr,
-        BLETester.bt.gap.ADDRESS_TYPE_PUBLIC_ADDRESS,
-        BLETester.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
+        Tester.bt.gap.ADDRESS_TYPE_PUBLIC_ADDRESS,
+        Tester.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
     )
 
-    tester_conn_evt = bgapi_check_event(BLETester,
+    tester_conn_evt = bgapi_check_event(Tester,
                                  "connection",
                                  "opened",
                                  lambda evt: evt.address == dut_addr,
@@ -388,7 +312,7 @@ def test_connAdv_peripheral(BLEDut,
                                  )
     assert tester_conn_evt.connection != 0
 
-    dut_conn_evt = bgapi_check_event(BLEDut,
+    dut_conn_evt = bgapi_check_event(DUT,
                                  "connection",
                                  "opened",
                                  lambda evt: evt.address == tester_addr,
@@ -400,10 +324,10 @@ def test_connAdv_peripheral(BLEDut,
     # Sleep for 500ms to allow the connection for the idle state
     sleep(0.5)
 
-    rsp = BLETester.bt.connection.close(tester_conn_evt.connection)
+    rsp = Tester.bt.connection.close(tester_conn_evt.connection)
 
     conn_closed_evt = bgapi_check_event(
-        BLETester,
+        Tester,
         "connection",
         "closed",
         lambda evt: evt.connection == tester_conn_evt.connection,
@@ -413,7 +337,7 @@ def test_connAdv_peripheral(BLEDut,
     assert conn_closed_evt is not None
 
     conn_closed_evt = bgapi_check_event(
-        BLEDut,
+        DUT,
         "connection",
         "closed",
         lambda evt: evt.connection == dut_conn_evt.connection,
@@ -423,9 +347,9 @@ def test_connAdv_peripheral(BLEDut,
     assert conn_closed_evt is not None
 
 # TODO - Scanning
-def test_scanner(BLEDut):
+def test_scanner(DUT):
     assert 1 == 0
 
 # TODO - PAwR Observer
-def test_PAwR_obs(BLEDut):
+def test_PAwR_obs(DUT):
     assert 1 == 0
