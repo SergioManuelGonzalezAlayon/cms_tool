@@ -1,0 +1,13 @@
+{
+  "test" :{
+    "name" : "non_conn_adv_200ms"
+  },
+  "advertiser": {
+    "min_interval": 200,
+    "max_interval": 200
+  },
+  "scanner": {
+    "interval": 100,
+    "window": 50
+  },
+}
