@@ -105,19 +105,31 @@ def DUTAdvStart(DUT,
         assert rsp.result == 0
 
 @pytest.fixture
+def DUTScanConfig(DUT,
+                  Config) -> ScannerConfig:
+    def _config(*, mode):
+        config = dataclass_from_dict(ScannerConfig, Config.get("scanner",{}))
+        # Configure the scanner
+        DUT.bt.scanner.set_parameters(mode,
+                                      config.interval,
+                                      config.window)
+
+    return _config
+
+@pytest.fixture
 def DUTScanStart(DUT):
-    rsp = DUT.bt.scanner.start(DUT.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
-                                     DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION)
-    assert rsp.result == 0
-    log.info("DUT scanning started")
+    started = False
+    def _start(*, phy, discover_mode):
+        nonlocal started
+        DUT.bt.scanner.start(phy, discover_mode)
+        log.info("DUT scanning started")
+        started = True
 
-    yield 
+    yield _start
 
-    rsp = DUT.bt.scanner.stop()
-    assert rsp.result == 0
-    log.info("DUT scanning stopped")
-
-
+    if started:
+        DUT.bt.scanner.stop()
+        log.info("DUT scanning stopped")
 
 @pytest.fixture
 def TesterAdvConfig(Tester,
@@ -173,49 +185,105 @@ def TesterAdvStart(Tester,
 @pytest.fixture
 def TesterScanConfig(Tester,
                      Config) -> ScannerConfig:
-    config = dataclass_from_dict(ScannerConfig, Config.get("scanner",{}))
+    def _config(*, mode):
+        config = dataclass_from_dict(ScannerConfig, Config.get("scanner",{}))
+        # Configure the scanner
+        DUT.bt.scanner.set_parameters(mode,
+                                      config.interval,
+                                      config.window)
 
-    # Configure the scanner
-    rsp = Tester.bt.scanner.set_parameters(Tester.bt.scanner.SCAN_MODE_SCAN_MODE_PASSIVE,
-                                            config.interval,
-                                            config.window)
-    assert rsp.result == 0 
-
-    return config
+    return _config
 
 @pytest.fixture
 def TesterScanStart(Tester,
                     TesterScanConfig):
-    rsp = Tester.bt.scanner.start(Tester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
-                                  Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION)
-    assert rsp.result == 0
-    log.info("Tester scanning started")
+    started = False
+    def _start(*, phy, discover_mode):
+        nonlocal started
+        Tester.bt.scanner.start(phy, discover_mode)
+        log.info("Tester scanning started")
+        started = True
 
-    yield 
+    yield _start
 
-    rsp = Tester.bt.scanner.stop()
-    assert rsp.result == 0
-    log.info("Tester scanning stopped")
+    if started:
+        Tester.bt.scanner.stop()
+        log.info("Tester scanning stopped")
 
 @pytest.fixture
-def TesterOpenConnection(Tester):
-    connHandle = -1
-    # Open connection with DUT
+def ConnectBLEDevices(Config):
+    connected = False
+    dev_ctrl = None
+    dev_per = None
+    ctrl_conn, per_conn = None, None
 
-    yield connHandle
+    def _connect_devices(*,
+                    central, 
+                    peripheral,
+                    phy,
+                    retry_sleep=0.25,
+                    max_retries=3):
+        """
+        Connect two BLE devices where the peripheral has started Connectable Advertising,
+        with a maximum number of retries
+        """
+        nonlocal connected, dev_ctrl, dev_per, ctrl_conn, per_conn
 
-    # Close connection with DUT
+        dev_ctrl = central
+        dev_per = peripheral
+        params = dataclass_from_dict(ConnectionParameters, Config.get("connection", {}))
 
-def test_beacon(#JoulescopeDev,
+        central_conn, peripheral_conn = connect_devices(
+            central,
+            peripheral,
+            phy,
+            params,
+            retry_sleep=retry_sleep,
+            max_retries=max_retries)
+        
+        log.info("DUT and Tester connected")
+        ctrl_conn = central_conn
+        per_conn = peripheral_conn
+        connected = True
+
+        return central_conn, peripheral_conn
+
+    yield _connect_devices
+
+    if connected:
+        dev_ctrl.bt.connection.close(ctrl_conn)
+
+        bgapi_check_event(
+                dev_ctrl,
+                "connection",
+                "closed",
+                lambda evt: evt.connection == ctrl_conn,
+                eventTimeout=1,
+                maxTime=5,
+            )
+        bgapi_check_event(
+                dev_per,
+                "connection",
+                "closed",
+                lambda evt: evt.connection == per_conn,
+                eventTimeout=1,
+                maxTime=5,
+            )
+        log.info("Connection closed succesfully")
+
+
+def test_beacon(JoulescopeDev,
                 DUT,
                 Tester,
-                DUTAdvConfig,
-                TesterScanConfig,
                 DUTAdvStart,
                 TesterScanStart):
     DUTAdvStart(
         discover_mode=DUT.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
         connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
+    )
+    TesterScanStart(
+        phy=Tester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
+        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
     )
 
     dut_addr = get_device_addr(DUT)
@@ -235,135 +303,66 @@ def test_beacon(#JoulescopeDev,
             break
 
     # Run the capture and store it
-    #JoulescopeDev.capture(0.2)
+    JoulescopeDev.capture(0.2)
 
-
-# TODO - Connectable Advertising - Central
-def test_connAdv_central(DUT,
+def test_connAdv_central(JoulescopeDev,
+                         DUT,
                          Tester,
-                         TesterAdvStart):
+                         TesterAdvStart,
+                         ConnectBLEDevices):
     TesterAdvStart(
         discover_mode=Tester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
         connectable_mode=Tester.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
-
-    dut_addr = get_device_addr(DUT)
-    tester_addr = get_device_addr(Tester)
-
-    DUT.bt.connection.open(
-        tester_addr,
-        DUT.bt.gap.ADDRESS_TYPE_PUBLIC_ADDRESS,
-        DUT.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
+    ConnectBLEDevices(
+        central=DUT,
+        peripheral=Tester,
+        phy=DUT.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
     )
 
-    dut_conn_evt = bgapi_check_event(
-        DUT,
-        "connection",
-        "opened",
-        lambda evt: evt.address == tester_addr and evt.connection != 0,
-        eventTimeout=1,
-        maxTime=10,
-    )
+    # TODO - Calculate the time required for N events to complete
+    # TODO - Capture with Joulescope on that NEvent time
+    JoulescopeDev.capture(0.2)
 
-    tester_conn_evt = bgapi_check_event(
-        Tester,
-        "connection",
-        "opened",
-        lambda evt: evt.address == dut_addr and evt.connection != 0,
-        eventTimeout=1,
-        maxTime=10,
-    )
 
-    # Sleep for 500ms to allow the connection for the idle state
-    sleep(0.5)
-
-    DUT.bt.connection.close(dut_conn_evt.connection)
-
-    conn_closed_evt = bgapi_check_event(
-        DUT,
-        "connection",
-        "closed",
-        lambda evt: evt.connection == dut_conn_evt.connection,
-        eventTimeout=1,
-        maxTime=10
-    )
-
-    conn_closed_evt = bgapi_check_event(
-        Tester,
-        "connection",
-        "closed",
-        lambda evt: evt.connection == tester_conn_evt.connection,
-        eventTimeout=1,
-        maxTime=10
-    )
-
-# TODO - Connectable Advertising - Peripheral
-def test_connAdv_peripheral(DUT,
+def test_connAdv_peripheral(JoulescopeDev,
+                            DUT,
                             Tester,
-                            DUTAdvStart):
+                            DUTAdvStart,
+                            ConnectBLEDevices):
     DUTAdvStart(
         discover_mode=DUT.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
         connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
-
-    dut_addr = get_device_addr(DUT)
-    tester_addr = get_device_addr(Tester)
-
-    rsp = Tester.bt.connection.open(
-        dut_addr,
-        Tester.bt.gap.ADDRESS_TYPE_PUBLIC_ADDRESS,
-        Tester.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
+    ConnectBLEDevices(
+        central=Tester,
+        peripheral=DUT,
+        phy=Tester.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
     )
 
-    tester_conn_evt = bgapi_check_event(Tester,
-                                 "connection",
-                                 "opened",
-                                 lambda evt: evt.address == dut_addr,
-                                 eventTimeout=1,
-                                 maxTime=10,
-                                 )
-    assert tester_conn_evt.connection != 0
+    # TODO - Calculate the time required for N events to complete
+    # TODO - Capture with Joulescope on that NEvent time
+    JoulescopeDev.capture(0.2)
 
-    dut_conn_evt = bgapi_check_event(DUT,
-                                 "connection",
-                                 "opened",
-                                 lambda evt: evt.address == tester_addr,
-                                 eventTimeout=1,
-                                 maxTime=10,
-                                 )
-    assert dut_conn_evt.connection != 0
-
-    # Sleep for 500ms to allow the connection for the idle state
-    sleep(0.5)
-
-    rsp = Tester.bt.connection.close(tester_conn_evt.connection)
-
-    conn_closed_evt = bgapi_check_event(
-        Tester,
-        "connection",
-        "closed",
-        lambda evt: evt.connection == tester_conn_evt.connection,
-        eventTimeout=1,
-        maxTime=10
-    )
-    assert conn_closed_evt is not None
-
-    conn_closed_evt = bgapi_check_event(
-        DUT,
-        "connection",
-        "closed",
-        lambda evt: evt.connection == dut_conn_evt.connection,
-        eventTimeout=1,
-        maxTime=10
-    )
-    assert conn_closed_evt is not None
 
 # TODO - Scanning
-def test_scanner(DUT,
+def test_scanner(JoulescopeDev,
+                 DUT,
                  Tester,
                  TesterAdvStart,
                  DUTScanStart):
-    assert 1 == 0
+    TesterAdvStart(
+        discover_mode=Tester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
+        connectable_mode=Tester.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+    )
+    DUTScanStart(
+        phy=DUT.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
+        discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+    )
+
+    # TODO - Calculate the time required for N events to complete
+    # TODO - Capture with Joulescope on that NEvent time
+    JoulescopeDev.capture(0.2)
 
 # TODO - PAwR Observer
 def test_PAwR_obs(DUT):

@@ -53,8 +53,11 @@ class ScannerConfig:
 @dataclass
 class ConnectionParameters:
     min_interval : int = 100
-    max_interval : int = 250
-    # TODO - Fill all the Connection Parameters for the dataclass
+    max_interval : int = 100
+    latency : int = 0
+    timeout : int = 0
+    min_ce_lenght : int = 0
+    max_ce_lenght : int = 0xffff
 
 
 def read_dev_config(section, key=None, default=None, *, path="dev_config.json"):
@@ -129,3 +132,100 @@ def get_device_addr(dev):
     rsp = dev.bt.system.get_identity_address()
     assert rsp.result == 0
     return rsp.address
+
+def is_conn_handle_valid(handle):
+    return (handle != 255 and handle > 0)
+
+def close_connection(dev, conn_handle):
+    try:
+        if is_conn_handle_valid(conn_handle):
+            log.info("Closing partial central connection conn_handle %s", conn_handle)
+            dev.bt.connection.close(conn_handle)
+
+    except Exception as ex:
+        log.debug("Error while closing central partial connection: %s", ex)
+
+def connection_set_params(dev, params):
+    dev.bt.connection.set_default_parameters(
+    params.min_interval,
+    params.max_interval,
+    params.latency,
+    params.timeout,
+    params.min_ce_lenght,
+    params.max_ce_lenght)
+
+def connect_devices(central, 
+                    peripheral,
+                    phy,
+                    parameters : ConnectionParameters,
+                    retry_sleep=0.25,
+                    max_retries=3):
+    """
+    Connect two BLE devices where the peripheral has started Connectable Advertising,
+    with a maximum number of retries
+    """
+    central_conn = -1
+    peripheral_conn = -1
+
+    rsp = peripheral.bt.system.get_identity_address()
+    peripheral_addr = rsp.address
+    peripheral_addr_type = rsp.type
+
+    central_addr = central.bt.system.get_identity_address().address
+    
+    # Configure the connection parameters
+    connection_set_params(central, parameters)
+    connection_set_params(peripheral, parameters)
+
+    # Connection attempts
+    for attempt in range(max_retries):
+        log.info("Connection attempt %d/%d", attempt + 1, max_retries)
+
+        rsp = central.bt.connection.open(
+            peripheral_addr,
+            peripheral_addr_type,
+            phy,
+        )
+        assert rsp.result == 0
+
+        try:
+            central_event = bgapi_check_event(
+                central,
+                "connection",
+                "opened",
+                lambda evt: evt.address == peripheral_addr,
+                eventTimeout=1,
+                maxTime=5,
+            )
+            
+            peripheral_event = bgapi_check_event(
+                peripheral,
+                "connection",
+                "opened",
+                lambda evt: evt.address == central_addr,
+                eventTimeout=1,
+                maxTime=5,
+            )
+
+            central_conn = central_event.connection
+            peripheral_conn = peripheral_event.connection
+
+            if is_conn_handle_valid(central_conn) and is_conn_handle_valid(peripheral_conn):
+                log.info("Devices connected")
+                return central_conn, peripheral_conn
+
+        except BGAPIEventTimeoutError as be:
+            log.warning("Connection attempt %d/%d failed", attempt + 1, max_retries)
+
+            close_connection(central, central_conn)
+            close_connection(peripheral, peripheral_conn)
+
+            sleep(retry_sleep)
+            continue
+
+
+    # All attempts exhausted
+    raise ConnectionError(
+        f"Could not establish connection between central ({getattr(central, 'name', repr(central))}) "
+        f"and peripheral ({getattr(peripheral, 'name', repr(peripheral))}) after {max_retries} attempts"
+    )
