@@ -10,4 +10,7 @@
     "serial_port": "tester",
     "baudrate": 115200
   }
+    "ble": {
+    "xapi" : "C:\\path\\to\\sdk\\sl_bt.xapi"
+  }
 }

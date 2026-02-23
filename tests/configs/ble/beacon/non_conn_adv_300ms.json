@@ -1,0 +1,11 @@
+{
+  "advertiser": {
+    "min_interval": 300,
+    "max_interval": 300
+  },
+  "scanner": {
+    "interval": 100,
+    "window": 50
+  }
+}
+
