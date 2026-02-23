@@ -6,5 +6,5 @@
   "scanner": {
     "interval": 100,
     "window": 50
-  },
+  }
 }

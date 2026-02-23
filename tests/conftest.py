@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
+from dataclasses import fields
 import pytest
-
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
@@ -30,6 +30,12 @@ def _test_config_path(request: pytest.FixtureRequest) -> Path:
         return cfg_dir / cfg_name
     return cfg_dir / "default.json"
 
+def dataclass_from_dict(cls, data: dict):
+    valid = {f.name for f in fields(cls)}
+    unknown = set(data.keys()) - valid
+    if unknown:
+        raise ValueError(f"Unknown fields for {cls.__name__}: {sorted(unknown)}")
+    return cls(**data)
 
 @pytest.fixture
 def Config(request: pytest.FixtureRequest) -> dict:
