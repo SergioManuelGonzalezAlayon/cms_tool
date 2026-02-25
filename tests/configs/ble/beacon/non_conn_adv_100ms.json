@@ -1,10 +1,18 @@
 {
-  "advertiser": {
-    "min_interval": 100,
-    "max_interval": 100
-  },
-  "scanner": {
-    "interval": 100,
-    "window": 50
-  }
+    "advertiser":  {
+                       "min_interval":  100,
+                       "max_interval":  100
+                   },
+    "scanner":  {
+                    "interval":  100,
+                    "window":  50
+                },
+    "firmware":  {
+                     "dut_slcp":  "apps/ncp_ble_dut.slcp",
+                     "tester_slcp":  "apps/ncp_ble_tester.slcp",
+                     "board":  "brd4182a",
+                     "build_root":  ".fw_build",
+                     "dut_probe_sn":  "REPLACE_WITH_DUT_PROBE_SN",
+                     "tester_probe_sn":  "REPLACE_WITH_TESTER_PROBE_SN"
+                 }
 }

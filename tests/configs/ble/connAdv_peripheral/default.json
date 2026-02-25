@@ -1,18 +1,26 @@
 {
-  "advertiser": {
-    "min_interval": 150,
-    "max_interval": 150
-  },
-  "scanner": {
-    "interval": 100,
-    "window": 50
-  },
-  "connection": {
-    "min_interval" : 100,
-    "max_interval" : 100,
-    "latency" : 0,
-    "timeout" : 100,
-    "min_ce_lenght" : 0,
-    "max_ce_lenght" : 65535
-  }
+    "advertiser":  {
+                       "min_interval":  150,
+                       "max_interval":  150
+                   },
+    "scanner":  {
+                    "interval":  100,
+                    "window":  50
+                },
+    "connection":  {
+                       "min_interval":  100,
+                       "max_interval":  100,
+                       "latency":  0,
+                       "timeout":  100,
+                       "min_ce_lenght":  0,
+                       "max_ce_lenght":  65535
+                   },
+    "firmware":  {
+                     "dut_slcp":  "apps/ncp_ble_dut.slcp",
+                     "tester_slcp":  "apps/ncp_ble_tester.slcp",
+                     "board":  "brd4182a",
+                     "build_root":  ".fw_build",
+                     "dut_probe_sn":  "REPLACE_WITH_DUT_PROBE_SN",
+                     "tester_probe_sn":  "REPLACE_WITH_TESTER_PROBE_SN"
+                 }
 }

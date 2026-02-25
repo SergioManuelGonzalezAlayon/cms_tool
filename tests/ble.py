@@ -113,6 +113,8 @@ def DUTScanConfig(DUT,
         DUT.bt.scanner.set_parameters(mode,
                                       config.interval,
                                       config.window)
+        
+        return config
 
     return _config
 
@@ -246,7 +248,7 @@ def ConnectBLEDevices(Config):
         per_conn = peripheral_conn
         connected = True
 
-        return central_conn, peripheral_conn
+        return central_conn, peripheral_conn, params
 
     yield _connect_devices
 
@@ -275,6 +277,7 @@ def ConnectBLEDevices(Config):
 def test_beacon(JoulescopeDev,
                 DUT,
                 Tester,
+                DUTAdvConfig,
                 DUTAdvStart,
                 TesterScanStart):
     DUTAdvStart(
@@ -287,7 +290,6 @@ def test_beacon(JoulescopeDev,
     )
 
     dut_addr = get_device_addr(DUT)
-
     # Check the Advertising Packets with the Tester, since the nature of the test
     # is heavily dependant on the environment repeat 3 times if failed
     for attempt in range(MAX_TEST_RETRIES):
@@ -303,46 +305,52 @@ def test_beacon(JoulescopeDev,
             break
 
     # Run the capture and store it
-    JoulescopeDev.capture(0.2)
+    # BLE advertising interval units are 0.625 ms; capture expects seconds.
+    capture_s = 10 * DUTAdvConfig.max_interval * 0.000625
+    JoulescopeDev.capture(capture_s)
 
 def test_connAdv_central(JoulescopeDev,
                          DUT,
                          Tester,
+                         Config,
                          TesterAdvStart,
                          ConnectBLEDevices):
     TesterAdvStart(
         discover_mode=Tester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
         connectable_mode=Tester.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
-    ConnectBLEDevices(
+    _, _, conn_params = ConnectBLEDevices(
         central=DUT,
         peripheral=Tester,
         phy=DUT.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
     )
 
-    # TODO - Calculate the time required for N events to complete
-    # TODO - Capture with Joulescope on that NEvent time
-    JoulescopeDev.capture(0.2)
+    n_events = 10
+    capture_s = n_events * conn_params.max_interval * 0.00125
+    log.info(f"Capturing Conn Adv for {capture_s}s")
+    JoulescopeDev.capture(capture_s)
 
 
 def test_connAdv_peripheral(JoulescopeDev,
                             DUT,
                             Tester,
+                            DUTAdvConfig,
                             DUTAdvStart,
                             ConnectBLEDevices):
     DUTAdvStart(
         discover_mode=DUT.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
         connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
-    ConnectBLEDevices(
+    _, _, conn_params = ConnectBLEDevices(
         central=Tester,
         peripheral=DUT,
         phy=Tester.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
     )
 
-    # TODO - Calculate the time required for N events to complete
-    # TODO - Capture with Joulescope on that NEvent time
-    JoulescopeDev.capture(0.2)
+    n_events = 10
+    capture_s = n_events * conn_params.max_interval * 0.00125
+    log.info(f"Capturing Conn Adv for {capture_s}s")
+    JoulescopeDev.capture(capture_s)
 
 
 # TODO - Scanning
@@ -350,6 +358,7 @@ def test_scanner(JoulescopeDev,
                  DUT,
                  Tester,
                  TesterAdvStart,
+                 DUTScanConfig,
                  DUTScanStart):
     TesterAdvStart(
         discover_mode=Tester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
@@ -360,10 +369,10 @@ def test_scanner(JoulescopeDev,
         discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
     )
 
-    # TODO - Calculate the time required for N events to complete
-    # TODO - Capture with Joulescope on that NEvent time
-    JoulescopeDev.capture(0.2)
+    n_events = 10
+    capture_s =  n_events * DUTScanConfig.interval * 0.000625
+    JoulescopeDev.capture(capture_s)
 
 # TODO - PAwR Observer
 def test_PAwR_obs(DUT):
-    assert 1 == 0
+    pass
