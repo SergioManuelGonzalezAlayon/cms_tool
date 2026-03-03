@@ -59,6 +59,13 @@ class ConnectionParameters:
     min_ce_lenght : int = 0
     max_ce_lenght : int = 0xffff
 
+@dataclass
+class PAWRConfig:
+    num_subevents : int = 0
+    subevent_interval : int = 0
+    response_slot_delay : int = 0
+    response_slot_spacing : int = 0
+    response_slots : int = 0
 
 def read_dev_config(section, key=None, default=None, *, path="dev_config.json"):
     config_path = os.path.join(os.getcwd(), path)
