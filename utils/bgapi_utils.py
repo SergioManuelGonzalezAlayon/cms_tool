@@ -69,7 +69,7 @@ class PAWRConfig:
 
 def read_dev_config(section, key=None, default=None, *, path="dev_config.json"):
     config_path = os.path.join(os.getcwd(), path)
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, "r", encoding="utf-8-sig") as f:
         data = json.load(f)
 
     if key is None:

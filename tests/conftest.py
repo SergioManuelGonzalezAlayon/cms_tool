@@ -1,8 +1,13 @@
 import json
 import subprocess
+import shutil
+import logging
+import time
 from pathlib import Path
 from dataclasses import fields
 import pytest
+
+log = logging.getLogger(__name__)
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
@@ -68,18 +73,37 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest) -> None:
     js.capture_config_name = Path(cfg_opt).name if cfg_opt else "default.json"
 
 def _run(cmd, cwd=None):
-    subprocess.run(cmd, cwd=cwd, check=True, text=True)
+    exe = shutil.which(cmd[0])
+    if exe is None:
+        pytest.fail(
+            f"Required tool '{cmd[0]}' not found on PATH. "
+            "Ensure Simplicity Studio CLI tools and CMake are installed and available."
+        )
+
+    resolved_cmd = [exe, *cmd[1:]]
+    subprocess.run(resolved_cmd, cwd=cwd, check=True, text=True)
+
+
+def _read_dev_config(path: Path = Path("dev_config.json")) -> dict:
+    if not path.exists():
+        pytest.fail(f"Missing {path}. Required for probe serial fallback.")
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def _build_slcp(slcp: Path, out_dir: Path, project_name: str, board: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
+    log.info("FW build start: project=%s slcp=%s out=%s board=%s", project_name, slcp, out_dir, board)
+    t0 = time.monotonic()
 
     _run(["slc", "generate", str(slcp), "-d", str(out_dir), f"-name={project_name}", "--with", board])
+    log.info("FW generate done: project=%s", project_name)
     _run(["cmake", "--workflow", "--preset", "project"], cwd=out_dir / "cmake_gcc")
+    log.info("FW compile done: project=%s", project_name)
 
     candidates = list((out_dir / "cmake_gcc").rglob("*.s37")) + list((out_dir / "cmake_gcc").rglob("*.hex"))
     if not candidates:
         raise RuntimeError(f"No firmware image found under {out_dir}")
+    log.info("FW build complete: project=%s image=%s elapsed=%.1fs", project_name, candidates[0], time.monotonic() - t0)
     return candidates[0]
 
 
@@ -108,15 +132,26 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
         "dut_slcp",
         "tester_slcp",
         "board",
-        "build_root",
-        "dut_probe_sn",
-        "tester_probe_sn",
     )
     missing = [key for key in required if key not in fw]
     if missing:
         pytest.fail("Missing 'firmware' fields in test config: " + ", ".join(missing))
 
-    build_root = Path(fw["build_root"])
+    dev_cfg = _read_dev_config()
+    build_root_str = fw.get("build_root") or dev_cfg.get("firmware", {}).get("build_root")
+    if not build_root_str:
+        pytest.fail(
+            "Missing build root. Set dev_config.json firmware.build_root "
+            "or provide firmware.build_root in test config."
+        )
+    build_root = Path(build_root_str)
+    dut_probe_sn = fw.get("dut_probe_sn") or dev_cfg.get("dut", {}).get("probe_sn")
+    tester_probe_sn = fw.get("tester_probe_sn") or dev_cfg.get("tester", {}).get("probe_sn")
+    if not dut_probe_sn or not tester_probe_sn:
+        pytest.fail(
+            "Missing probe serials. Set dev_config.json dut.probe_sn and tester.probe_sn "
+            "or provide firmware.dut_probe_sn/tester_probe_sn in test config."
+        )
 
     dut_image = _build_slcp(
         slcp=Path(fw["dut_slcp"]),
@@ -131,7 +166,7 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
         board=fw["board"],
     )
 
-    _flash(dut_image, fw["dut_probe_sn"])
-    _flash(tester_image, fw["tester_probe_sn"])
+    _flash(dut_image, dut_probe_sn)
+    _flash(tester_image, tester_probe_sn)
 
     _PROVISIONED_CONFIGS.add(cfg_path)
