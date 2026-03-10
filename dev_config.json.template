@@ -1,21 +1,22 @@
-﻿{
-    "Joulescope":  {
-                       "serial_port":  "scope"
-                   },
-    "dut":  {
-                "serial_port":  "dut",
-                "baudrate":  115200,
-                "probe_sn":  "REPLACE_WITH_DUT_PROBE_SN"
-            },
-    "tester":  {
-                   "serial_port":  "tester",
-                   "baudrate":  115200,
-                   "probe_sn":  "REPLACE_WITH_TESTER_PROBE_SN"
-               },
-    "ble":  {
-                "xapi":  "C:\\\\path\\\\to\\\\sdk\\\\sl_bt.xapi"
-            },
-    "firmware":  {
-                     "build_root":  ".fw_build"
-                 }
+{
+    "Joulescope": {
+        "serial_port": "scope",
+        "wake_gpio": 0
+    },
+    "dut": {
+        "serial_port": "dut",
+        "baudrate": 115200,
+        "probe_sn": "REPLACE_WITH_DUT_PROBE_SN"
+    },
+    "tester": {
+        "serial_port": "tester",
+        "baudrate": 115200,
+        "probe_sn": "REPLACE_WITH_TESTER_PROBE_SN"
+    },
+    "ble": {
+        "xapi": "C:\\\\path\\\\to\\\\sdk\\\\sl_bt.xapi"
+    },
+    "firmware": {
+        "build_root": ".fw_build"
+    }
 }
