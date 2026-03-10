@@ -1,0 +1,119 @@
+{
+    "test": "conn_peripheral",
+    "source": {
+        "workbook": "CurrentMeasApp.xlsx",
+        "sheet": "Sheet1"
+    },
+    "generator": {
+        "base_config": "default.json",
+        "output_dir": ".",
+        "name_rule": "concise_parameter_value",
+        "name_separator": "_",
+        "steps": 4,
+        "analyses": {
+            "one_factor": {
+                "enabled": true
+            },
+            "full_sweep": {
+                "enabled": true,
+                "output_dir": "full_sweep",
+                "partition_by": "dcdc",
+                "partition_dirs": {
+                    "On": "dcdc",
+                    "Off": "no_dcdc"
+                },
+                "name_order": [
+                    "connection_interval",
+                    "tx_payload_length",
+                    "rx_payload_length",
+                    "phy",
+                    "tx_power",
+                    "dcdc"
+                ]
+            }
+        }
+    },
+    "parameters": [
+        {
+            "name": "dcdc",
+            "label": "DCDC",
+            "control": "compile",
+            "default": "On",
+            "file_token": "dcdc",
+            "omit_value_in_name": [
+                "Off"
+            ],
+            "values": [
+                "On",
+                "Off"
+            ],
+            "config_path": "firmware.dut_slcp",
+            "options": {
+                "On": "apps/ncp_ble_dut_dcdc.slcp",
+                "Off": "apps/ncp_ble_dut.slcp"
+            }
+        },
+        {
+            "name": "phy",
+            "label": "Phy",
+            "control": "bgapi",
+            "default": "1mbps",
+            "file_token": "phy",
+            "config_path": "radio.phy",
+            "values": [
+                "125kbps",
+                "500kbps",
+                "1000kbps",
+                "2000kbps"
+            ]
+        },
+        {
+            "name": "tx_power",
+            "label": "TX Power",
+            "control": "bgapi",
+            "default": "0 dBm",
+            "file_token": "txp",
+            "range": {
+                "min": "0 dBm",
+                "max": "20 dBm"
+            },
+            "config_path": "radio.tx_power_dbm"
+        },
+        {
+            "name": "connection_interval",
+            "label": "Connection Interval",
+            "control": "bgapi",
+            "default": "15 ms",
+            "file_token": "conn",
+            "range": {
+                "min": "7.5 ms",
+                "max": "4 s"
+            },
+            "config_path": "connection.interval"
+        },
+        {
+            "name": "tx_payload_length",
+            "label": "TX Payload Length",
+            "control": "bgapi",
+            "default": "10 bytes",
+            "file_token": "txpayload",
+            "range": {
+                "min": "0 bytes",
+                "max": "251 bytes"
+            },
+            "config_path": "connection.tx_payload_length"
+        },
+        {
+            "name": "rx_payload_length",
+            "label": "RX Payload Length",
+            "control": "bgapi",
+            "default": "10 bytes",
+            "file_token": "rxpayload",
+            "range": {
+                "min": "0 bytes",
+                "max": "251 bytes"
+            },
+            "config_path": "connection.rx_payload_length"
+        }
+    ]
+}

@@ -9,7 +9,7 @@
         "output_dir": ".",
         "name_rule": "concise_parameter_value",
         "name_separator": "_",
-        "steps": 10,
+        "steps": 4,
         "analyses": {
             "one_factor": {
                 "enabled": true
