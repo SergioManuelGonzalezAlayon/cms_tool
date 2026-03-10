@@ -89,6 +89,12 @@ def _read_dev_config(path: Path = Path("dev_config.json")) -> dict:
         pytest.fail(f"Missing {path}. Required for probe serial fallback.")
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
+def _upgrade_generated_slcp(slcp: Path, out_dir: Path) -> Path:
+    generated_slcp = out_dir / slcp.name
+    shutil.copy2(slcp, generated_slcp)
+    _run(["slc", "upgrade", "-p", generated_slcp.name], cwd=out_dir)
+    return generated_slcp
+
 
 def _build_slcp(slcp: Path, out_dir: Path, project_name: str, board: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -97,6 +103,8 @@ def _build_slcp(slcp: Path, out_dir: Path, project_name: str, board: str) -> Pat
 
     _run(["slc", "generate", str(slcp), "-d", str(out_dir), f"-name={project_name}", "--with", board])
     log.info("FW generate done: project=%s", project_name)
+    generated_slcp = _upgrade_generated_slcp(slcp, out_dir)
+    log.info("FW upgrade done: project=%s slcp=%s", project_name, generated_slcp)
     _run(["cmake", "--workflow", "--preset", "project"], cwd=out_dir / "cmake_gcc")
     log.info("FW compile done: project=%s", project_name)
 
