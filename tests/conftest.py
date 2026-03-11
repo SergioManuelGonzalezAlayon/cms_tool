@@ -66,7 +66,7 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest) -> None:
     js = request.getfixturevalue("JoulescopeDev")
     js.capture_test_name = request.node.name.removeprefix("test_")
     cfg_opt = request.config.getoption("--cfg")
-    js.capture_config_name = Path(cfg_opt).name if cfg_opt else "default.json"
+    js.capture_config_name = Path(cfg_opt).stem if cfg_opt else "default"
 
 def _flash(image: Path, probe_sn: str):
     exe = shutil.which("commander")

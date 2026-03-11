@@ -13,6 +13,11 @@ log = logging.getLogger(__name__)
 
 ADV_INTERVAL_UNIT_MS = Decimal("0.625")
 CONN_INTERVAL_UNIT_MS = Decimal("1.25")
+ADV_DURATION_UNIT_MS = Decimal("10")
+ADV_INTERVAL_MIN_UNITS = 0x20
+ADV_INTERVAL_MAX_UNITS = 0xFFFFFF
+CONN_INTERVAL_MIN_UNITS = 0x0006
+CONN_INTERVAL_MAX_UNITS = 0x0C80
 
 
 class BGAPIEventTimeoutError(RuntimeError):
@@ -48,7 +53,7 @@ class BGAPIEventTimeoutError(RuntimeError):
 class AdvertiserConfig:
     set: int = -1
     min_interval: int = 100
-    max_interval: int = 100
+    max_interval: int = 200
     interval: int | None = None
     payload: int = 20
     phy: str | int = "1mbps"
@@ -67,7 +72,7 @@ class ScannerConfig:
 class ConnectionParameters:
     min_interval: int | None = None
     max_interval: int | None = None
-    interval: int | None = 100
+    interval: int | None = 15
     latency: int = 0
     timeout: int = 100
     min_ce_lenght: int = 0
@@ -123,6 +128,10 @@ def connection_ms_from_units(units: int) -> Decimal:
     return ms_from_bgapi_units(units, CONN_INTERVAL_UNIT_MS)
 
 
+def advertising_duration_units_from_ms(milliseconds: int | float | Decimal) -> int:
+    return int((_decimal_ms(milliseconds) / ADV_DURATION_UNIT_MS).to_integral_value(rounding=ROUND_HALF_UP))
+
+
 def advertising_tx_power_from_dbm(value: int | float | Decimal) -> int:
     return int((Decimal(str(value)) * Decimal("10")).to_integral_value(rounding=ROUND_HALF_UP))
 
@@ -163,8 +172,22 @@ def normalize_advertiser_config(config: AdvertiserConfig) -> AdvertiserConfig:
     max_interval_ms = interval_ms if interval_ms is not None else config.max_interval
     config.min_interval = advertising_units_from_ms(min_interval_ms)
     config.max_interval = advertising_units_from_ms(max_interval_ms)
+    if config.min_interval < ADV_INTERVAL_MIN_UNITS:
+        raise ValueError(f"Advertising min_interval must be >= 20 ms, got {min_interval_ms!r} ms")
+    if config.max_interval < ADV_INTERVAL_MIN_UNITS:
+        raise ValueError(f"Advertising max_interval must be >= 20 ms, got {max_interval_ms!r} ms")
+    if config.min_interval > ADV_INTERVAL_MAX_UNITS or config.max_interval > ADV_INTERVAL_MAX_UNITS:
+        raise ValueError("Advertising interval exceeds BGAPI range")
+    if config.max_interval < config.min_interval:
+        raise ValueError(
+            f"Advertising max_interval must be >= min_interval, got {max_interval_ms!r} ms < {min_interval_ms!r} ms"
+        )
     config.phy = advertising_phy_from_str(config.phy)
     config.tx_power = advertising_tx_power_from_dbm(config.tx_power)
+    if config.duration < 0:
+        raise ValueError(f"Advertising duration must be >= 0, got {config.duration}")
+    if config.duration > 0:
+        config.duration = advertising_duration_units_from_ms(config.duration)
     config.payload = random_payload_bytes(config.payload)
     return config
 
@@ -181,6 +204,16 @@ def normalize_connection_parameters(params: ConnectionParameters) -> ConnectionP
     max_interval_ms = interval_ms if interval_ms is not None else params.max_interval
     params.min_interval = connection_units_from_ms(min_interval_ms)
     params.max_interval = connection_units_from_ms(max_interval_ms)
+    if params.min_interval < CONN_INTERVAL_MIN_UNITS:
+        raise ValueError(f"Connection min_interval must be >= 7.5 ms, got {min_interval_ms!r} ms")
+    if params.max_interval < CONN_INTERVAL_MIN_UNITS:
+        raise ValueError(f"Connection max_interval must be >= 7.5 ms, got {max_interval_ms!r} ms")
+    if params.min_interval > CONN_INTERVAL_MAX_UNITS or params.max_interval > CONN_INTERVAL_MAX_UNITS:
+        raise ValueError("Connection interval exceeds BGAPI range")
+    if params.max_interval < params.min_interval:
+        raise ValueError(
+            f"Connection max_interval must be >= min_interval, got {max_interval_ms!r} ms < {min_interval_ms!r} ms"
+        )
     if params.timeout <= 0:
         log.warning("Connection supervision timeout %s is invalid. Using 100 (1.0 s).", params.timeout)
         params.timeout = 100

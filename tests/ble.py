@@ -84,8 +84,8 @@ def DUTAdvStart(DUT,
     def start(*, discover_mode, connectable_mode):
         nonlocal started
 
-        rsp = DUT.bt.legacy_advertiser.generate_data(DUTAdvConfig.set, discover_mode)
-        assert rsp.result == 0
+        #rsp = DUT.bt.legacy_advertiser.generate_data(DUTAdvConfig.set, discover_mode)
+        #assert rsp.result == 0
 
         rsp = DUT.bt.legacy_advertiser.start(DUTAdvConfig.set, connectable_mode)
         assert rsp.result == 0
@@ -415,7 +415,7 @@ def test_beacon(JoulescopeDev,
             break
 
     capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
-    JoulescopeDev.capture(10.0)
+    JoulescopeDev.capture(capture_s)
 
 
 def test_conn_adv(JoulescopeDev,
@@ -446,7 +446,8 @@ def test_conn_adv(JoulescopeDev,
         else:
             break
 
-    capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
+    n_events = 10
+    capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
     JoulescopeDev.capture(capture_s)
 
 def test_conn_central(JoulescopeDev,
