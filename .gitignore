@@ -1,0 +1,6 @@
+dut/
+tester/
+artifacts/
+.fw_build/
+.pytest_cache/
+.slc-config/

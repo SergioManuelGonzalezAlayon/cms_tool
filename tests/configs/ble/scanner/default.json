@@ -1,0 +1,21 @@
+{
+    "test": {
+        "name": "default"
+    },
+    "advertiser": {
+        "interval": 20,
+        "payload": 10
+    },
+    "scanner": {
+        "interval": 100,
+        "window": 20
+    },
+    "radio": {
+        "phy": "1mbps"
+    },
+    "firmware": {
+        "dut_slcp": "apps/ncp_ble_dut_dcdc.slcp",
+        "tester_slcp": "apps/ncp_ble_tester.slcp",
+        "board": "brd4182a"
+    }
+}

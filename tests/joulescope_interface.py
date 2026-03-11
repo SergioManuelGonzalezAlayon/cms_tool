@@ -8,8 +8,16 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-def savePlotData(profile, data_type, title, ylabel, out_dir):
-    filename = "result_" + title.replace(" ", "").lower() + ".png"
+def _safe_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+
+
+def savePlotData(profile, data_type, title, ylabel, out_dir, test_name=None, config_name=None):
+    signal_name = title.replace(" ", "").lower()
+    if test_name and config_name:
+        filename = f"{_safe_name(test_name)}_{_safe_name(config_name)}_{signal_name}.png"
+    else:
+        filename = "result_" + signal_name + ".png"
 
     plt.figure()
     plt.plot(profile[data_type]["timestamp"],
@@ -32,6 +40,20 @@ class JoulescopeConfig:
     irange: str = "auto"
     verbose: bool = False
 
+
+@pytest.fixture(autouse=True)
+def JoulescopeCaptureContext(request: pytest.FixtureRequest):
+    if "JoulescopeDev" not in request.fixturenames:
+        yield
+        return
+
+    js = request.getfixturevalue("JoulescopeDev")
+    js.capture_test_name = request.node.name.removeprefix("test_")
+    cfg_opt = request.config.getoption("--cfg")
+    js.capture_config_name = Path(cfg_opt).name if cfg_opt else "default.json"
+    yield
+
+
 @pytest.fixture(scope="session")
 def JoulescopeDev():
     log.info("Enabling Joulescope")
@@ -50,15 +72,17 @@ def JoulescopeDev():
 
         out_dir = Path("artifacts")
         out_dir.mkdir(exist_ok=True)
+        test_name = getattr(js, "capture_test_name", None)
+        config_name = getattr(js, "capture_config_name", None)
 
         if "current" in profile:
-            savePlotData(profile, "current", "Current", "mA", out_dir)
+            savePlotData(profile, "current", "Current", "mA", out_dir, test_name, config_name)
 
         if "gpio[0]" in profile:
-            savePlotData(profile, "gpio[0]", "GPIO 0", "Level", out_dir)
+            savePlotData(profile, "gpio[0]", "GPIO 0", "Level", out_dir, test_name, config_name)
 
         if "gpio[1]" in profile:
-            savePlotData(profile, "gpio[1]", "GPIO 1", "Level", out_dir)
+            savePlotData(profile, "gpio[1]", "GPIO 1", "Level", out_dir, test_name, config_name)
     
         log.info("Plots saved")
 
