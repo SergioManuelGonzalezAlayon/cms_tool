@@ -1,12 +1,19 @@
-﻿import json
+import json
 import logging
 import os
+import secrets
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from time import sleep
+
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
 
 log = logging.getLogger(__name__)
+
+ADV_INTERVAL_UNIT_MS = Decimal("0.625")
+CONN_INTERVAL_UNIT_MS = Decimal("1.25")
+
 
 class BGAPIEventTimeoutError(RuntimeError):
     def __init__(self,
@@ -36,36 +43,149 @@ class BGAPIEventTimeoutError(RuntimeError):
             for evt in self.seen_events
         )
 
+
 @dataclass
 class AdvertiserConfig:
     set: int = -1
     min_interval: int = 100
-    max_interval: int = 250
+    max_interval: int = 100
+    interval: int | None = None
     payload: int = 20
-    duration: int = 0               # Default value : no duration limit
-    max_events: int = 0             # Default value : no event limit
+    phy: str | int = "1mbps"
+    tx_power: int | float = 0
+    duration: int = 0
+    max_events: int = 0
+
 
 @dataclass
 class ScannerConfig:
-    window: int = 50      # 50 * 0.625 ms = 31.25 ms
-    interval: int = 100   # 100 * 0.625 ms = 62.5 ms
+    window: int = 50
+    interval: int = 100
+
 
 @dataclass
 class ConnectionParameters:
-    min_interval : int = 100
-    max_interval : int = 100
-    latency : int = 0
-    timeout : int = 0
-    min_ce_lenght : int = 0
-    max_ce_lenght : int = 0xffff
+    min_interval: int | None = None
+    max_interval: int | None = None
+    interval: int | None = 100
+    latency: int = 0
+    timeout: int = 100
+    min_ce_lenght: int = 0
+    max_ce_lenght: int = 0xffff
+    rx_payload_length :int = 0
+    tx_payload_length :int = 0
+
 
 @dataclass
 class PAWRConfig:
-    num_subevents : int = 0
-    subevent_interval : int = 0
-    response_slot_delay : int = 0
-    response_slot_spacing : int = 0
-    response_slots : int = 0
+    num_subevents: int = 0
+    subevent_interval: int = 0
+    response_slot_delay: int = 0
+    response_slot_spacing: int = 0
+    response_slots: int = 0
+
+
+def _decimal_ms(value) -> Decimal:
+    return Decimal(str(value))
+
+
+def bgapi_units_from_ms(milliseconds, unit_ms: Decimal) -> int:
+    units = (_decimal_ms(milliseconds) / unit_ms).to_integral_value(rounding=ROUND_HALF_UP)
+    actual_ms = Decimal(units) * unit_ms
+    requested_ms = _decimal_ms(milliseconds)
+    if actual_ms != requested_ms:
+        log.warning(
+            "Requested %sms cannot be represented exactly with %sms BGAPI units. Using %sms instead.",
+            requested_ms,
+            unit_ms,
+            actual_ms,
+        )
+    return int(units)
+
+
+def ms_from_bgapi_units(units: int, unit_ms: Decimal) -> Decimal:
+    return Decimal(units) * unit_ms
+
+
+def advertising_units_from_ms(milliseconds) -> int:
+    return bgapi_units_from_ms(milliseconds, ADV_INTERVAL_UNIT_MS)
+
+
+def advertising_ms_from_units(units: int) -> Decimal:
+    return ms_from_bgapi_units(units, ADV_INTERVAL_UNIT_MS)
+
+
+def connection_units_from_ms(milliseconds) -> int:
+    return bgapi_units_from_ms(milliseconds, CONN_INTERVAL_UNIT_MS)
+
+
+def connection_ms_from_units(units: int) -> Decimal:
+    return ms_from_bgapi_units(units, CONN_INTERVAL_UNIT_MS)
+
+
+def advertising_tx_power_from_dbm(value: int | float | Decimal) -> int:
+    return int((Decimal(str(value)) * Decimal("10")).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def advertising_phy_from_str(value: str | int) -> int:
+    if isinstance(value, int):
+        return value
+
+    normalized = value.strip().lower().replace(" ", "")
+    phy_map = {
+        "1mbps": 0x1,
+        "1000kbps": 0x1,
+        "1m": 0x1,
+        "2mbps": 0x2,
+        "2000kbps": 0x2,
+        "2m": 0x2,
+        "125kbps": 0x4,
+        "500kbps": 0x4,
+        "coded": 0x4,
+        "longrange": 0x4,
+        "any": 0xFF,
+    }
+    try:
+        return phy_map[normalized]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported advertiser phy: {value!r}") from exc
+
+
+def random_payload_bytes(payload_length: int) -> bytes:
+    if payload_length < 0:
+        raise ValueError(f"payload_length must be >= 0, got {payload_length}")
+    return secrets.token_bytes(payload_length)
+
+
+def normalize_advertiser_config(config: AdvertiserConfig) -> AdvertiserConfig:
+    interval_ms = config.interval
+    min_interval_ms = interval_ms if interval_ms is not None else config.min_interval
+    max_interval_ms = interval_ms if interval_ms is not None else config.max_interval
+    config.min_interval = advertising_units_from_ms(min_interval_ms)
+    config.max_interval = advertising_units_from_ms(max_interval_ms)
+    config.phy = advertising_phy_from_str(config.phy)
+    config.tx_power = advertising_tx_power_from_dbm(config.tx_power)
+    config.payload = random_payload_bytes(config.payload)
+    return config
+
+
+def normalize_scanner_config(config: ScannerConfig) -> ScannerConfig:
+    config.interval = advertising_units_from_ms(config.interval)
+    config.window = advertising_units_from_ms(config.window)
+    return config
+
+
+def normalize_connection_parameters(params: ConnectionParameters) -> ConnectionParameters:
+    interval_ms = params.interval
+    min_interval_ms = interval_ms if interval_ms is not None else params.min_interval
+    max_interval_ms = interval_ms if interval_ms is not None else params.max_interval
+    params.min_interval = connection_units_from_ms(min_interval_ms)
+    params.max_interval = connection_units_from_ms(max_interval_ms)
+    if params.timeout <= 0:
+        log.warning("Connection supervision timeout %s is invalid. Using 100 (1.0 s).", params.timeout)
+        params.timeout = 100
+    return params
+
 
 def read_dev_config(section, key=None, default=None, *, path="dev_config.json"):
     config_path = os.path.join(os.getcwd(), path)
@@ -95,6 +215,7 @@ def get_ble_dev(serialPort):
         log.error(f"Cannot create the BGAPI interface with the device. Reason : {e}")
         raise
 
+
 def open_dev(dev):
     try:
         dev.open()
@@ -103,6 +224,7 @@ def open_dev(dev):
     except Exception:
         log.exception("Failed to open/reset BGAPI device")
         raise
+
 
 def bgapi_check_event(dev,
                       event_class,
@@ -141,13 +263,16 @@ def bgapi_check_event(dev,
         seen_events=seen
     )
 
+
 def get_device_addr(dev):
     rsp = dev.bt.system.get_identity_address()
     assert rsp.result == 0
     return rsp.address
 
+
 def is_conn_handle_valid(handle):
     return (handle != 255 and handle > 0)
+
 
 def close_connection(dev, conn_handle):
     try:
@@ -158,19 +283,21 @@ def close_connection(dev, conn_handle):
     except Exception as ex:
         log.debug("Error while closing central partial connection: %s", ex)
 
+
 def connection_set_params(dev, params):
     dev.bt.connection.set_default_parameters(
-    params.min_interval,
-    params.max_interval,
-    params.latency,
-    params.timeout,
-    params.min_ce_lenght,
-    params.max_ce_lenght)
+        params.min_interval,
+        params.max_interval,
+        params.latency,
+        params.timeout,
+        params.min_ce_lenght,
+        params.max_ce_lenght)
 
-def connect_devices(central, 
+
+def connect_devices(central,
                     peripheral,
                     phy,
-                    parameters : ConnectionParameters,
+                    parameters: ConnectionParameters,
                     retry_sleep=0.25,
                     max_retries=3):
     """
@@ -185,12 +312,10 @@ def connect_devices(central,
     peripheral_addr_type = rsp.type
 
     central_addr = central.bt.system.get_identity_address().address
-    
-    # Configure the connection parameters
+
     connection_set_params(central, parameters)
     connection_set_params(peripheral, parameters)
 
-    # Connection attempts
     for attempt in range(max_retries):
         log.info("Connection attempt %d/%d", attempt + 1, max_retries)
 
@@ -210,7 +335,7 @@ def connect_devices(central,
                 eventTimeout=1,
                 maxTime=5,
             )
-            
+
             peripheral_event = bgapi_check_event(
                 peripheral,
                 "connection",
@@ -227,7 +352,7 @@ def connect_devices(central,
                 log.info("Devices connected")
                 return central_conn, peripheral_conn
 
-        except BGAPIEventTimeoutError as be:
+        except BGAPIEventTimeoutError:
             log.warning("Connection attempt %d/%d failed", attempt + 1, max_retries)
 
             close_connection(central, central_conn)
@@ -236,8 +361,6 @@ def connect_devices(central,
             sleep(retry_sleep)
             continue
 
-
-    # All attempts exhausted
     raise ConnectionError(
         f"Could not establish connection between central ({getattr(central, 'name', repr(central))}) "
         f"and peripheral ({getattr(peripheral, 'name', repr(peripheral))}) after {max_retries} attempts"

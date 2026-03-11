@@ -1,4 +1,4 @@
-import pytest
+﻿import pytest
 import logging
 import json
 import os
@@ -57,6 +57,7 @@ def DUTAdvConfig(DUT,
     log.info("Configuring DUT Advertiser")
 
     config = dataclass_from_dict(AdvertiserConfig, Config.get("advertiser",{}))
+    config = normalize_advertiser_config(config)
     rsp = DUT.bt.advertiser.create_set()
     config.set = rsp.handle
     assert rsp.result == 0
@@ -67,7 +68,11 @@ def DUTAdvConfig(DUT,
                                        config.duration,
                                        config.max_events)
     assert rsp.result == 0
-    log.info("DUT Advertiser configured")    
+    log.info("DUT Advertiser configured")
+
+    #DUT.bt.advertiser.set_tx_power(config.set, config.tx_power)
+    #DUT.bt.extended_advertiser.set_phy(config.set, config.phy, config.phy)
+    #DUT.bt.extended_advertiser.set_data(config.set, config.payload)
 
     return config
 
@@ -78,10 +83,10 @@ def DUTAdvStart(DUT,
 
     def start(*, discover_mode, connectable_mode):
         nonlocal started
+
         rsp = DUT.bt.legacy_advertiser.generate_data(DUTAdvConfig.set, discover_mode)
         assert rsp.result == 0
 
-        # Start advertising and scanning
         rsp = DUT.bt.legacy_advertiser.start(DUTAdvConfig.set, connectable_mode)
         assert rsp.result == 0
         log.info("DUT Advertising started")
@@ -108,6 +113,7 @@ def DUTScanConfig(DUT,
                   Config) -> ScannerConfig:
     def _config(*, mode):
         config = dataclass_from_dict(ScannerConfig, Config.get("scanner",{}))
+        config = normalize_scanner_config(config)
         # Configure the scanner
         DUT.bt.scanner.set_parameters(mode,
                                       config.interval,
@@ -118,10 +124,14 @@ def DUTScanConfig(DUT,
     return _config
 
 @pytest.fixture
-def DUTScanStart(DUT):
+def DUTScanStart(DUT,
+                 DUTScanConfig):
     started = False
-    def _start(*, phy, discover_mode):
+    def _start(*, phy, discover_mode, mode=None):
         nonlocal started
+        if mode is None:
+            mode = getattr(DUT.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
+        DUTScanConfig(mode=mode)
         DUT.bt.scanner.start(phy, discover_mode)
         log.info("DUT scanning started")
         started = True
@@ -187,6 +197,7 @@ def TesterAdvConfig(Tester,
     log.info("Configuring Tester Advertiser")
 
     config = dataclass_from_dict(AdvertiserConfig, Config.get("advertiser",{}))
+    config = normalize_advertiser_config(config)
 
     rsp = Tester.bt.advertiser.create_set()
     config.set = rsp.handle
@@ -237,10 +248,11 @@ def TesterScanConfig(Tester,
                      Config) -> ScannerConfig:
     def _config(*, mode):
         config = dataclass_from_dict(ScannerConfig, Config.get("scanner",{}))
+        config = normalize_scanner_config(config)
         # Configure the scanner
-        DUT.bt.scanner.set_parameters(mode,
-                                      config.interval,
-                                      config.window)
+        Tester.bt.scanner.set_parameters(mode,
+                                         config.interval,
+                                         config.window)
 
     return _config
 
@@ -248,8 +260,11 @@ def TesterScanConfig(Tester,
 def TesterScanStart(Tester,
                     TesterScanConfig):
     started = False
-    def _start(*, phy, discover_mode):
+    def _start(*, phy, discover_mode, mode=None):
         nonlocal started
+        if mode is None:
+            mode = getattr(Tester.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
+        TesterScanConfig(mode=mode)
         Tester.bt.scanner.start(phy, discover_mode)
         log.info("Tester scanning started")
         started = True
@@ -328,6 +343,7 @@ def ConnectBLEDevices(Config):
         dev_ctrl = central
         dev_per = peripheral
         params = dataclass_from_dict(ConnectionParameters, Config.get("connection", {}))
+        params = normalize_connection_parameters(params)
 
         central_conn, peripheral_conn = connect_devices(
             central,
@@ -398,10 +414,8 @@ def test_beacon(JoulescopeDev,
         else:
             break
 
-    # Run the capture and store it
-    # BLE advertising interval units are 0.625 ms; capture expects seconds.
-    capture_s = 10 * DUTAdvConfig.max_interval * 0.000625
-    JoulescopeDev.capture(capture_s)
+    capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
+    JoulescopeDev.capture(10.0)
 
 
 def test_conn_adv(JoulescopeDev,
@@ -432,8 +446,7 @@ def test_conn_adv(JoulescopeDev,
         else:
             break
 
-    # BLE advertising interval units are 0.625 ms; capture expects seconds.
-    capture_s = 10 * DUTAdvConfig.max_interval * 0.000625
+    capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
     JoulescopeDev.capture(capture_s)
 
 def test_conn_central(JoulescopeDev,
@@ -452,7 +465,7 @@ def test_conn_central(JoulescopeDev,
     )
 
     n_events = 10
-    capture_s = n_events * conn_params.max_interval * 0.00125
+    capture_s = float(connection_ms_from_units(n_events * conn_params.max_interval) / 1000)
     log.info(f"Capturing Conn Adv for {capture_s}s")
     JoulescopeDev.capture(capture_s)
 
@@ -473,7 +486,7 @@ def test_conn_peripheral(JoulescopeDev,
     )
 
     n_events = 10
-    capture_s = n_events * conn_params.max_interval * 0.00125
+    capture_s = float(connection_ms_from_units(n_events * conn_params.max_interval) / 1000)
     log.info(f"Capturing Conn Adv for {capture_s}s")
     JoulescopeDev.capture(capture_s)
 
@@ -488,13 +501,16 @@ def test_scanner(JoulescopeDev,
         discover_mode=Tester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
         connectable_mode=Tester.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
+    scan_mode = getattr(DUT.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
+    scan_config = DUTScanConfig(mode=scan_mode)
     DUTScanStart(
         phy=DUT.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
-        discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+        discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
+        mode=scan_mode,
     )
 
     n_events = 10
-    capture_s =  n_events * DUTScanConfig.interval * 0.000625
+    capture_s = float(advertising_ms_from_units(n_events * scan_config.interval) / 1000)
     JoulescopeDev.capture(capture_s)
 
 def test_PAwR_obs(DUT,
