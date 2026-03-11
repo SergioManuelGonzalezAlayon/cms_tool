@@ -13,7 +13,10 @@ clean-fw-tester:
     if (Test-Path .fw_build\tester) { Remove-Item -Recurse -Force .fw_build\tester }
 
 clean-confs:
-    Get-ChildItem tests\configs -Recurse -Filter *.json -File | Where-Object { $_.Name -notin @('default.json', 'parameters.json') } | Remove-Item -Force
+    pipenv run python .\tests\configs\config_manager.py clean
+
+gen-confs mode="both":
+    pipenv run python .\tests\configs\config_manager.py generate --mode {{mode}}
 
 test-smoke:
     pipenv run pytest .\tests\joulescope_interface.py -o log_cli=true --log-cli-level=INFO

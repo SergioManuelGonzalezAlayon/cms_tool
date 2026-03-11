@@ -1,4 +1,4 @@
-.PHONY: default help clean-fw clean-fw-dut clean-fw-tester clean-confs test-smoke test-ble test-ble-all test-ble-beacon test-ble-connadv-central test-ble-connadv-peripheral
+.PHONY: default help clean-fw clean-fw-dut clean-fw-tester clean-confs gen-configs test-smoke test-ble test-ble-all test-ble-beacon test-ble-connadv-central test-ble-connadv-peripheral
 
 default: help
 
@@ -9,6 +9,7 @@ help:
 	@echo "  make clean-fw-dut                Remove the generated DUT project under .fw_build\\dut"
 	@echo "  make clean-fw-tester             Remove the generated tester project under .fw_build\\tester"
 	@echo "  make clean-confs                 Remove generated test config JSONs under tests\\configs"
+	@echo "  make gen-configs                 Generate all config matrices, including full sweeps"
 	@echo ""
 	@echo "  make test-smoke                  Run the Joulescope smoke test suite"
 	@echo "  make test-ble case=<name>        Run a single BLE test (e.g. case=beacon)"
@@ -17,6 +18,7 @@ help:
 	@echo "Examples:"
 	@echo "  make clean-fw"
 	@echo "  make clean-confs"
+	@echo "  make gen-configs"
 	@echo "  make test-ble case=beacon"
 	@echo "  make test-ble-all"
 
@@ -30,7 +32,10 @@ clean-fw-tester:
 	@powershell -NoProfile -Command "if (Test-Path '.fw_build\\tester') { Remove-Item -Recurse -Force '.fw_build\\tester' }"
 
 clean-confs:
-	@powershell -NoProfile -Command "Get-ChildItem tests\\configs -Recurse -Filter *.json -File | Where-Object { $$_.Name -notin @('default.json', 'parameters.json') } | Remove-Item -Force"
+	python -m pipenv run python .\tests\configs\config_manager.py clean
+
+gen-confs:
+	python -m pipenv run python .\tests\configs\config_manager.py generate --mode $(if $(mode),$(mode),both)
 
 test-smoke:
 	python -m pipenv run pytest .\tests\joulescope_interface.py -o log_cli=true --log-cli-level=INFO
