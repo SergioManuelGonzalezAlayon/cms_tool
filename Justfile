@@ -3,8 +3,12 @@ set shell := ["powershell", "-NoProfile", "-Command"]
 default:
     just --list
 
+build board="brd4182a":
+    pipenv run python .\apps\app_manager.py clean
+    pipenv run python .\apps\app_manager.py rebuild --board {{board}}
+
 clean-fw:
-    if (Test-Path .fw_build) { Remove-Item -Recurse -Force .fw_build }
+    pipenv run python .\apps\app_manager.py clean
 
 clean-fw-dut:
     if (Test-Path .fw_build\dut) { Remove-Item -Recurse -Force .fw_build\dut }
@@ -12,10 +16,10 @@ clean-fw-dut:
 clean-fw-tester:
     if (Test-Path .fw_build\tester) { Remove-Item -Recurse -Force .fw_build\tester }
 
-clean-confs:
+clean-configs:
     pipenv run python .\tests\configs\config_manager.py clean
 
-gen-confs mode="both":
+gen-configs mode="both":
     pipenv run python .\tests\configs\config_manager.py generate --mode {{mode}}
 
 test-smoke:

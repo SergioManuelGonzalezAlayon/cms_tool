@@ -3,10 +3,10 @@ import hashlib
 import subprocess
 import shutil
 import logging
-import time
 from pathlib import Path
 from dataclasses import fields
 import pytest
+from apps.app_manager import read_dev_config
 
 log = logging.getLogger(__name__)
 
@@ -16,11 +16,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         default=None,
         help="Config filename inside the test's config folder, e.g. non_conn_adv_200ms.json",
-    )
-    parser.addoption(
-        "--provision-fw",
-        action="store_true",
-        help="Build+flash DUT and tester before tests",
     )
 
 def _test_config_dir(request: pytest.FixtureRequest) -> Path:
@@ -73,51 +68,14 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest) -> None:
     cfg_opt = request.config.getoption("--cfg")
     js.capture_config_name = Path(cfg_opt).name if cfg_opt else "default.json"
 
-def _run(cmd, cwd=None):
-    exe = shutil.which(cmd[0])
+def _flash(image: Path, probe_sn: str):
+    exe = shutil.which("commander")
     if exe is None:
         pytest.fail(
-            f"Required tool '{cmd[0]}' not found on PATH. "
-            "Ensure Simplicity Studio CLI tools and CMake are installed and available."
+            "Required tool 'commander' not found on PATH. "
+            "Ensure Simplicity Studio CLI tools are installed and available."
         )
-
-    resolved_cmd = [exe, *cmd[1:]]
-    subprocess.run(resolved_cmd, cwd=cwd, check=True, text=True)
-
-
-def _read_dev_config(path: Path = Path("dev_config.json")) -> dict:
-    if not path.exists():
-        pytest.fail(f"Missing {path}. Required for probe serial fallback.")
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-def _upgrade_generated_slcp(slcp: Path, out_dir: Path) -> Path:
-    generated_slcp = out_dir / slcp.name
-    shutil.copy2(slcp, generated_slcp)
-    _run(["slc", "upgrade", "-p", generated_slcp.name], cwd=out_dir)
-    return generated_slcp
-
-
-def _build_slcp(slcp: Path, out_dir: Path, project_name: str, board: str) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log.info("FW build start: project=%s slcp=%s out=%s board=%s", project_name, slcp, out_dir, board)
-    t0 = time.monotonic()
-
-    _run(["slc", "generate", str(slcp), "-d", str(out_dir), f"-name={project_name}", "--with", board])
-    log.info("FW generate done: project=%s", project_name)
-    generated_slcp = _upgrade_generated_slcp(slcp, out_dir)
-    log.info("FW upgrade done: project=%s slcp=%s", project_name, generated_slcp)
-    _run(["cmake", "--workflow", "--preset", "project"], cwd=out_dir / "cmake_gcc")
-    log.info("FW compile done: project=%s", project_name)
-
-    candidates = list((out_dir / "cmake_gcc").rglob("*.s37")) + list((out_dir / "cmake_gcc").rglob("*.hex"))
-    if not candidates:
-        raise RuntimeError(f"No firmware image found under {out_dir}")
-    log.info("FW build complete: project=%s image=%s elapsed=%.1fs", project_name, candidates[0], time.monotonic() - t0)
-    return candidates[0]
-
-
-def _flash(image: Path, probe_sn: str):
-    _run(["commander", "flash", str(image), "--serialno", probe_sn])
+    subprocess.run([exe, "flash", str(image), "--serialno", probe_sn], check=True, text=True)
 
 
 def _file_sha256(path: Path) -> str:
@@ -138,6 +96,31 @@ def _image_metadata(image: Path, *, slcp: Path, board: str, project_name: str, p
         "sha256": _file_sha256(image),
         "size": image.stat().st_size,
     }
+
+
+def _project_output_dir(build_root: Path, slcp: Path, *, project_name: str) -> Path:
+    candidates = [
+        build_root / slcp.stem,
+        build_root / project_name.removeprefix("ncp_ble_"),
+        build_root / project_name,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _find_prebuilt_image(build_root: Path, *, slcp: Path, project_name: str) -> Path:
+    out_dir = _project_output_dir(build_root, slcp, project_name=project_name)
+    candidates = list((out_dir / "cmake_gcc").rglob("*.s37")) + list((out_dir / "cmake_gcc").rglob("*.hex"))
+    if not candidates:
+        pytest.fail(
+            "Missing prebuilt firmware image.\n"
+            f"Expected build output under: {out_dir}\n"
+            f"SLCP: {slcp}\n"
+            "Run `just build` or `make build` before executing pytest."
+        )
+    return candidates[0]
 
 
 def _dut_state_path(build_root: Path) -> Path:
@@ -168,9 +151,6 @@ def _same_image(current: dict, previous: dict | None) -> bool:
 
 @pytest.fixture(autouse=True)
 def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
-    if not request.config.getoption("--provision-fw"):
-        return
-
     if "Config" not in request.fixturenames:
         return
 
@@ -187,7 +167,7 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
     if missing:
         pytest.fail("Missing 'firmware' fields in test config: " + ", ".join(missing))
 
-    dev_cfg = _read_dev_config()
+    dev_cfg = read_dev_config(Path("dev_config.json"))
     build_root_str = fw.get("build_root") or dev_cfg.get("firmware", {}).get("build_root")
     if not build_root_str:
         pytest.fail(
@@ -208,29 +188,21 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
     previous_dut_state = _read_provision_state(dut_state_path)
     previous_tester_state = _read_provision_state(tester_state_path)
 
-    dut_image = _build_slcp(
-        slcp=Path(fw["dut_slcp"]),
-        out_dir=build_root / "dut",
-        project_name="ncp_ble_dut",
-        board=fw["board"],
-    )
-    tester_image = _build_slcp(
-        slcp=Path(fw["tester_slcp"]),
-        out_dir=build_root / "tester",
-        project_name="ncp_ble_tester",
-        board=fw["board"],
-    )
+    dut_slcp = Path(fw["dut_slcp"])
+    tester_slcp = Path(fw["tester_slcp"])
+    dut_image = _find_prebuilt_image(build_root, slcp=dut_slcp, project_name="ncp_ble_dut")
+    tester_image = _find_prebuilt_image(build_root, slcp=tester_slcp, project_name="ncp_ble_tester")
 
     dut_required = _image_metadata(
         dut_image,
-        slcp=Path(fw["dut_slcp"]),
+        slcp=dut_slcp,
         board=fw["board"],
         project_name="ncp_ble_dut",
         probe_sn=dut_probe_sn,
     )
     tester_required = _image_metadata(
         tester_image,
-        slcp=Path(fw["tester_slcp"]),
+        slcp=tester_slcp,
         board=fw["board"],
         project_name="ncp_ble_tester",
         probe_sn=tester_probe_sn,
