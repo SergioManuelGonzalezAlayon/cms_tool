@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from dataclasses import fields
 import pytest
-from apps.app_manager import read_dev_config
+from apps.app_manager import read_dev_config as _read_dev_config
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +149,39 @@ def _same_image(current: dict, previous: dict | None) -> bool:
     return all(current.get(key) == previous.get(key) for key in keys)
 
 
+def _short_hash(image_meta: dict | None) -> str:
+    if not image_meta:
+        return "missing"
+    return str(image_meta.get("sha256", "missing"))[:12]
+
+
+def _log_flash_decision(label: str, required: dict, previous: dict | None, should_flash: bool) -> None:
+    if should_flash:
+        if previous:
+            log.info(
+                "%s flash required: hash changed %s -> %s image=%s",
+                label,
+                _short_hash(previous),
+                _short_hash(required),
+                required["image"],
+            )
+        else:
+            log.info(
+                "%s flash required: no previous state image=%s hash=%s",
+                label,
+                required["image"],
+                _short_hash(required),
+            )
+        return
+
+    log.info(
+        "%s flash skipped: image unchanged image=%s hash=%s",
+        label,
+        required["image"],
+        _short_hash(required),
+    )
+
+
 @pytest.fixture(autouse=True)
 def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
     if "Config" not in request.fixturenames:
@@ -167,7 +200,7 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
     if missing:
         pytest.fail("Missing 'firmware' fields in test config: " + ", ".join(missing))
 
-    dev_cfg = read_dev_config(Path("dev_config.json"))
+    dev_cfg = _read_dev_config(Path("dev_config.json"))
     build_root_str = fw.get("build_root") or dev_cfg.get("firmware", {}).get("build_root")
     if not build_root_str:
         pytest.fail(
@@ -211,10 +244,26 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
     dut_matches = _same_image(dut_required, previous_dut_state.get("last_flashed"))
     tester_already_flashed = bool(previous_tester_state.get("last_flashed"))
 
+    _log_flash_decision("DUT", dut_required, previous_dut_state.get("last_flashed"), not dut_matches)
+    if tester_already_flashed:
+        log.info(
+            "Tester flash skipped: tester_ready.json present image=%s hash=%s",
+            tester_required["image"],
+            _short_hash(tester_required),
+        )
+    else:
+        log.info(
+            "Tester flash required: tester_ready.json missing image=%s hash=%s",
+            tester_required["image"],
+            _short_hash(tester_required),
+        )
+
     if not dut_matches:
         _flash(dut_image, dut_probe_sn)
+        log.info("DUT flashed successfully: %s", dut_image)
     if not tester_already_flashed:
         _flash(tester_image, tester_probe_sn)
+        log.info("Tester flashed successfully: %s", tester_image)
 
     _write_provision_state(
         dut_state_path,
