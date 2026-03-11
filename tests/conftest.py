@@ -140,8 +140,12 @@ def _image_metadata(image: Path, *, slcp: Path, board: str, project_name: str, p
     }
 
 
-def _provision_state_path(build_root: Path) -> Path:
-    return build_root / "provision_state.json"
+def _dut_state_path(build_root: Path) -> Path:
+    return build_root / "dut_last_flashed.json"
+
+
+def _tester_ready_path(build_root: Path) -> Path:
+    return build_root / "tester_ready.json"
 
 
 def _read_provision_state(path: Path) -> dict:
@@ -199,8 +203,10 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
             "or provide firmware.dut_probe_sn/tester_probe_sn in test config."
         )
 
-    state_path = _provision_state_path(build_root)
-    previous_state = _read_provision_state(state_path)
+    dut_state_path = _dut_state_path(build_root)
+    tester_state_path = _tester_ready_path(build_root)
+    previous_dut_state = _read_provision_state(dut_state_path)
+    previous_tester_state = _read_provision_state(tester_state_path)
 
     dut_image = _build_slcp(
         slcp=Path(fw["dut_slcp"]),
@@ -215,45 +221,44 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
         board=fw["board"],
     )
 
-    required_state = {
-        "cfg_path": cfg_path,
-        "board": fw["board"],
-        "dut": _image_metadata(
-            dut_image,
-            slcp=Path(fw["dut_slcp"]),
-            board=fw["board"],
-            project_name="ncp_ble_dut",
-            probe_sn=dut_probe_sn,
-        ),
-        "tester": _image_metadata(
-            tester_image,
-            slcp=Path(fw["tester_slcp"]),
-            board=fw["board"],
-            project_name="ncp_ble_tester",
-            probe_sn=tester_probe_sn,
-        ),
-    }
+    dut_required = _image_metadata(
+        dut_image,
+        slcp=Path(fw["dut_slcp"]),
+        board=fw["board"],
+        project_name="ncp_ble_dut",
+        probe_sn=dut_probe_sn,
+    )
+    tester_required = _image_metadata(
+        tester_image,
+        slcp=Path(fw["tester_slcp"]),
+        board=fw["board"],
+        project_name="ncp_ble_tester",
+        probe_sn=tester_probe_sn,
+    )
 
-    last_flashed = previous_state.get("last_flashed", {})
-    dut_matches = _same_image(required_state["dut"], last_flashed.get("dut"))
-    tester_matches = _same_image(required_state["tester"], last_flashed.get("tester"))
+    dut_matches = _same_image(dut_required, previous_dut_state.get("last_flashed"))
+    tester_already_flashed = bool(previous_tester_state.get("last_flashed"))
 
     if not dut_matches:
         _flash(dut_image, dut_probe_sn)
-    if not tester_matches:
+    if not tester_already_flashed:
         _flash(tester_image, tester_probe_sn)
 
     _write_provision_state(
-        state_path,
+        dut_state_path,
         {
             "cfg_path": cfg_path,
-            "status": "reused" if dut_matches and tester_matches else "flashed",
-            "required": required_state,
-            "last_flashed": {
-                "cfg_path": cfg_path,
-                "board": fw["board"],
-                "dut": required_state["dut"],
-                "tester": required_state["tester"],
-            },
+            "status": "reused" if dut_matches else "flashed",
+            "required": dut_required,
+            "last_flashed": dut_required,
+        },
+    )
+    _write_provision_state(
+        tester_state_path,
+        {
+            "cfg_path": cfg_path,
+            "status": "reused" if tester_already_flashed else "flashed_once",
+            "required": tester_required,
+            "last_flashed": previous_tester_state.get("last_flashed", tester_required),
         },
     )
