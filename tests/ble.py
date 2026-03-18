@@ -70,9 +70,9 @@ def DUTAdvConfig(DUT,
     assert rsp.result == 0
     log.info("DUT Advertiser configured")
 
-    #DUT.bt.advertiser.set_tx_power(config.set, config.tx_power)
-    #DUT.bt.extended_advertiser.set_phy(config.set, config.phy, config.phy)
-    #DUT.bt.extended_advertiser.set_data(config.set, config.payload)
+    DUT.bt.advertiser.set_tx_power(config.set, config.tx_power)
+    DUT.bt.extended_advertiser.set_phy(config.set, config.phy, config.phy)
+    DUT.bt.extended_advertiser.set_data(config.set, config.payload)
 
     return config
 
@@ -81,13 +81,10 @@ def DUTAdvStart(DUT,
                 DUTAdvConfig):
     started = False
 
-    def start(*, discover_mode, connectable_mode):
+    def start(*, connectable_mode, flags=0):
         nonlocal started
 
-        #rsp = DUT.bt.legacy_advertiser.generate_data(DUTAdvConfig.set, discover_mode)
-        #assert rsp.result == 0
-
-        rsp = DUT.bt.legacy_advertiser.start(DUTAdvConfig.set, connectable_mode)
+        rsp = DUT.bt.extended_advertiser.start(DUTAdvConfig.set, connectable_mode, flags)
         assert rsp.result == 0
         log.info("DUT Advertising started")
         started = True
@@ -127,12 +124,12 @@ def DUTScanConfig(DUT,
 def DUTScanStart(DUT,
                  DUTScanConfig):
     started = False
-    def _start(*, phy, discover_mode, mode=None):
+    def _start(*, discover_mode, mode=None):
         nonlocal started
         if mode is None:
             mode = getattr(DUT.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
-        DUTScanConfig(mode=mode)
-        DUT.bt.scanner.start(phy, discover_mode)
+        cfg = DUTScanConfig(mode=mode)
+        DUT.bt.scanner.start(cfg.phy, discover_mode)
         log.info("DUT scanning started")
         started = True
 
@@ -150,15 +147,12 @@ def DUTPAwRStart(DUT,
     started = False
     pawr_cfg = dataclass_from_dict(PAWRConfig, Config.get("pawr", {}))
 
-    def _start(primary_phy, secondary_phy, flags=0):
+    def _start(flags=0):
         nonlocal started
 
-        if secondary_phy == DUT.bt.gap.PHY_PHY_ANY:
-            secondary_phy = DUT.bt.gap.PHY_PHY_1M
-
         rsp = DUT.bt.extended_advertiser.set_phy(DUTAdvConfig.set,
-                                                 primary_phy,
-                                                 secondary_phy)
+                                                 DUTAdvConfig.phy,
+                                                 DUTAdvConfig.phy)
         assert rsp.result == 0
 
         rsp = DUT.bt.pawr_advertiser.start(
@@ -204,12 +198,16 @@ def TesterAdvConfig(Tester,
     assert rsp.result == 0
 
     rsp = Tester.bt.advertiser.set_timing(config.set,
-                                        config.min_interval,
-                                        config.max_interval,
-                                        config.duration,
-                                        config.max_events)
+                                          config.min_interval,
+                                          config.max_interval,
+                                          config.duration,
+                                          config.max_events)
     assert rsp.result == 0
     log.info("Tester Advertiser configured")
+
+    Tester.bt.advertiser.set_tx_power(config.set, config.tx_power)
+    Tester.bt.extended_advertiser.set_phy(config.set, config.phy, config.phy)
+    Tester.bt.extended_advertiser.set_data(config.set, config.payload)
 
     return config
 
@@ -218,12 +216,10 @@ def TesterAdvStart(Tester,
                    TesterAdvConfig):
     started = False
 
-    def start(*, discover_mode, connectable_mode):
+    def start(*, connectable_mode, flags=0):
         nonlocal started
-        rsp = Tester.bt.legacy_advertiser.generate_data(TesterAdvConfig.set, discover_mode)
-        assert rsp.result == 0
 
-        rsp = Tester.bt.legacy_advertiser.start(TesterAdvConfig.set, connectable_mode)
+        rsp = Tester.bt.extended_advertiser.start(TesterAdvConfig.set, connectable_mode, flags)
         assert rsp.result == 0
         log.info("Tester Advertising started")
         started = True
@@ -253,6 +249,8 @@ def TesterScanConfig(Tester,
         Tester.bt.scanner.set_parameters(mode,
                                          config.interval,
                                          config.window)
+        
+        return config
 
     return _config
 
@@ -260,12 +258,12 @@ def TesterScanConfig(Tester,
 def TesterScanStart(Tester,
                     TesterScanConfig):
     started = False
-    def _start(*, phy, discover_mode, mode=None):
+    def _start(*, discover_mode, mode=None):
         nonlocal started
         if mode is None:
             mode = getattr(Tester.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
-        TesterScanConfig(mode=mode)
-        Tester.bt.scanner.start(phy, discover_mode)
+        cfg = TesterScanConfig(mode=mode)
+        Tester.bt.scanner.start(cfg.phy, discover_mode)
         log.info("Tester scanning started")
         started = True
 
@@ -331,7 +329,6 @@ def ConnectBLEDevices(Config):
     def _connect_devices(*,
                     central, 
                     peripheral,
-                    phy,
                     retry_sleep=0.25,
                     max_retries=3):
         """
@@ -348,7 +345,6 @@ def ConnectBLEDevices(Config):
         central_conn, peripheral_conn = connect_devices(
             central,
             peripheral,
-            phy,
             params,
             retry_sleep=retry_sleep,
             max_retries=max_retries)
@@ -391,11 +387,9 @@ def test_beacon(JoulescopeDev,
                 DUTAdvStart,
                 TesterScanStart):
     DUTAdvStart(
-        discover_mode=DUT.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
         connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
     )
     TesterScanStart(
-        phy=Tester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
         discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
     )
 
@@ -406,7 +400,7 @@ def test_beacon(JoulescopeDev,
         log.info("Beacon detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
         event = bgapi_check_event(Tester,
                                   "scanner",
-                                  "legacy_advertisement_report",
+                                  "extended_advertisement_report",
                                   lambda evt: (evt.address == dut_addr))
     
         if event is None and attempt == MAX_TEST_RETRIES - 1:
@@ -425,11 +419,9 @@ def test_conn_adv(JoulescopeDev,
                   DUTAdvStart,
                   TesterScanStart):
     DUTAdvStart(
-        discover_mode=DUT.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
-        connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+        connectable_mode=DUT.bt.extended_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
     TesterScanStart(
-        phy=Tester.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
         discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
     )
 
@@ -438,7 +430,7 @@ def test_conn_adv(JoulescopeDev,
         log.info("Connectable advertiser detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
         event = bgapi_check_event(Tester,
                                   "scanner",
-                                  "legacy_advertisement_report",
+                                  "extended_advertisement_report",
                                   lambda evt: (evt.address == dut_addr))
 
         if event is None and attempt == MAX_TEST_RETRIES - 1:
@@ -456,13 +448,11 @@ def test_conn_central(JoulescopeDev,
                       TesterAdvStart,
                       ConnectBLEDevices):
     TesterAdvStart(
-        discover_mode=Tester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
-        connectable_mode=Tester.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+        connectable_mode=Tester.bt.extended_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
     _, _, conn_params = ConnectBLEDevices(
         central=DUT,
-        peripheral=Tester,
-        phy=DUT.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
+        peripheral=Tester
     )
 
     n_events = 10
@@ -477,13 +467,11 @@ def test_conn_peripheral(JoulescopeDev,
                          DUTAdvStart,
                          ConnectBLEDevices):
     DUTAdvStart(
-        discover_mode=DUT.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
-        connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+        connectable_mode=DUT.bt.extended_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
     _, _, conn_params = ConnectBLEDevices(
         central=Tester,
-        peripheral=DUT,
-        phy=Tester.bt.gap.PHY_CODING_PHY_CODING_1M_UNCODED
+        peripheral=DUT
     )
 
     n_events = 10
@@ -499,13 +487,11 @@ def test_scanner(JoulescopeDev,
                  DUTScanConfig,
                  DUTScanStart):
     TesterAdvStart(
-        discover_mode=Tester.bt.advertiser.DISCOVERY_MODE_GENERAL_DISCOVERABLE,
-        connectable_mode=Tester.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+        connectable_mode=Tester.bt.extended_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
     scan_mode = getattr(DUT.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
     scan_config = DUTScanConfig(mode=scan_mode)
     DUTScanStart(
-        phy=DUT.bt.scanner.SCAN_PHY_SCAN_PHY_1M,
         discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
         mode=scan_mode,
     )
@@ -519,11 +505,6 @@ def test_PAwR_obs(DUT,
                   DUTPAwRStart,
                   TesterScanSync):
     dut_address = get_device_addr(DUT)
-
-    DUTPAwRStart(
-        primary_phy=DUT.bt.gap.PHY_PHY_1M,
-        secondary_phy=DUT.bt.gap.PHY_PHY_1M
-    )
 
     TesterScanSync(
         address=dut_address,

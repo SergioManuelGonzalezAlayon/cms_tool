@@ -86,7 +86,7 @@
             "control": "bgapi",
             "default": "1mbps",
             "file_token": "phy",
-            "config_path": "radio.phy",
+            "config_path": "advertiser.phy",
             "values": [
                 "125kbps",
                 "500kbps",
@@ -104,7 +104,7 @@
                 "min": "0 dBm",
                 "max": "20 dBm"
             },
-            "config_path": "radio.tx_power_dbm"
+            "config_path": "advertiser.tx_power"
         },
         {
             "name": "advertising_interval",

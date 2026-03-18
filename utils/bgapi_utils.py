@@ -66,6 +66,7 @@ class AdvertiserConfig:
 class ScannerConfig:
     window: int = 50
     interval: int = 100
+    phy: str | int = "1mbps"
 
 
 @dataclass
@@ -79,10 +80,14 @@ class ConnectionParameters:
     max_ce_lenght: int = 0xffff
     rx_payload_length :int = 0
     tx_payload_length :int = 0
+    tx_power: int | float = 0
+    phy : int = 0
 
 
 @dataclass
 class PAWRConfig:
+    interval: int = 1000
+    rx_payload_length: int = 0
     num_subevents: int = 0
     subevent_interval: int = 0
     response_slot_delay: int = 0
@@ -195,6 +200,7 @@ def normalize_advertiser_config(config: AdvertiserConfig) -> AdvertiserConfig:
 def normalize_scanner_config(config: ScannerConfig) -> ScannerConfig:
     config.interval = advertising_units_from_ms(config.interval)
     config.window = advertising_units_from_ms(config.window)
+    config.phy = advertising_phy_from_str(config.phy)
     return config
 
 
@@ -217,6 +223,8 @@ def normalize_connection_parameters(params: ConnectionParameters) -> ConnectionP
     if params.timeout <= 0:
         log.warning("Connection supervision timeout %s is invalid. Using 100 (1.0 s).", params.timeout)
         params.timeout = 100
+    params.tx_power = advertising_tx_power_from_dbm(params.tx_power)
+    params.phy = advertising_phy_from_str(params.phy)
     return params
 
 
@@ -317,7 +325,7 @@ def close_connection(dev, conn_handle):
         log.debug("Error while closing central partial connection: %s", ex)
 
 
-def connection_set_params(dev, params):
+def connection_config_params(dev, params: ConnectionParameters):
     dev.bt.connection.set_default_parameters(
         params.min_interval,
         params.max_interval,
@@ -325,11 +333,44 @@ def connection_set_params(dev, params):
         params.timeout,
         params.min_ce_lenght,
         params.max_ce_lenght)
+    
+    dev.bt.connection.set_default_preferred_phy(params.phy, params.phy)
+    # ATT MTU must be at least 23. Treat rx_payload_length as payload sizing,
+    # not a request to force an invalid MTU during default connection setup.
+    if params.rx_payload_length >= 23:
+        dev.bt.gatt.set_max_mtu(params.rx_payload_length)
+
+
+def connection_set_live_params(dev,
+                               conn_handle,
+                               params: ConnectionParameters):
+    """
+        Set connection parameters that cannot be set as a default value:w
+    """
+    dev.bt.connection.set_tx_power(
+        conn_handle,
+        params.tx_power,
+        params.tx_power
+    )
+    # TX payload length
+    dev.bt.connection.set_data_length(
+        conn_handle,
+        params.tx_payload_length,
+        328
+    )
+    bgapi_check_event(
+                dev,
+                "connection",
+                "data_length",
+                lambda evt: evt.connection == conn_handle,
+                eventTimeout=1,
+                maxTime=5,
+    )
+
 
 
 def connect_devices(central,
                     peripheral,
-                    phy,
                     parameters: ConnectionParameters,
                     retry_sleep=0.25,
                     max_retries=3):
@@ -346,8 +387,8 @@ def connect_devices(central,
 
     central_addr = central.bt.system.get_identity_address().address
 
-    connection_set_params(central, parameters)
-    connection_set_params(peripheral, parameters)
+    connection_config_params(central, parameters)
+    connection_config_params(peripheral, parameters)
 
     for attempt in range(max_retries):
         log.info("Connection attempt %d/%d", attempt + 1, max_retries)
@@ -355,7 +396,7 @@ def connect_devices(central,
         rsp = central.bt.connection.open(
             peripheral_addr,
             peripheral_addr_type,
-            phy,
+            parameters.phy,
         )
         assert rsp.result == 0
 
@@ -377,6 +418,9 @@ def connect_devices(central,
                 eventTimeout=1,
                 maxTime=5,
             )
+
+            # Remember to configure the TX power on the opened connection
+            
 
             central_conn = central_event.connection
             peripheral_conn = peripheral_event.connection

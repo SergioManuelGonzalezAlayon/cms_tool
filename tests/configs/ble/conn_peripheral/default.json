@@ -14,11 +14,9 @@
         "interval": 15,
         "latency": 0,
         "tx_payload_length": 10,
-        "rx_payload_length": 10
-    },
-    "radio": {
+        "rx_payload_length": 23,
         "phy": "1mbps",
-        "tx_power_dbm": 0
+        "tx_power": 0
     },
     "firmware": {
         "dut_slcp": "apps/ncp_ble_dut_dcdc.slcp",

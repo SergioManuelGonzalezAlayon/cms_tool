@@ -8,9 +8,7 @@
     },
     "scanner": {
         "interval": 100,
-        "window": 20
-    },
-    "radio": {
+        "window": 20,
         "phy": "1mbps"
     },
     "firmware": {
