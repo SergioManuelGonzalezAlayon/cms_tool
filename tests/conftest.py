@@ -57,6 +57,42 @@ def Config(request: pytest.FixtureRequest) -> dict:
 
     return json.loads(cfg_path.read_text(encoding="utf-8-sig"))
 
+@pytest.fixture(autouse=True)
+def HWInit(request: pytest.FixtureRequest) -> None:
+    if "Config" not in request.fixturenames:
+        return
+
+    config = request.getfixturevalue("Config")
+    hw = config.get("hw", {})
+    supply_v = hw.get("supply_v")
+    if supply_v is None:
+        pytest.fail("Missing 'hw.supply_v' in test config.")
+
+    dev_cfg = _read_dev_config(Path("dev_config.json"))
+    tester_sn = dev_cfg.get("tester", {}).get("probe_sn")
+    if not tester_sn:
+        pytest.fail(
+            "Missing tester probe serial. Set dev_config.json tester.probe_sn."
+        )
+
+    exe = shutil.which("commander")
+    if exe is None:
+        pytest.fail(
+            "Required tool 'commander' not found on PATH. "
+            "Ensure Simplicity Studio CLI tools are installed and available."
+        )
+
+    log.info(
+        "Setting tester adapter voltage: serial=%s voltage=%s V",
+        tester_sn,
+        supply_v,
+    )
+    subprocess.run(
+        [exe, "adapter", "voltage", "-s", str(tester_sn), str(supply_v)],
+        check=True,
+        text=True,
+    )
+
 
 @pytest.fixture(autouse=True)
 def JoulescopeCaptureContext(request: pytest.FixtureRequest) -> None:
