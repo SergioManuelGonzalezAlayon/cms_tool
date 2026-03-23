@@ -4,3 +4,4 @@ artifacts/
 .fw_build/
 .pytest_cache/
 .slc-config/
+dev_config.json

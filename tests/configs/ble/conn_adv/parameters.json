@@ -27,12 +27,40 @@
                     "tx_payload_length",
                     "phy",
                     "tx_power",
+                    "supply_voltage",
                     "dcdc"
                 ]
             }
         }
     },
     "parameters": [
+        {
+            "name": "supply_voltage",
+            "label": "Supply voltage",
+            "control": "hardware",
+            "default": "3.0 V",
+            "file_token": "vdd",
+            "values": [
+                "1.8 V",
+                "2.1 V",
+                "2.4 V",
+                "2.7 V",
+                "3.0 V",
+                "3.3 V",
+                "3.6 V"
+            ],
+            "full_sweep_values": {
+                "dcdc": [
+                    "2.4 V",
+                    "3.3 V"
+                ],
+                "no_dcdc": [
+                    "1.8 V",
+                    "2.4 V"
+                ]
+            },
+            "config_path": "hw.supply_v"
+        },
         {
             "name": "dcdc",
             "label": "DCDC",
@@ -58,7 +86,7 @@
             "control": "bgapi",
             "default": "1mbps",
             "file_token": "phy",
-            "config_path": "radio.phy",
+            "config_path": "advertiser.phy",
             "values": [
                 "125kbps",
                 "500kbps",
@@ -76,7 +104,7 @@
                 "min": "0 dBm",
                 "max": "20 dBm"
             },
-            "config_path": "radio.tx_power_dbm"
+            "config_path": "advertiser.tx_power"
         },
         {
             "name": "advertising_interval",

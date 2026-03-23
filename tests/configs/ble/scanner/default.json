@@ -8,14 +8,15 @@
     },
     "scanner": {
         "interval": 100,
-        "window": 20
-    },
-    "radio": {
+        "window": 20,
         "phy": "1mbps"
     },
     "firmware": {
         "dut_slcp": "apps/ncp_ble_dut_dcdc.slcp",
         "tester_slcp": "apps/ncp_ble_tester.slcp",
         "board": "brd4182a"
+    },
+    "hw": {
+        "supply_v": 3.0
     }
 }
