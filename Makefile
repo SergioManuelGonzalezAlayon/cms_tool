@@ -25,11 +25,11 @@ help:
 	@echo "  make test-ble-all"
 
 build:
-	python -m pipenv run python .\apps\app_manager.py clean
-	python -m pipenv run python .\apps\app_manager.py rebuild --board $(if $(board),$(board),brd4182a)
+	uv run python .\apps\app_manager.py clean
+	uv run python .\apps\app_manager.py rebuild --board $(if $(board),$(board),brd4182a)
 
 clean-fw:
-	python -m pipenv run python .\apps\app_manager.py clean
+	uv run python .\apps\app_manager.py clean
 
 clean-fw-dut:
 	@powershell -NoProfile -Command "if (Test-Path '.fw_build\\dut') { Remove-Item -Recurse -Force '.fw_build\\dut' }"
@@ -38,16 +38,16 @@ clean-fw-tester:
 	@powershell -NoProfile -Command "if (Test-Path '.fw_build\\tester') { Remove-Item -Recurse -Force '.fw_build\\tester' }"
 
 clean-configs:
-	python -m pipenv run python .\tests\configs\config_manager.py clean
+	uv run python .\tests\configs\config_manager.py clean
 
 gen-configs:
-	python -m pipenv run python .\tests\configs\config_manager.py generate --mode $(if $(mode),$(mode),both)
+	uv run python .\tests\configs\config_manager.py generate --mode $(if $(mode),$(mode),both)
 
 test-smoke:
-	python -m pipenv run pytest .\tests\joulescope_interface.py -o log_cli=true --log-cli-level=INFO
+	uv run pytest .\tests\joulescope_interface.py -o log_cli=true --log-cli-level=INFO
 
 test-ble:
-	python -m pipenv run pytest .\tests\ble.py::test_$(case) -o log_cli=true --log-cli-level=INFO
+	uv run pytest .\tests\ble.py::test_$(case) -o log_cli=true --log-cli-level=INFO
 
 test-ble-all:
-	python -m pipenv run pytest .\tests\ble.py -o log_cli=true --log-cli-level=INFO
+	uv run pytest .\tests\ble.py -o log_cli=true --log-cli-level=INFO

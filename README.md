@@ -1,41 +1,138 @@
 # Current Measurement
 
-The Current Measurement tool is intended to measure the current consumption of the Silabs EFR32 devices
-so that different wireless stacks can be measured and further optimized in power consumption for the end
-products. Since this is a Silabs tool is should be integrated with the UTF since it is integrated into 
-various SW Development teams, mainly the SW SQA team. 
+Current Measurement is a hardware-backed test tool for measuring power consumption on Silicon Labs EFR32 devices across BLE scenarios. The repository contains firmware build helpers, BLE test cases, Joulescope capture utilities, and config-generation tooling for parameter sweeps.
 
-## Test structure overview
+## Current Scope
 
-The main test logic lives in `tests/ble.py` and is organized around:
+The main BLE test logic lives in `tests/ble.py`.
 
-- **Configuration**
-  The configuration of the features is done inside the test as `<Device><Feature>Config` so that these are 
-  read from an specific of default configuration file under `tests/configs/<protocol>/<test_name>` so that
-  we know the exact variables of the test that affect the BLE Event. 
+Implemented and wired into the current workflow:
 
-Currently the Beacon, Peripheral and Central Connection cases are covered, different test results will be acquired from different configurations. The PAwR test are not yet implemented.
+- `beacon`
+- `conn_adv`
+- `conn_central`
+- `conn_peripheral`
+- `scanner`
+- `PAwR_obs`
 
-## Usage
+## Prerequisites
 
-The goal of this tool is to get the current estiomation data from N amount of BLE Events, which are defined as the 
-interval between two consecutives WakeUp from Deep Sleep, which include the processing, transmission and return
-to Deep Sleep. There are two main uses, the developer investigating power consumption will require local feedback
-on his desk so that the feedback loop is closed faster, and for the Jenkins agent running the tests on a the lab 
-testing bench that will be inside a Ramsay box.
+- Python `3.10`
+- `uv`
+- Windows machine with the required hardware tools on `PATH` for firmware workflows:
+  - `slc`
+  - `cmake`
+  - `commander`
+- Joulescope-connected test setup for hardware-backed capture and BLE power tests
 
-### For the developer
+For some environments, installing `pyjoulescope-driver` may also require a working Visual C++ / Windows SDK toolchain.
 
-Most environments are `make` friendly and thus we have also added `just` to add more variety:
+## Setup
 
-Examples:
+This repository uses `uv` for dependency management and command execution.
+
 ```powershell
-# Run a single BLE test
-just/make test-ble beacon
+uv sync
+```
 
-# Run all BLE tests
-just/make test-ble-all
+If you want to include development dependencies when they are added later:
 
-However, the tests are run within a virtual python environment inside `pipenv` and can be called by using `pytest` as
-intended. The only requirement is that the devices will be flashed with the applications on this repository using
-the `slc` and `cmake` tools, that way the system can test the application correctly.
+```powershell
+uv sync --dev
+```
+
+## Common Workflows
+
+### Build Firmware Projects
+
+```powershell
+just build
+make build
+uv run python .\apps\app_manager.py rebuild --board brd4182a
+```
+
+### Clean Generated Firmware
+
+```powershell
+just clean-fw
+make clean-fw
+```
+
+### Clean Generated Test Configs
+
+```powershell
+just clean-configs
+make clean-configs
+uv run python .\tests\configs\config_manager.py clean
+```
+
+### Generate Test Configs
+
+Generate both one-factor and full-sweep matrices:
+
+```powershell
+just gen-configs
+make gen-configs
+uv run python .\tests\configs\config_manager.py generate --mode both
+```
+
+Generate only one subset:
+
+```powershell
+just gen-configs one_factor
+uv run python .\tests\configs\config_manager.py generate --mode one_factor
+uv run python .\tests\configs\config_manager.py generate --mode full_sweep
+```
+
+### Run Joulescope Smoke Tests
+
+```powershell
+just test-smoke
+make test-smoke
+uv run pytest .\tests\joulescope_interface.py -o log_cli=true --log-cli-level=INFO
+```
+
+### Run BLE Tests
+
+Run a single BLE case:
+
+```powershell
+just test-ble beacon
+make test-ble case=beacon
+uv run pytest .\tests\ble.py::test_beacon --cfg default.json -o log_cli=true --log-cli-level=INFO
+```
+
+Run a single BLE case with a specific config file:
+
+```powershell
+just test-ble beacon non_conn_adv_300ms.json
+uv run pytest .\tests\ble.py::test_beacon --cfg non_conn_adv_300ms.json -o log_cli=true --log-cli-level=INFO
+```
+
+Run all BLE tests:
+
+```powershell
+just test-ble-all
+make test-ble-all
+uv run pytest .\tests\ble.py -o log_cli=true --log-cli-level=INFO
+```
+
+## Config Layout
+
+Generated test configurations live under `tests/configs`. The config manager supports:
+
+- `generate`
+- `clean`
+- `rebuild`
+- `--mode one_factor|full_sweep|both`
+
+## Notes On Current Status
+
+The repository has been migrated to `uv` structurally, but environment validation is still machine-dependent.
+
+Known caveat:
+
+- `pyjoulescope-driver` may require native compilation on Windows
+- if that happens, a missing MSVC / Windows SDK install can block `uv sync`
+
+If `uv sync` or pytest collection fails while building Joulescope dependencies, verify the local Visual C++ build tools and Windows SDK installation first.
