@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from dataclasses import fields
 import pytest
-from apps.app_manager import read_dev_config as _read_dev_config
+from apps.app_manager import read_dev_config as _read_dev_config, resolve_bootloader_slcp
 
 log = logging.getLogger(__name__)
 
@@ -167,6 +167,10 @@ def _tester_ready_path(build_root: Path) -> Path:
     return build_root / "tester_ready.json"
 
 
+def _bootloader_state_path(build_root: Path, device_name: str) -> Path:
+    return build_root / f"{device_name}_bootloader_flashed.json"
+
+
 def _read_provision_state(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -252,16 +256,36 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
             "or provide firmware.dut_probe_sn/tester_probe_sn in test config."
         )
 
+    bootloader_slcp = resolve_bootloader_slcp()
     dut_state_path = _dut_state_path(build_root)
     tester_state_path = _tester_ready_path(build_root)
+    dut_bootloader_state_path = _bootloader_state_path(build_root, "dut")
+    tester_bootloader_state_path = _bootloader_state_path(build_root, "tester")
     previous_dut_state = _read_provision_state(dut_state_path)
     previous_tester_state = _read_provision_state(tester_state_path)
+    previous_dut_bootloader_state = _read_provision_state(dut_bootloader_state_path)
+    previous_tester_bootloader_state = _read_provision_state(tester_bootloader_state_path)
 
     dut_slcp = Path(fw["dut_slcp"])
     tester_slcp = Path(fw["tester_slcp"])
+    bootloader_image = _find_prebuilt_image(build_root, slcp=bootloader_slcp, project_name="bootloader-uart-bgapi")
     dut_image = _find_prebuilt_image(build_root, slcp=dut_slcp, project_name="ncp_ble_dut")
     tester_image = _find_prebuilt_image(build_root, slcp=tester_slcp, project_name="ncp_ble_tester")
 
+    dut_bootloader_required = _image_metadata(
+        bootloader_image,
+        slcp=bootloader_slcp,
+        board=fw["board"],
+        project_name="bootloader-uart-bgapi",
+        probe_sn=dut_probe_sn,
+    )
+    tester_bootloader_required = _image_metadata(
+        bootloader_image,
+        slcp=bootloader_slcp,
+        board=fw["board"],
+        project_name="bootloader-uart-bgapi",
+        probe_sn=tester_probe_sn,
+    )
     dut_required = _image_metadata(
         dut_image,
         slcp=dut_slcp,
@@ -277,9 +301,23 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
         probe_sn=tester_probe_sn,
     )
 
+    dut_bootloader_matches = _same_image(dut_bootloader_required, previous_dut_bootloader_state.get("last_flashed"))
+    tester_bootloader_matches = _same_image(tester_bootloader_required, previous_tester_bootloader_state.get("last_flashed"))
     dut_matches = _same_image(dut_required, previous_dut_state.get("last_flashed"))
     tester_already_flashed = bool(previous_tester_state.get("last_flashed"))
 
+    _log_flash_decision(
+        "DUT bootloader",
+        dut_bootloader_required,
+        previous_dut_bootloader_state.get("last_flashed"),
+        not dut_bootloader_matches,
+    )
+    _log_flash_decision(
+        "Tester bootloader",
+        tester_bootloader_required,
+        previous_tester_bootloader_state.get("last_flashed"),
+        not tester_bootloader_matches,
+    )
     _log_flash_decision("DUT", dut_required, previous_dut_state.get("last_flashed"), not dut_matches)
     if tester_already_flashed:
         log.info(
@@ -294,6 +332,12 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
             _short_hash(tester_required),
         )
 
+    if not dut_bootloader_matches:
+        _flash(bootloader_image, dut_probe_sn)
+        log.info("DUT bootloader flashed successfully: %s", bootloader_image)
+    if not tester_bootloader_matches:
+        _flash(bootloader_image, tester_probe_sn)
+        log.info("Tester bootloader flashed successfully: %s", bootloader_image)
     if not dut_matches:
         _flash(dut_image, dut_probe_sn)
         log.info("DUT flashed successfully: %s", dut_image)
@@ -301,6 +345,24 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
         _flash(tester_image, tester_probe_sn)
         log.info("Tester flashed successfully: %s", tester_image)
 
+    _write_provision_state(
+        dut_bootloader_state_path,
+        {
+            "cfg_path": cfg_path,
+            "status": "reused" if dut_bootloader_matches else "flashed",
+            "required": dut_bootloader_required,
+            "last_flashed": dut_bootloader_required,
+        },
+    )
+    _write_provision_state(
+        tester_bootloader_state_path,
+        {
+            "cfg_path": cfg_path,
+            "status": "reused" if tester_bootloader_matches else "flashed",
+            "required": tester_bootloader_required,
+            "last_flashed": tester_bootloader_required,
+        },
+    )
     _write_provision_state(
         dut_state_path,
         {
