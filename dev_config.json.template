@@ -17,6 +17,7 @@
         "xapi": "C:\\\\path\\\\to\\\\sdk\\\\sl_bt.xapi"
     },
     "firmware": {
-        "build_root": ".fw_build"
+        "build_root": ".fw_build",
+        "bootloader_slcp": "apps/bootloader-uart-bgapi.slcp"
     }
 }
