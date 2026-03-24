@@ -53,6 +53,7 @@ component:
 - id: bluetooth_feature_pawr_sync
 - id: bluetooth_feature_sm
 - id: bluetooth_feature_sync
+- id: bluetooth_feature_sync_scanner
 - id: bluetooth_feature_system
 - id: bluetooth_feature_test
 - id: bluetooth_stack
