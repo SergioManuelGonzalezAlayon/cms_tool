@@ -628,7 +628,7 @@ def test_scanner(JoulescopeDev,
     capture_s = float(advertising_ms_from_units(n_events * scan_config.interval) / 1000)
     JoulescopeDev.capture(capture_s)
 
-def test_PAwR_obs(DUT,
+def test_PAwR_per(DUT,
                   Tester,
                   DUTAdvConfig,
                   DUTPAwRStart,
@@ -636,7 +636,6 @@ def test_PAwR_obs(DUT,
                   TesterScanSync):
     dut_address = get_device_addr(DUT)
 
-    # What I meant was if we actually ran this within a with TesterScanStart() then when we exit the "when" the scanner is then closed
     TesterScanStart(
         discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
     )
@@ -697,4 +696,7 @@ def test_PAwR_obs(DUT,
         adv_sid=adv_report.adv_sid,
     )
 
+    n_events = 10
+    capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
+    JoulescopeDev.capture(capture_s)
 
