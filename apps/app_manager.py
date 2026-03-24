@@ -10,6 +10,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APPS_DIR = REPO_ROOT / "apps"
 DEFAULT_BUILD_ROOT = REPO_ROOT / ".fw_build"
+DEFAULT_BOOTLOADER_SLCP = APPS_DIR / "bootloader-uart-bgapi.slcp"
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, ok_returncodes: set[int] | None = None) -> subprocess.CompletedProcess:
@@ -54,6 +55,17 @@ def resolve_board(cli_value: str | None) -> str:
     if board:
         return str(board)
     return "brd4182a"
+
+
+def resolve_bootloader_slcp() -> Path:
+    dev_cfg = read_dev_config()
+    configured = dev_cfg.get("firmware", {}).get("bootloader_slcp")
+    path = Path(configured) if configured else DEFAULT_BOOTLOADER_SLCP
+    if not path.is_absolute():
+        path = (REPO_ROOT / path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Could not resolve bootloader SLCP: {path}")
+    return path
 
 
 def discover_slcps(targets: list[str]) -> list[Path]:
