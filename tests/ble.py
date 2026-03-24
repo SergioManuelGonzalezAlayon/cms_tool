@@ -22,7 +22,7 @@ def _format_bd_addr(address) -> str:
 def _match_pawr_advertiser_report(evt, dut_address, *, require_periodic_interval: bool) -> bool:
     if evt.address == dut_address:
         log.info(
-            "Tester saw DUT extended advertisement: address=%s address_type=%s adv_sid=%s periodic_interval=%s",
+            "Matched PAwR advertisement: address=%s address_type=%s adv_sid=%s periodic_interval=%s",
             _format_bd_addr(evt.address),
             evt.address_type,
             evt.adv_sid,
@@ -54,7 +54,7 @@ def _log_sync_event(evt) -> bool:
                     value = _format_bd_addr(value)
                 details.append(f"{field_name}={value}")
         suffix = f" ({', '.join(details)})" if details else ""
-        log.info("Tester sync event: %s.%s%s", evt._class_name, evt._msg_name, suffix)
+        log.info("Sync event: %s.%s%s", evt._class_name, evt._msg_name, suffix)
     return False
 
 @pytest.fixture
@@ -192,7 +192,7 @@ def DUTPAwRStart(DUT,
 
     def _start(*, flags=0):
         nonlocal started
-        pawr_payload = random_payload_bytes(pawr_cfg.payload)
+        pawr_payload = DUTAdvConfig.payload
 
         rsp = DUT.bt.extended_advertiser.set_phy(DUTAdvConfig.set,
                                                  DUTAdvConfig.phy,
@@ -247,6 +247,77 @@ def DUTPAwRStart(DUT,
     else:
         rsp = DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
         assert rsp.result == 0
+
+
+@pytest.fixture
+def DUTScanSync(DUT):
+    """Configure DUT PAwR synchronization with a specific advertiser."""
+    started = False
+    sync_handle = None
+
+    def _start(*, address, address_type, adv_sid=0, skip=0, timeout=200, reporting_mode=None):
+        nonlocal started, sync_handle
+        if reporting_mode is None:
+            reporting_mode = DUT.bt.sync.REPORTING_MODE_REPORT_ALL
+
+        rsp = DUT.bt.sync_scanner.set_sync_parameters(skip, timeout, reporting_mode)
+        assert rsp.result == 0
+        log.info(
+            "DUT sync parameters set: skip=%s timeout=%s reporting_mode=%s",
+            skip,
+            timeout,
+            reporting_mode,
+        )
+
+        rsp = DUT.bt.sync_scanner.open(address, address_type, adv_sid)
+        assert rsp.result == 0
+        sync_handle = rsp.sync
+        log.info(
+            "DUT sync open requested: sync=%s address=%s address_type=%s adv_sid=%s",
+            sync_handle,
+            _format_bd_addr(address),
+            address_type,
+            adv_sid,
+        )
+
+        try:
+            bgapi_check_event(
+                DUT,
+                "pawr_sync",
+                "opened",
+                lambda evt: evt.sync == sync_handle,
+                eventTimeout=1,
+                maxTime=10,
+            )
+            log.info("DUT PAwR sync opened")
+
+        except BGAPIEventTimeoutError:
+            bgapi_check_event(
+                DUT,
+                "pawr_sync",
+                "subevent_report",
+                lambda evt: evt.sync == sync_handle,
+                eventTimeout=1,
+                maxTime=10,
+            )
+            log.info("DUT PAwR sync established via subevent reports")
+
+        started = True
+        return sync_handle
+
+    yield _start
+
+    if started and sync_handle is not None:
+        DUT.bt.sync.close(sync_handle)
+        bgapi_check_event(
+            DUT,
+            "sync",
+            "closed",
+            lambda evt: evt.sync == sync_handle,
+            eventTimeout=1,
+            maxTime=5,
+        )
+        log.info("DUT PAwR sync closed")
 
 @pytest.fixture
 def TesterAdvConfig(Tester,
@@ -349,7 +420,6 @@ def TesterScanSync(Tester):
 
     def _start(*, address, address_type, adv_sid=0, skip=0, timeout=200, reporting_mode=None):
         nonlocal started, sync_handle
-
         if reporting_mode is None:
             reporting_mode = Tester.bt.sync.REPORTING_MODE_REPORT_ALL
 
@@ -372,30 +442,6 @@ def TesterScanSync(Tester):
             address_type,
             adv_sid,
         )
-
-        try:
-            bgapi_check_event(
-                Tester,
-                "periodic_sync",
-                "opened",
-                lambda evt: _log_sync_event(evt),
-                eventTimeout=0.5,
-                maxTime=2,
-            )
-        except BGAPIEventTimeoutError:
-            log.info("No periodic_sync.opened event observed during initial sync debug window")
-
-        try:
-            bgapi_check_event(
-                Tester,
-                "pawr_sync",
-                "opened",
-                lambda evt: _log_sync_event(evt),
-                eventTimeout=0.5,
-                maxTime=2,
-            )
-        except BGAPIEventTimeoutError:
-            log.info("No pawr_sync.opened event observed during initial sync debug window")
 
         try:
             bgapi_check_event(
@@ -446,6 +492,72 @@ def TesterScanSync(Tester):
             maxTime=5,
         )
         log.info("Tester PAwR sync closed")
+
+
+@pytest.fixture
+def TesterPAwRStart(Tester,
+                    TesterAdvConfig,
+                    Config):
+    started = False
+    pawr_cfg = dataclass_from_dict(PAWRConfig, Config.get("pawr", {}))
+
+    def _start(*, flags=0):
+        nonlocal started
+        pawr_payload = TesterAdvConfig.payload
+
+        rsp = Tester.bt.extended_advertiser.set_phy(TesterAdvConfig.set,
+                                                    TesterAdvConfig.phy,
+                                                    TesterAdvConfig.phy)
+        assert rsp.result == 0
+
+        rsp = Tester.bt.pawr_advertiser.start(
+            TesterAdvConfig.set,
+            TesterAdvConfig.min_interval,
+            TesterAdvConfig.max_interval,
+            flags,
+            pawr_cfg.num_subevents,
+            pawr_cfg.subevent_interval,
+            pawr_cfg.response_slot_delay,
+            pawr_cfg.response_slot_spacing,
+            pawr_cfg.response_slots,
+        )
+        assert rsp.result == 0
+
+        for subevent in range(pawr_cfg.num_subevents):
+            rsp = Tester.bt.pawr_advertiser.set_subevent_data(
+                TesterAdvConfig.set,
+                subevent,
+                0,
+                pawr_cfg.response_slots,
+                pawr_payload,
+            )
+            assert rsp.result == 0
+
+        tester_identity = Tester.bt.system.get_identity_address()
+        assert tester_identity.result == 0
+        log.info(
+            "Tester PAwR advertiser started: set=%s identity_address=%s pawr_payload=%sB num_subevents=%s",
+            TesterAdvConfig.set,
+            _format_bd_addr(tester_identity.address),
+            len(pawr_payload),
+            pawr_cfg.num_subevents,
+        )
+        started = True
+
+    yield _start
+
+    if started:
+        try:
+            rsp = Tester.bt.pawr_advertiser.stop(TesterAdvConfig.set)
+            assert rsp.result == 0
+            log.info("Tester PAwR advertiser stopped")
+        finally:
+            rsp = Tester.bt.advertiser.delete_set(TesterAdvConfig.set)
+            assert rsp.result == 0
+            log.info("Tester PAwR advertising set deleted")
+    else:
+        rsp = Tester.bt.advertiser.delete_set(TesterAdvConfig.set)
+        assert rsp.result == 0
 
 @pytest.fixture
 def ConnectBLEDevices(Config):
@@ -628,7 +740,8 @@ def test_scanner(JoulescopeDev,
     capture_s = float(advertising_ms_from_units(n_events * scan_config.interval) / 1000)
     JoulescopeDev.capture(capture_s)
 
-def test_PAwR_per(DUT,
+def test_PAwR_per(JoulescopeDev,
+                  DUT,
                   Tester,
                   DUTAdvConfig,
                   DUTPAwRStart,
@@ -700,3 +813,75 @@ def test_PAwR_per(DUT,
     capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
     JoulescopeDev.capture(capture_s)
 
+
+def test_PAwR_obs(JoulescopeDev,
+                  DUT,
+                  Tester,
+                  TesterAdvConfig,
+                  DUTScanStart,
+                  DUTScanSync,
+                  TesterPAwRStart):
+    tester_address = get_device_addr(Tester)
+
+    DUTScanStart(
+        discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+    )
+
+    TesterPAwRStart(flags=Tester.bt.periodic_advertiser.FLAGS_AUTO_START_EXTENDED_ADVERTISING)
+    log.info(
+        "Tester extended advertising started for PAwR discovery: set=%s identity_address=%s",
+        TesterAdvConfig.set,
+        _format_bd_addr(tester_address),
+    )
+
+    adv_report = bgapi_check_event(
+        DUT,
+        "scanner",
+        "extended_advertisement_report",
+        lambda evt: _match_pawr_advertiser_report(
+            evt,
+            tester_address,
+            require_periodic_interval=False,
+        ),
+        eventTimeout=1,
+        maxTime=10,
+    )
+    log.info(
+        "DUT matched Tester extended advertisement before PAwR start: address=%s address_type=%s adv_sid=%s periodic_interval=%s",
+        _format_bd_addr(adv_report.address),
+        adv_report.address_type,
+        adv_report.adv_sid,
+        adv_report.periodic_interval,
+    )
+
+    adv_report = bgapi_check_event(
+        DUT,
+        "scanner",
+        "extended_advertisement_report",
+        lambda evt: _match_pawr_advertiser_report(
+            evt,
+            tester_address,
+            require_periodic_interval=True,
+        ),
+        eventTimeout=1,
+        maxTime=10,
+    )
+    log.info(
+        "DUT matched Tester PAwR-capable advertisement: address=%s address_type=%s adv_sid=%s periodic_interval=%s",
+        _format_bd_addr(adv_report.address),
+        adv_report.address_type,
+        adv_report.adv_sid,
+        adv_report.periodic_interval,
+    )
+    DUT.bt.scanner.stop()
+    log.info("DUT scanning stopped before PAwR sync open")
+
+    DUTScanSync(
+        address=adv_report.address,
+        address_type=adv_report.address_type,
+        adv_sid=adv_report.adv_sid,
+    )
+
+    n_events = 10
+    capture_s = float(advertising_ms_from_units(n_events * TesterAdvConfig.max_interval) / 1000)
+    JoulescopeDev.capture(capture_s)

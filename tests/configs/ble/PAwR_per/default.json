@@ -1,0 +1,32 @@
+{
+    "test": {
+        "name": "default"
+    },
+    "advertiser": {
+        "interval": 20,
+        "payload": 10,
+        "phy": "1mbps",
+        "tx_power": 0
+    },
+    "scanner": {
+        "interval": 100,
+        "window": 50
+    },
+    "pawr": {
+        "interval": 1000,
+        "rx_payload_length": 10,
+        "num_subevents": 1,
+        "subevent_interval": 6,
+        "response_slot_delay": 1,
+        "response_slot_spacing": 2,
+        "response_slots": 1
+    },
+    "firmware": {
+        "dut_slcp": "apps/ncp_ble_dut_dcdc.slcp",
+        "tester_slcp": "apps/ncp_ble_tester.slcp",
+        "board": "brd4182a"
+    },
+    "hw": {
+        "supply_v": 3.0
+    }
+}
