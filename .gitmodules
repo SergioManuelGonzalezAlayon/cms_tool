@@ -1,0 +1,3 @@
+[submodule "external/power_profiling_tools_val"]
+	path = external/power_profiling_tools_val
+	url = git@stash.silabs.com:mcuw_val_sw/power_profiling_tools_val.git
