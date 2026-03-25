@@ -67,10 +67,14 @@ component:
 - id: ncp
 - id: ncp_user_cmd
 - id: sl_main
+- id: sl_radioprs
+  instance: 
+    - RX
+    - TX
 - instance:
   - vcom
   id: uartdrv_usart
-- id: wake_lock
+# - id: wake_lock
 other_file:
 - path: image/readme_img0.png
 - path: image/readme_img1.png
@@ -94,6 +98,22 @@ configuration:
   value: '0'
 - name: SL_DEVICE_INIT_DCDC_ENABLE
   value: 1
+- name: RADIOPRS_RX_CHANNEL
+  value: 0
+- name: RADIOPRS_RX_SOURCESEL
+  value: PRS_RACL_LNAEN
+- name: RADIOPRS_RX_PORT
+  value: SL_GPIO_PORT_B
+- name: RADIOPRS_RX_PIN
+  value: 2
+- name: RADIOPRS_TX_CHANNEL
+  value: 1
+- name: RADIOPRS_TX_SOURCESEL
+  value: PRS_RACL_PAEN
+- name: RADIOPRS_TX_PORT
+  value: SL_GPIO_PORT_B
+- name: RADIOPRS_TX_PIN
+  value: 3
 ui_hints:
   highlight:
   - path: readme.md
