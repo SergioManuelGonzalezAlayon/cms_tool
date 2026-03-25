@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Current measurement acquisition and analysis utilities"
 readme = "README.md"
 requires-python = "==3.10.*"
-license = { text = "Current measurement tool" }
+license = "LicenseRef-Current-Measurement-Tool"
 authors = [{ name = "Systems" }]
 
 dependencies = [
@@ -20,6 +20,9 @@ dependencies = [
   "pytest>=9",
   "power-profiling-tools-val",
 ]
+
+[tool.setuptools]
+packages = []
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
