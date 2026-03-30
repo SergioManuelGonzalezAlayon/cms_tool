@@ -6,6 +6,7 @@ from algorithms.single_pattern_analysis import SinglePatternCurrentProfileAnalyz
 from presentation.html_report import generate_report
 import matplotlib.pyplot as plt
 from pathlib import Path
+from time import sleep
 
 log = logging.getLogger(__name__)
 
@@ -165,6 +166,8 @@ class JoulescopeConfig:
     vref: str = "3v3"
     post_process: str = "profile"
     irange: str = "auto"
+    use_wake_pin: bool = True
+    dut_sleep_settle_ms: float = 500
     verbose: bool = False
 
 
@@ -238,16 +241,3 @@ def JoulescopeDev():
             )
 
     js.close_driver()
-
-def test_capture(JoulescopeDev):
-    """
-    Test the Joulescope basic capture 
-    """
-    #JouleIscopeDev.run()
-    pass
-
-def test_GPIOInCheck():
-    NotImplementedError
-
-def test_GPIOOutCheck():
-    NotImplementedError

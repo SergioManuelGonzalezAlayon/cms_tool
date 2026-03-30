@@ -3,7 +3,6 @@ import logging
 import json
 import os
 from dataclasses import dataclass
-from time import sleep
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
 from joulescope_interface import JoulescopeDev
@@ -17,6 +16,33 @@ log = logging.getLogger(__name__)
 
 def _format_bd_addr(address) -> str:
     return str(address)
+
+
+def open_ble_dev(dev, wakeUp=None):
+    dev.open()
+    dev.bt.system.reset(0)
+    bgapi_check_event(
+        dev,
+        "system",
+        "boot",
+        lambda evt: True,
+        eventTimeout=1,
+        maxTime=5,
+    )
+
+    if wakeUp is not None:
+        wakeUp.setDUTAwake()
+        bgapi_check_event(
+            dev,
+            "system",
+            "awake",
+            lambda evt: True,
+            eventTimeout=1,
+            maxTime=5,
+        )
+
+    log.info("BLE device reported system.boot after reset")
+    return dev
 
 
 def _match_pawr_advertiser_report(evt, dut_address, *, require_periodic_interval: bool) -> bool:
@@ -68,10 +94,6 @@ def BLEDev():
             raise RuntimeError("No serial_port found")
 
         dev = get_ble_dev(port)
-
-        dev.open()
-        dev.bt.system.reset(0)
-        sleep(0.5)
         
         created.append((device, port, dev))
 
@@ -86,13 +108,17 @@ def BLEDev():
             log.exception(f"Failed to close BGAPI connection on:\n{e}")
             log.exception(f"Device {dev_name} on port {dev_port}.\n")
 
+
 @pytest.fixture
-def DUT(BLEDev):
-    yield BLEDev("dut")
+def DUT(BLEDev,
+        JoulescopeDev):
+    dut = BLEDev("dut")
+    yield open_ble_dev(dut, wakeUp=JoulescopeDev)
 
 @pytest.fixture
 def Tester(BLEDev):
-    yield BLEDev("tester")
+    tester = BLEDev("tester")
+    yield open_ble_dev(tester)
 
 @pytest.fixture
 def DUTAdvConfig(DUT,
