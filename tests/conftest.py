@@ -103,6 +103,20 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest) -> None:
     js.capture_test_name = request.node.name.removeprefix("test_")
     cfg_opt = request.config.getoption("--cfg")
     js.capture_config_name = Path(cfg_opt).stem if cfg_opt else "default"
+    js.capture_supply_v = None
+
+    if "Config" in request.fixturenames:
+        config = request.getfixturevalue("Config")
+        supply_v = config.get("hw", {}).get("supply_v")
+        if supply_v is not None:
+            try:
+                supply_v = float(supply_v)
+            except (TypeError, ValueError):
+                pytest.fail(
+                    f"Invalid 'hw.supply_v' value: {supply_v!r}. Expected a numeric voltage."
+                )
+
+            js.capture_supply_v = supply_v
 
 def _flash(image: Path, probe_sn: str):
     exe = shutil.which("commander")

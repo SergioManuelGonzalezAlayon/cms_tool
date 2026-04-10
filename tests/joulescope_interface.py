@@ -4,6 +4,7 @@ import json
 from instruments.joulescope.read_pyjoulescope_driver import Joulescope, get_profile
 from algorithms.single_pattern_analysis import SinglePatternCurrentProfileAnalyzer
 from presentation.html_report import generate_report
+from presentation.outlier_plots import OutlierPlotsGenerator
 import matplotlib.pyplot as plt
 from pathlib import Path
 from time import sleep
@@ -184,12 +185,14 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest):
     if "Config" in request.fixturenames:
         config = request.getfixturevalue("Config")
         supply_v = config.get("hw", {}).get("supply_v")
-        js.capture_supply_v = supply_v
         if supply_v is not None:
-            js.vref = supply_v
-            if getattr(js, "driver", None) is not None:
-                for device_path in getattr(js, "device_paths", []):
-                    js.driver.publish(f"{device_path}/c/gpio/vref", js.vref)
+            try:
+                supply_v = float(supply_v)
+            except (TypeError, ValueError):
+                pytest.fail(
+                    f"Invalid 'hw.supply_v' value: {supply_v!r}. Expected a numeric voltage."
+                )
+        js.capture_supply_v = supply_v
     yield
 
 
