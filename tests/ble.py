@@ -3,6 +3,7 @@ import logging
 import json
 import os
 from dataclasses import dataclass
+from time import sleep
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
 from joulescope_interface import JoulescopeDev
@@ -11,6 +12,8 @@ from conftest import *
 
 # TODO - BGAPI device interfaces in pytest so that we can use the HWMux thingy
 MAX_TEST_RETRIES = 3
+DUT_OPEN_RETRIES = 3
+DUT_OPEN_RETRY_SLEEP_S = 1.0
 log = logging.getLogger(__name__)
 
 
@@ -18,31 +21,63 @@ def _format_bd_addr(address) -> str:
     return str(address)
 
 
-def open_ble_dev(dev, wakeUp=None):
-    dev.open()
-    dev.bt.system.reset(0)
-    bgapi_check_event(
-        dev,
-        "system",
-        "boot",
-        lambda evt: True,
-        eventTimeout=1,
-        maxTime=5,
-    )
+def open_ble_dev(dev,
+                 wakeUp=None,
+                 *,
+                 open_retries=1,
+                 retry_sleep_s=0.0,
+                 boot_event_timeout=1,
+                 boot_max_time=5,
+                 awake_event_timeout=1,
+                 awake_max_time=5):
+    last_error = None
 
-    if wakeUp is not None:
-        wakeUp.setDUTAwake()
-        bgapi_check_event(
-            dev,
-            "system",
-            "awake",
-            lambda evt: True,
-            eventTimeout=1,
-            maxTime=5,
-        )
+    for attempt in range(1, open_retries + 1):
+        try:
+            dev.open()
+            dev.bt.system.reset(0)
+            bgapi_check_event(
+                dev,
+                "system",
+                "boot",
+                lambda evt: True,
+                eventTimeout=boot_event_timeout,
+                maxTime=boot_max_time,
+            )
 
-    log.info("BLE device reported system.boot after reset")
-    return dev
+            if wakeUp is not None:
+                wakeUp.setDUTAwake()
+                bgapi_check_event(
+                    dev,
+                    "system",
+                    "awake",
+                    lambda evt: True,
+                    eventTimeout=awake_event_timeout,
+                    maxTime=awake_max_time,
+                )
+
+            if attempt > 1:
+                log.info("BLE open/reset recovered on attempt %d/%d", attempt, open_retries)
+            log.info("BLE device reported system.boot after reset")
+            return dev
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "BLE open/reset attempt %d/%d failed: %s",
+                attempt,
+                open_retries,
+                exc,
+            )
+            try:
+                dev.close()
+            except Exception:
+                pass
+            if attempt < open_retries and retry_sleep_s > 0:
+                sleep(retry_sleep_s)
+
+    raise RuntimeError(
+        f"Failed to open/reset BLE device after {open_retries} attempt(s)"
+    ) from last_error
 
 
 def _match_pawr_advertiser_report(evt, dut_address, *, require_periodic_interval: bool) -> bool:
@@ -113,7 +148,12 @@ def BLEDev():
 def DUT(BLEDev,
         JoulescopeDev):
     dut = BLEDev("dut")
-    yield open_ble_dev(dut, wakeUp=JoulescopeDev)
+    yield open_ble_dev(
+        dut,
+        wakeUp=JoulescopeDev,
+        open_retries=DUT_OPEN_RETRIES,
+        retry_sleep_s=DUT_OPEN_RETRY_SLEEP_S,
+    )
 
 @pytest.fixture
 def Tester(BLEDev):
