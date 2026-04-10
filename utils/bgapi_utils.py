@@ -223,6 +223,22 @@ def normalize_connection_parameters(params: ConnectionParameters) -> ConnectionP
     if params.timeout <= 0:
         log.warning("Connection supervision timeout %s is invalid. Using 100 (1.0 s).", params.timeout)
         params.timeout = 100
+    # BLE stack constraint for supervision timeout:
+    # timeout_ms must be > (1 + latency) * max_interval_ms * 2
+    # and timeout units must be in [0x000a, 0x0c80] (10 ms units).
+    if params.timeout < 0x000A or params.timeout > 0x0C80:
+        raise ValueError(
+            f"Connection supervision timeout must be between 10 and 3200 (10 ms units), got {params.timeout}"
+        )
+    max_interval_ms = connection_ms_from_units(params.max_interval)
+    timeout_ms = Decimal(params.timeout) * Decimal("10")
+    min_timeout_ms_exclusive = Decimal(1 + params.latency) * max_interval_ms * Decimal("2")
+    if timeout_ms <= min_timeout_ms_exclusive:
+        raise ValueError(
+            "Connection supervision timeout is too small: "
+            f"timeout={timeout_ms} ms must be > {(1 + params.latency)} * {max_interval_ms} ms * 2 "
+            f"(minimum strictly greater than {min_timeout_ms_exclusive} ms)"
+        )
     params.tx_power = advertising_tx_power_from_dbm(params.tx_power)
     params.phy = advertising_phy_from_str(params.phy)
     return params
