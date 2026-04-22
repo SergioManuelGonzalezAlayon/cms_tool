@@ -1,8 +1,10 @@
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 import sys
 
@@ -11,15 +13,54 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 APPS_DIR = REPO_ROOT / "apps"
 DEFAULT_BUILD_ROOT = REPO_ROOT / ".fw_build"
 DEFAULT_BOOTLOADER_SLCP = APPS_DIR / "bootloader-uart-bgapi.slcp"
+TOOL_ENV_VARS = {
+    "slc": "SLC_PATH",
+    "cmake": "CMAKE_PATH",
+    "commander": "COMMANDER_PATH",
+}
 
 
-def run(cmd: list[str], *, cwd: Path | None = None, ok_returncodes: set[int] | None = None) -> subprocess.CompletedProcess:
-    exe = shutil.which(cmd[0])
-    if exe is None:
-        raise RuntimeError(
-            f"Required tool '{cmd[0]}' not found on PATH. "
-            "Ensure Simplicity Studio CLI tools and CMake are installed and available."
-        )
+def _resolve_executable_candidate(value: str | None) -> str | None:
+    if not value:
+        return None
+    path = Path(value)
+    if path.is_file():
+        return str(path)
+    return shutil.which(value)
+
+
+def resolve_tool(tool_name: str) -> str:
+    env_name = TOOL_ENV_VARS.get(tool_name, f"{tool_name.upper()}_PATH")
+    env_value = os.getenv(env_name)
+    resolved = _resolve_executable_candidate(env_value)
+    if resolved:
+        return resolved
+
+    dev_cfg = read_dev_config()
+    configured = dev_cfg.get("tools", {}).get(tool_name)
+    resolved = _resolve_executable_candidate(configured)
+    if resolved:
+        return resolved
+
+    resolved = shutil.which(tool_name)
+    if resolved:
+        return resolved
+
+    raise RuntimeError(
+        f"Required tool '{tool_name}' not found on PATH. "
+        f"Configure dev_config.json tools.{tool_name}, set {env_name}, "
+        "or ensure the Simplicity Studio CLI tools and CMake are installed and available."
+    )
+
+
+def run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    ok_returncodes: set[int] | None = None,
+    ok_result: Callable[[subprocess.CompletedProcess], bool] | None = None,
+) -> subprocess.CompletedProcess:
+    exe = resolve_tool(cmd[0])
     result = subprocess.run([exe, *cmd[1:]], cwd=cwd, check=False, text=True, capture_output=True)
     if result.stdout:
         print(result.stdout, end="")
@@ -28,7 +69,7 @@ def run(cmd: list[str], *, cwd: Path | None = None, ok_returncodes: set[int] | N
     accepted = {0}
     if ok_returncodes:
         accepted.update(ok_returncodes)
-    if result.returncode not in accepted:
+    if result.returncode not in accepted and not (ok_result and ok_result(result)):
         raise subprocess.CalledProcessError(result.returncode, [exe, *cmd[1:]], output=result.stdout, stderr=result.stderr)
     return result
 
@@ -108,11 +149,27 @@ def generate_slcp(slcp: Path, *, out_dir: Path, board: str) -> None:
     )
 
 
+def _is_noop_upgrade_result(result: subprocess.CompletedProcess) -> bool:
+    if result.returncode not in {19, -14, 4294967282}:
+        return False
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part).lower()
+    markers = (
+        "nothing to upgrade",
+        "an upgrade was not performed",
+        "project framework id and version are identical to target",
+    )
+    return any(marker in output for marker in markers)
+
+
 def upgrade_slcp(slcp: Path, *, out_dir: Path) -> Path:
     generated_slcp = out_dir / slcp.name
     shutil.copy2(slcp, generated_slcp)
-    # SLC returns a non-zero code when the project is already current.
-    run(["slc", "upgrade", "-p", str(generated_slcp.resolve())], cwd=REPO_ROOT, ok_returncodes={4294967282, -14})
+    # Some SLC versions return a non-zero code when the project is already current.
+    run(
+        ["slc", "upgrade", "-p", str(generated_slcp.resolve())],
+        cwd=REPO_ROOT,
+        ok_result=_is_noop_upgrade_result,
+    )
     return generated_slcp
 
 
