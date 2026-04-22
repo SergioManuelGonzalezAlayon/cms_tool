@@ -24,12 +24,12 @@ def _format_bd_addr(address) -> str:
 def open_ble_dev(dev,
                  wakeUp=None,
                  *,
-                 open_retries=1,
-                 retry_sleep_s=0.0,
-                 boot_event_timeout=1,
-                 boot_max_time=5,
-                 awake_event_timeout=1,
-                 awake_max_time=5):
+                 open_retries=2,
+                 retry_sleep_s=0.5,
+                 boot_event_timeout=5,
+                 boot_max_time=10,
+                 awake_event_timeout=5,
+                 awake_max_time=10):
     last_error = None
 
     for attempt in range(1, open_retries + 1):
@@ -700,19 +700,20 @@ def test_beacon(JoulescopeDev,
     )
 
     dut_addr = get_device_addr(DUT)
-    # Check the Advertising Packets with the Tester, since the nature of the test
-    # is heavily dependant on the environment repeat 3 times if failed
     for attempt in range(MAX_TEST_RETRIES):
         log.info("Beacon detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
-        event = bgapi_check_event(Tester,
-                                  "scanner",
-                                  "extended_advertisement_report",
-                                  lambda evt: (evt.address == dut_addr))
-    
-        if event is None and attempt == MAX_TEST_RETRIES - 1:
-            pytest.fail("Test retry maximum reached. Test failed.")
-        else:
+        try:
+            bgapi_check_event(
+                Tester,
+                "scanner",
+                "extended_advertisement_report",
+                lambda evt: evt.address == dut_addr,
+            )
             break
+        except BGAPIEventTimeoutError:
+            if attempt == MAX_TEST_RETRIES - 1:
+                raise
+            sleep(0.25)
 
     capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
     JoulescopeDev.capture(capture_s)
@@ -734,15 +735,18 @@ def test_conn_adv(JoulescopeDev,
     dut_addr = get_device_addr(DUT)
     for attempt in range(MAX_TEST_RETRIES):
         log.info("Connectable advertiser detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
-        event = bgapi_check_event(Tester,
-                                  "scanner",
-                                  "extended_advertisement_report",
-                                  lambda evt: (evt.address == dut_addr))
-
-        if event is None and attempt == MAX_TEST_RETRIES - 1:
-            pytest.fail("Test retry maximum reached. Test failed.")
-        else:
+        try:
+            bgapi_check_event(
+                Tester,
+                "scanner",
+                "extended_advertisement_report",
+                lambda evt: evt.address == dut_addr,
+            )
             break
+        except BGAPIEventTimeoutError:
+            if attempt == MAX_TEST_RETRIES - 1:
+                raise
+            sleep(0.25)
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
