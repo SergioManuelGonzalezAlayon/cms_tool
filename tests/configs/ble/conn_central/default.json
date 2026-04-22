@@ -11,7 +11,7 @@
         "window": 50
     },
     "connection": {
-        "interval": 15,
+        "interval": 100,
         "latency": 0,
         "tx_payload_length": 10,
         "rx_payload_length": 23,
