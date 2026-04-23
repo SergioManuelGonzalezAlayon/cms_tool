@@ -10,6 +10,7 @@ from pathlib import Path
 from time import sleep
 
 log = logging.getLogger(__name__)
+DUT_WAKE_GPIO = 0
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
@@ -87,6 +88,86 @@ def savePlotData(profile, data_type, title, ylabel, out_dir, test_name=None, con
     plt.ylabel(ylabel)
     plt.savefig(out_dir / filename , dpi=149, bbox_inches="tight")
     plt.close()
+
+
+class WakePinJoulescope(Joulescope):
+    """Local Joulescope policy for DUT wake GPIO semantics."""
+
+    def __init__(
+        self,
+        *args,
+        use_wake_pin: bool = False,
+        dut_sleep_settle_ms: float = 500,
+        dut_wake_gpio: int = DUT_WAKE_GPIO,
+        dut_awake_settle_s: float = 0.01,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.use_wake_pin = use_wake_pin
+        self.dut_sleep_settle_ms = dut_sleep_settle_ms
+        self.dut_wake_gpio = dut_wake_gpio
+        self.dut_awake_settle_s = dut_awake_settle_s
+
+    def open_devices(self):
+        device_paths = super().open_devices()
+        if self.use_wake_pin:
+            self.wakeDUT()
+        return device_paths
+
+    def close_driver(self):
+        if self.driver is None:
+            return
+        if self.use_wake_pin and self.device_paths:
+            try:
+                self.sleepDUT()
+            except Exception:
+                pass
+        super().close_driver()
+
+    def capture(self, seconds: float, on_progress=None):
+        if not self.use_wake_pin:
+            return super().capture(seconds, on_progress=on_progress)
+
+        self._require_driver()
+        if not self.signals_full:
+            raise RuntimeError("signals_full not set; did you open devices first?")
+
+        self.sleepDUT()
+        try:
+            sleep(self.dut_sleep_settle_ms / 1000.0)
+            self.capture_data = self.read(
+                self.driver,
+                self.signals_full,
+                duration=float(seconds),
+                on_progress=on_progress,
+            )
+        finally:
+            self.wakeDUT()
+        return self.capture_data
+
+    def wakeDUT(self):
+        """Assert the DUT wake line."""
+        self.gpo_clear(self.dut_wake_gpio)
+
+    def sleepDUT(self):
+        """Release the DUT wake line to the sleep state."""
+        self.gpo_set(self.dut_wake_gpio)
+
+    def setDUTAwake(self, maybe=None):
+        """
+        Ensure DUT is permanently awake:
+        - force known HIGH state
+        - generate clean falling edge
+        - hold LOW afterwards
+        """
+        device_path = self._get_open_device_path()
+
+        # Preserve the known-good wake pulse sequence for this bench.
+        self.driver.publish(f"{device_path}/s/gpo/+/!set", 1 << self.dut_wake_gpio)
+        sleep(self.dut_awake_settle_s)
+        self.driver.publish(f"{device_path}/s/gpo/+/!clr", 1 << self.dut_wake_gpio)
+        sleep(self.dut_awake_settle_s)
+        self.driver.publish(f"{device_path}/s/gpo/+/!clr", 1 << self.dut_wake_gpio)
 
 
 def _artifact_stem(test_name=None, config_name=None):
@@ -169,6 +250,8 @@ class JoulescopeConfig:
     irange: str = "auto"
     use_wake_pin: bool = True
     dut_sleep_settle_ms: float = 500
+    dut_wake_gpio: int = DUT_WAKE_GPIO
+    dut_awake_settle_s: float = 0.01
     verbose: bool = False
 
 
@@ -200,7 +283,7 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest):
 def JoulescopeDev():
     log.info("Enabling Joulescope")
     cfg = JoulescopeConfig(open_mode="restore")
-    js = Joulescope(**asdict(cfg))
+    js = WakePinJoulescope(**asdict(cfg))
 
     js.create_driver()
     js.open_devices()
