@@ -5,7 +5,6 @@ from instruments.joulescope.read_pyjoulescope_driver import Joulescope, get_prof
 from algorithms.single_pattern_analysis import SinglePatternCurrentProfileAnalyzer
 from presentation.html_report import generate_report
 from presentation.outlier_plots import OutlierPlotsGenerator
-import matplotlib.pyplot as plt
 from pathlib import Path
 from time import sleep
 
@@ -73,23 +72,6 @@ def build_single_pattern_analyzer(
     )
 
 
-def savePlotData(profile, data_type, title, ylabel, out_dir, test_name=None, config_name=None):
-    signal_name = title.replace(" ", "").lower()
-    if test_name and config_name:
-        filename = f"{_safe_name(test_name)}_{_safe_name(config_name)}_{signal_name}.png"
-    else:
-        filename = "result_" + signal_name + ".png"
-
-    plt.figure()
-    plt.plot(profile[data_type]["timestamp"],
-             profile[data_type]["samples"])
-    plt.title(title)
-    plt.xlabel("Time (s)")
-    plt.ylabel(ylabel)
-    plt.savefig(out_dir / filename , dpi=149, bbox_inches="tight")
-    plt.close()
-
-
 class WakePinJoulescope(Joulescope):
     """Local Joulescope policy for DUT wake GPIO semantics."""
 
@@ -107,6 +89,7 @@ class WakePinJoulescope(Joulescope):
         self.dut_sleep_settle_ms = dut_sleep_settle_ms
         self.dut_wake_gpio = dut_wake_gpio
         self.dut_awake_settle_s = dut_awake_settle_s
+        self.capture_sequence = 0
 
     def open_devices(self):
         device_paths = super().open_devices()
@@ -126,7 +109,9 @@ class WakePinJoulescope(Joulescope):
 
     def capture(self, seconds: float, on_progress=None):
         if not self.use_wake_pin:
-            return super().capture(seconds, on_progress=on_progress)
+            result = super().capture(seconds, on_progress=on_progress)
+            self.capture_sequence += 1
+            return result
 
         self._require_driver()
         if not self.signals_full:
@@ -143,6 +128,7 @@ class WakePinJoulescope(Joulescope):
             )
         finally:
             self.wakeDUT()
+        self.capture_sequence += 1
         return self.capture_data
 
     def wakeDUT(self):
@@ -176,6 +162,34 @@ def _artifact_stem(test_name=None, config_name=None):
     if test_name:
         return _safe_name(test_name)
     return "result"
+
+
+def _artifact_out_dir(config_path: Path) -> Path:
+    configs_root = (Path("tests") / "configs").resolve()
+    resolved = config_path.resolve()
+    try:
+        relative = resolved.relative_to(configs_root)
+    except ValueError:
+        out_dir = Path("artifacts")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    if len(relative.parts) < 3:
+        out_dir = Path("artifacts")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    suite = relative.parts[0]
+    feature = relative.parts[1]
+    if relative.parts[2] == "default.json":
+        out_dir = Path("artifacts") / suite / feature / "default"
+    elif relative.parts[2] == "full_sweep":
+        partition = relative.parts[3] if len(relative.parts) > 3 else "unpartitioned"
+        out_dir = Path("artifacts") / suite / feature / "full_sweep" / partition
+    else:
+        out_dir = Path("artifacts") / suite / feature / "one_factor"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
 
 
 def write_single_pattern_results(profile, out_dir, *, test_name=None, config_name=None, voltage_override=None):
@@ -238,6 +252,58 @@ def write_single_pattern_results(profile, out_dir, *, test_name=None, config_nam
         "note_path": None,
     }
 
+
+def write_joulescope_artifacts(
+    js: Joulescope,
+    *,
+    test_name: str,
+    config_name: str,
+    config_path: Path,
+    voltage_override: float | None = None,
+    result_generator=None,
+):
+    if getattr(js, "capture_data", None) is None:
+        return None
+
+    log.info("Saving analysis outputs for %s/%s", test_name, config_name)
+    profile = get_profile(js, js.capture_data)
+
+    out_dir = _artifact_out_dir(config_path)
+
+    result_paths = write_single_pattern_results(
+        profile,
+        out_dir,
+        test_name=test_name,
+        config_name=config_name,
+        voltage_override=voltage_override,
+    )
+    if result_paths["note_path"] is not None:
+        log.warning("Analyzer did not detect windows yet; note saved to %s", result_paths["note_path"])
+    else:
+        log.info(
+            "Artifacts saved: consolidated=%s deep_dive=%s html=%s",
+            result_paths["consolidated_csv"],
+            result_paths["deep_dive_csv"],
+            result_paths["html_report"],
+        )
+
+    result_json_path = None
+    if result_generator is not None:
+        result_json_path = result_generator.write(
+            profile=profile,
+            out_dir=out_dir,
+            artifact_stem=_artifact_stem(test_name, config_name),
+            result_paths=result_paths,
+        )
+        log.info("Result JSON saved: %s", result_json_path)
+
+    return {
+        "profile": profile,
+        "out_dir": out_dir,
+        "result_paths": result_paths,
+        "result_json_path": result_json_path,
+    }
+
 @dataclass
 class JoulescopeConfig:
     signals: str = "i,r,0,1"
@@ -254,31 +320,6 @@ class JoulescopeConfig:
     dut_awake_settle_s: float = 0.01
     verbose: bool = False
 
-
-@pytest.fixture(autouse=True)
-def JoulescopeCaptureContext(request: pytest.FixtureRequest):
-    if "JoulescopeDev" not in request.fixturenames:
-        yield
-        return
-
-    js = request.getfixturevalue("JoulescopeDev")
-    js.capture_test_name = request.node.name.removeprefix("test_")
-    cfg_opt = request.config.getoption("--cfg")
-    js.capture_config_name = Path(cfg_opt).name if cfg_opt else "default.json"
-    if "Config" in request.fixturenames:
-        config = request.getfixturevalue("Config")
-        supply_v = config.get("hw", {}).get("supply_v")
-        if supply_v is not None:
-            try:
-                supply_v = float(supply_v)
-            except (TypeError, ValueError):
-                pytest.fail(
-                    f"Invalid 'hw.supply_v' value: {supply_v!r}. Expected a numeric voltage."
-                )
-        js.capture_supply_v = supply_v
-    yield
-
-
 @pytest.fixture(scope="session")
 def JoulescopeDev():
     log.info("Enabling Joulescope")
@@ -289,41 +330,5 @@ def JoulescopeDev():
     js.open_devices()
 
     yield js
-
-    # Save the capture data
-    if getattr(js, "capture_data", None) is not None:
-        log.info("Saving captured plots and analysis outputs")
-        profile = get_profile(js, js.capture_data)
-
-        out_dir = Path("artifacts")
-        out_dir.mkdir(exist_ok=True)
-        test_name = getattr(js, "capture_test_name", None)
-        config_name = getattr(js, "capture_config_name", None)
-
-        if "current" in profile:
-            savePlotData(profile, "current", "Current", "mA", out_dir, test_name, config_name)
-
-        if "gpi[0]" in profile:
-            savePlotData(profile, "gpi[0]", "GPIO 0", "Level", out_dir, test_name, config_name)
-
-        if "gpi[1]" in profile:
-            savePlotData(profile, "gpi[1]", "GPIO 1", "Level", out_dir, test_name, config_name)
-
-        result_paths = write_single_pattern_results(
-            profile,
-            out_dir,
-            test_name=test_name,
-            config_name=config_name,
-            voltage_override=getattr(js, "capture_supply_v", None),
-        )
-        if result_paths["note_path"] is not None:
-            log.warning("Analyzer did not detect windows yet; note saved to %s", result_paths["note_path"])
-        else:
-            log.info(
-                "Artifacts saved: consolidated=%s deep_dive=%s html=%s",
-                result_paths["consolidated_csv"],
-                result_paths["deep_dive_csv"],
-                result_paths["html_report"],
-            )
 
     js.close_driver()

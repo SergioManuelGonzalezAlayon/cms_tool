@@ -7,6 +7,8 @@ from pathlib import Path
 from dataclasses import fields
 import pytest
 from apps.app_manager import read_dev_config as _read_dev_config, resolve_bootloader_slcp
+from joulescope_interface import write_joulescope_artifacts
+from results_generator import ResultGenerator
 
 log = logging.getLogger(__name__)
 
@@ -95,18 +97,26 @@ def HWInit(request: pytest.FixtureRequest) -> None:
 
 
 @pytest.fixture(autouse=True)
-def JoulescopeCaptureContext(request: pytest.FixtureRequest) -> None:
+def ResultGeneratorFixture() -> ResultGenerator:
+    return ResultGenerator()
+
+
+@pytest.fixture(autouse=True)
+def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixture: ResultGenerator) -> None:
     if "JoulescopeDev" not in request.fixturenames:
         return
 
     js = request.getfixturevalue("JoulescopeDev")
-    js.capture_test_name = request.node.name.removeprefix("test_")
+    capture_sequence_before = getattr(js, "capture_sequence", 0)
+    test_name = request.node.name.removeprefix("test_")
     cfg_opt = request.config.getoption("--cfg")
-    js.capture_config_name = Path(cfg_opt).stem if cfg_opt else "default"
-    js.capture_supply_v = None
+    config_name = Path(cfg_opt).stem if cfg_opt else "default"
+    config_path = _test_config_path(request)
+    config_data = request.getfixturevalue("Config") if "Config" in request.fixturenames else {}
+    supply_v = None
 
     if "Config" in request.fixturenames:
-        config = request.getfixturevalue("Config")
+        config = config_data
         supply_v = config.get("hw", {}).get("supply_v")
         if supply_v is not None:
             try:
@@ -115,8 +125,26 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest) -> None:
                 pytest.fail(
                     f"Invalid 'hw.supply_v' value: {supply_v!r}. Expected a numeric voltage."
                 )
+    ResultGeneratorFixture.set_context(
+        test_name=test_name,
+        config_name=config_name,
+        config_path=config_path,
+        config_data=config_data,
+        supply_v=supply_v,
+    )
+    yield
+    capture_sequence_after = getattr(js, "capture_sequence", 0)
+    if capture_sequence_after <= capture_sequence_before:
+        return
+    write_joulescope_artifacts(
+        js,
+        test_name=test_name,
+        config_name=config_name,
+        config_path=config_path,
+        voltage_override=supply_v,
+        result_generator=ResultGeneratorFixture,
+    )
 
-            js.capture_supply_v = supply_v
 
 def _flash(image: Path, probe_sn: str):
     exe = shutil.which("commander")

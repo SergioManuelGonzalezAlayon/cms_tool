@@ -26,6 +26,7 @@ packages = []
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+addopts = "--junitxml=artifacts/pytest-results.xml"
 filterwarnings = [
   "ignore:.*'oneOf' deprecated - use 'one_of'.*:pyparsing.exceptions.PyparsingDeprecationWarning",
   "ignore:.*'parseString' deprecated - use 'parse_string'.*:pyparsing.exceptions.PyparsingDeprecationWarning",
