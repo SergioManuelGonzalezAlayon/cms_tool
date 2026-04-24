@@ -16,7 +16,15 @@
     "ble": {
         "xapi": "C:\\\\path\\\\to\\\\sdk\\\\sl_bt.xapi"
     },
+    "tools": {
+        "slc": "C:\\\\path\\\\to\\\\slc.exe",
+        "commander": "C:\\\\path\\\\to\\\\commander.exe",
+        "cmake": "C:\\\\path\\\\to\\\\cmake.exe"
+    },
     "firmware": {
+        "board": "REPLACE_WITH_BOARD_ID",
+        "device": "REPLACE_WITH_DEVICE_ID",
+        "sisdk": "REPLACE_WITH_SISDK_VERSION",
         "build_root": ".fw_build",
         "bootloader_slcp": "apps/bootloader-uart-bgapi.slcp"
     }
