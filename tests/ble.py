@@ -161,6 +161,56 @@ def Tester(BLEDev):
     yield open_ble_dev(tester)
 
 @pytest.fixture
+def DUTLegAdvConfig(DUT,
+                 Config) -> AdvertiserConfig:
+    log.info("Configuring DUT Advertiser")
+
+    config = dataclass_from_dict(AdvertiserConfig, Config.get("advertiser",{}))
+    config = normalize_advertiser_config(config)
+    rsp = DUT.bt.advertiser.create_set()
+    config.set = rsp.handle
+
+    DUT.bt.advertiser.set_timing(config.set,
+                                 config.min_interval,
+                                 config.max_interval,
+                                 config.duration,
+                                 config.max_events)
+    log.info("DUT Advertiser configured")
+
+    DUT.bt.advertiser.set_tx_power(config.set,config.tx_power)
+    DUT.bt.advertiser.set_phy(config.set, config.phy, config.phy)
+    DUT.bt.legacy_advertiser.set_data(config.set,
+                                      0, # Advertising data packet
+                                      config.payload)
+
+    return config
+
+@pytest.fixture
+def DUTLegAdvStart(DUT,
+                   DUTLegAdvConfig):
+    started = False
+
+    def start(*, connectable_mode, flags=0):
+        nonlocal started
+
+        DUT.bt.legacy_advertiser.start(DUTAdvConfig.set, connectable_mode)
+        log.info("DUT Advertising started")
+        started = True
+
+    yield start
+
+    if started:
+        try:
+            DUT.bt.advertiser.stop(DUTAdvConfig.set)
+            log.info("DUT Advertising stopped")
+        finally:
+            DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
+            log.info("DUT Advertising set deleted")
+    else:
+        # even if never started, still delete the set
+        DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
+
+@pytest.fixture
 def DUTAdvConfig(DUT,
                  Config) -> AdvertiserConfig:
     log.info("Configuring DUT Advertiser")
@@ -685,6 +735,37 @@ def ConnectBLEDevices(Config):
             )
         log.info("Connection closed succesfully")
 
+def test_legacy_beacon(JoulescopeDev,
+                       DUT,
+                       Tester,
+                       DUTLegAdvConfig,
+                       DUTLegAdvStart,
+                       TesterScanStart):
+    DUTLegAdvStart(
+        connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
+    )
+    TesterScanStart(
+        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+    )
+
+    dut_addr = get_device_addr(DUT)
+    for attempt in range(MAX_TEST_RETRIES):
+        log.info("Beacon detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
+        try:
+            bgapi_check_event(
+                Tester,
+                "scanner",
+                "legacy_advertisement_report",
+                lambda evt: evt.address == dut_addr,
+            )
+            break
+        except BGAPIEventTimeoutError:
+            if attempt == MAX_TEST_RETRIES - 1:
+                raise
+            sleep(0.25)
+
+    capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
+    JoulescopeDev.capture(capture_s)
 
 def test_beacon(JoulescopeDev,
                 DUT,
@@ -693,7 +774,7 @@ def test_beacon(JoulescopeDev,
                 DUTAdvStart,
                 TesterScanStart):
     DUTAdvStart(
-        connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
+        connectable_mode=DUT.bt.extended_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
     )
     TesterScanStart(
         discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
@@ -716,6 +797,39 @@ def test_beacon(JoulescopeDev,
             sleep(0.25)
 
     capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
+    JoulescopeDev.capture(capture_s)
+
+def test_conn_adv(JoulescopeDev,
+                  DUT,
+                  Tester,
+                  DUTLegAdvConfig,
+                  DUTLegAdvStart,
+                  TesterScanStart):
+    DUTAdvStart(
+        connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
+    )
+    TesterScanStart(
+        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+    )
+
+    dut_addr = get_device_addr(DUT)
+    for attempt in range(MAX_TEST_RETRIES):
+        log.info("Connectable advertiser detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
+        try:
+            bgapi_check_event(
+                Tester,
+                "scanner",
+                "legacy_advertisement_report",
+                lambda evt: evt.address == dut_addr,
+            )
+            break
+        except BGAPIEventTimeoutError:
+            if attempt == MAX_TEST_RETRIES - 1:
+                raise
+            sleep(0.25)
+
+    n_events = 10
+    capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
     JoulescopeDev.capture(capture_s)
 
 
