@@ -57,7 +57,20 @@ def Config(request: pytest.FixtureRequest) -> dict:
             f"(within {cfg_path.parent})."
         )
 
-    return json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    cfg_data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    dev_cfg = _read_dev_config(Path("dev_config.json"))
+    dev_fw = dev_cfg.get("firmware", {})
+
+    fw = dict(cfg_data.get("firmware", {}))
+
+    for key in ("board", "brev", "device"):
+        value = dev_fw.get(key)
+        if not value:
+            pytest.fail(f"Missing dev_config.json FW. {key}")
+        fw[key] = value
+
+    cfg_data["firmware"] = fw
+    return cfg_data
 
 @pytest.fixture(autouse=True)
 def HWInit(request: pytest.FixtureRequest) -> None:
@@ -113,6 +126,7 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixt
     config_name = Path(cfg_opt).stem if cfg_opt else "default"
     config_path = _test_config_path(request)
     config_data = request.getfixturevalue("Config") if "Config" in request.fixturenames else {}
+
     supply_v = None
 
     if "Config" in request.fixturenames:
@@ -276,7 +290,6 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
     required = (
         "dut_slcp",
         "tester_slcp",
-        "board",
     )
     missing = [key for key in required if key not in fw]
     if missing:
