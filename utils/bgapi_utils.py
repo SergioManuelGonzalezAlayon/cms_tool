@@ -276,7 +276,7 @@ def get_ble_dev(serialPort):
 def open_dev(dev):
     try:
         dev.open()
-        dev.bt.system.reset(0)
+        dev.bt.system.reboot()
         sleep(0.5)
     except Exception:
         log.exception("Failed to open/reset BGAPI device")

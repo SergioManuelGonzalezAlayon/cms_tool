@@ -35,7 +35,7 @@ def open_ble_dev(dev,
     for attempt in range(1, open_retries + 1):
         try:
             dev.open()
-            dev.bt.system.reset(0)
+            dev.bt.system.reboot()
             bgapi_check_event(
                 dev,
                 "system",
