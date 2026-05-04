@@ -19,6 +19,7 @@ TOOL_ENV_VARS = {
     "cmake": "CMAKE_PATH",
     "commander": "COMMANDER_PATH",
 }
+SL_BT_XAPI_PATH = Path("bluetooth_le_host") / "api" / "sl_bt.xapi"
 
 
 def _resolve_executable_candidate(value: str | None) -> str | None:
@@ -175,6 +176,13 @@ def resolve_sisdk_path(version: str) -> Path:
         raise RuntimeError(
             f"Requested Simplicity SDK version '{version}' resolved to a missing path: {sdk_path}"
         )
+    
+    sl_bt_xapi : Path = sdk_path / SL_BT_XAPI_PATH
+    if not sl_bt_xapi.exists():
+        raise RuntimeError(
+            f"Requested Simplicity SDK version '{version}' cannot find `sl_bt.xapi`: {sl_bt_xapi}"
+        )
+
     return sdk_path
 
 
@@ -326,6 +334,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     return parser.parse_args(argv)
 
+def update_bgapi_xapi(sisdk_path: Path, dev_cfg: dict, config_path: Path):
+    sl_bt_xapi_file = sisdk_path / SL_BT_XAPI_PATH
+    dev_cfg.setdefault("ble", {})["xapi"] = str(sl_bt_xapi_file)
+    config_path.write_text(json.dumps(dev_cfg, indent=2) + "\n", encoding="utf-8")
 
 def main(argv: list[str] | None = None) -> int:
     parsed = parse_args(list(argv if argv is not None else sys.argv[1:]))
@@ -375,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
         f"build_root={build_root} "
         f"elapsed_s={time.perf_counter() - total_start:.2f}"
     )
+
+    update_bgapi_xapi(sdk_path, dev_cfg, REPO_ROOT / "dev_config.json")
     return 0
 
 
