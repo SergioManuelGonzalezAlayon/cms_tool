@@ -8,6 +8,8 @@ The main BLE test logic lives in `tests/ble.py`.
 
 Implemented and wired into the current workflow:
 
+- `legacy_beacon`
+- `legacy_conn_adv`
 - `beacon`
 - `conn_adv`
 - `conn_central`
@@ -86,161 +88,47 @@ What you need to configure locally:
 - set DUT/tester serial ports and probe serial numbers
 - optionally set `firmware.build_root`, `firmware.board`, and `firmware.bootloader_slcp`
 
-## Container Workflow
-
-Container support is now available as a phase 1 additive workflow for CI and portable lab hosts. The planning document lives in `CONTAINER.md`.
-
-Current status:
-
-- the repository now ships a root `Dockerfile` and `.dockerignore`
-- phase 1 is focused on a portable repo runtime with the full lab toolchain installed in the image
-- the image keeps its virtual environment outside the mounted repo so bind mounts do not hide the installed dependencies
-- `scripts/run_lab_container.sh` provides a Linux lab-host and BeagleBone Black friendly launcher
-- the native `uv` workflow described above remains supported
-- multi-arch publishing is still a future phase
-
-### Build The Container Locally
-
-Then build the image:
-
-```bash
-docker build -t current-measurement .
-podman build -t current-measurement .
-```
-
-The image installs the generic build toolchain itself:
-
-- `uv`
-- `cmake`
-- `ninja-build`
-- `build-essential`
-
-Put the Silicon Labs payload under `container/vendor-tools/` before building. The `Dockerfile` copies that directory directly into `/opt/silabs`, and the image `PATH` includes `/opt/silabs/bin`.
-
-Expected tool bundle layout:
-
-```text
-container/vendor-tools/
-  bin/
-    commander
-    slc
-  sdk/
-    ...
-```
-
-Run the default portable smoke check from the image:
-
-```bash
-docker run --rm -it current-measurement
-```
-
-Run the same image against your checked-out repo:
-
-```bash
-docker run --rm -it -v "${PWD}:/workspace" current-measurement
-```
-
-Run a direct command in the container:
-
-```bash
-docker run --rm -it -v "${PWD}:/workspace" current-measurement \
-  python tests/configs/config_manager.py generate --mode both
-```
-
-```bash
-docker run --rm -it -v "${PWD}:/workspace" current-measurement \
-  python -m pytest tests/joulescope_interface.py --collect-only
-```
-
-The intended usage model is:
-
-- use the container for portable Python setup, config generation, pytest entrypoints, and report generation
-- use GitHub Actions with the container for portable checks that do not require attached hardware
-- use the same container on self-hosted runners, Raspberry Pi, or BeagleBone Black class hosts for hardware-backed runs
-
-For hardware-backed execution, the image should contain the repo toolchain, including:
-
-- Python dependencies
-- `cmake`
-- `ninja-build`
-- `slc`
-- `commander`
-- any SDK assets the workflow expects inside the container
-
-The host should still provide:
-
-- connected Joulescope hardware
-- serial access to DUT and tester devices
-- `dev_config.json`, either in the repo root or through `CURRENT_MEASUREMENT_DEV_CONFIG_FILE`
-- any USB or device permissions required to reach the attached lab hardware
-
-### Linux Lab Host / BeagleBone Black Flow
-
-For a Linux lab host, including a BeagleBone Black, use the launcher script:
-
-```bash
-bash scripts/run_lab_container.sh
-```
-
-That default command runs the beacon orchestrator against the `default` config:
-
-```bash
-python test_orchestrator.py tests/configs/ble/beacon --mode default --feature beacon --max-fail 1
-```
-
-You can pass any container command through the launcher:
-
-```bash
-bash scripts/run_lab_container.sh python test_orchestrator.py tests/configs/ble/beacon --generate --mode one_factor --feature beacon --max-fail 1
-```
-
-Useful environment variables for lab hosts:
-
-- `CURRENT_MEASUREMENT_IMAGE=current-measurement` picks the image tag to run
-- `CURRENT_MEASUREMENT_CONTAINER_ENGINE=docker|podman` selects the container engine explicitly
-- `CURRENT_MEASUREMENT_DEV_CONFIG_FILE=/path/to/dev_config.json` mounts a config file without copying it into the repo
-- `BGAPI_XAPI=/opt/silabs/sdk/protocol/bluetooth/api/sl_bt.xapi` points the test runtime at a bundled XAPI when you do not want that path in `dev_config.json`
-
-Example BeagleBone Black run using an external config file:
-
-```bash
-CURRENT_MEASUREMENT_DEV_CONFIG_FILE=/etc/current-measurement/dev_config.json \
-bash scripts/run_lab_container.sh python test_orchestrator.py tests/configs/ble/beacon --generate --mode one_factor --feature beacon --max-fail 1
-```
-
-The phase 1 image now covers the portable runtime contract, a lab-host launcher, and a portable GitHub Actions check. Treat `CONTAINER.md` as the source of truth for the remaining rollout and multi-arch work.
-
 ## Common Workflows
 
 Every pytest run now writes a JUnit XML result file to `artifacts/pytest-results.xml`, which is useful for CI test reporting and local run inspection.
 
-### Check Pytest Collection
+### Building the applications
 
-Use this first when validating that the Python environment is healthy:
+There are multiple applications to test a wireless stack, we have chosen an NCP App in our testing system to easy not only development but to simplify having to use use too many applications and potentially wearing the flash of the DUT as we run multiple test batches.
 
-```powershell
-uv run pytest --collect-only .\tests\ble.py
-```
-
-### Build Firmware Projects
-
-```powershell
-uv run python .\apps\app_manager.py rebuild --board brd4182a
-```
-
-### Clean Generated Firmware
+The first suggested step is to clean the previously build applications, the test system wont flash previously used aplications but this will generate test results based on previous firmware, which is not desired.
 
 ```powershell
 uv run python .\apps\app_manager.py clean
 ```
 
-### Clean Generated Test Configs
+Then using the `app_manager.py` you can clean, generate, build and rebuild applications. The sensible way would be to clean the workspace, once created the projects are generated under `.fw_build` and you can build said applications. The application details are defined in `dev_config.json`
 
 ```powershell
-uv run python .\tests\configs\config_manager.py clean
+uv run python .\apps\app_manager.py clean
+uv run python .\apps\app_manager.py generate
+uv run python .\apps\app_manager.py build
 ```
 
-### Generate Test Configs
+The `rebuild` option is intented to allow for iterative development of an application that has potentially had any changes on the SLC configuration SiSDK that has been chosen. This is intended to be used to custom changes to an application.
+
+```powershell
+uv run python .\apps\app_manager.py rebuild
+```
+
+Future work needs to address building applications for protocol specific tests, since not all applications or devices support the same technologies or features.
+
+
+### Test Configs
+
+The CMS uses test configurations in a file to be able to trace back the actual paramters in a test that has been run. There are `default` configurations that are generic options for the protocol in question that allow for a quick test iteration. 
+
+For more detailed testing the `config_manager.py` is used to generate two types of configs:
+
+* `one_factor`: One variable is modified at a time, keeping all other settings at their default values.
+* `full_sweep`: Configurations are varied across multiple parameters allowing to generate a greater result generation, that can be used to extrapolate other power consumption values.
+
+#### Generating Test Configs
 
 Generate both one-factor and full-sweep matrices:
 
@@ -255,49 +143,27 @@ uv run python .\tests\configs\config_manager.py generate --mode one_factor
 uv run python .\tests\configs\config_manager.py generate --mode full_sweep
 ```
 
-### Run Joulescope Smoke Tests
+### Running tests
+
+In order to run a test there first has to be the corresponding test config, in the repo there are default configurations that allow to run a generic configuration to obtain results. For the sake of simplicity these examples assume that you want to run the BLE Beacon test, where the DUT uses non-connectable Extended Advertising to broadcast a payload:
 
 ```powershell
-uv run pytest .\tests\joulescope_interface.py -o log_cli=true --log-cli-level=INFO
+uv run python .\test_orchestrator.py .\tests\configs\ble\beacon --mode default --feature beacon
 ```
 
-### Run BLE Tests
-
-Run a single BLE case:
+There is another option for test running that includes a generated set of tests that cover multiple ranges of variables without going into a deep variable sweep, but these are generated by the `config_manager.py` and have to be created first.
 
 ```powershell
-uv run pytest .\tests\ble.py::test_beacon --cfg default.json -o log_cli=true --log-cli-level=INFO
+uv run python .\tests\configs\config_manager.py generate --mode one_factor
+uv run python .\test_orchestrator.py .\tests\configs\ble\beacon --mode one_factor --feature beacon
 ```
 
-Run a single BLE case with a specific config file:
+Finally, the full sweep mode is intended to generate within all the variables for the test cases multiple points called `steps`, this will create a considerable set of tests that will test all the features.
 
 ```powershell
-uv run pytest .\tests\ble.py::test_beacon --cfg non_conn_adv_300ms.json -o log_cli=true --log-cli-level=INFO
+uv run python .\tests\configs\config_manager.py generate --mode full_sweep
+uv run python .\test_orchestrator.py .\tests\configs\ble\beacon --mode full_sweep
 ```
-
-Run all BLE tests:
-
-```powershell
-uv run pytest .\tests\ble.py -o log_cli=true --log-cli-level=INFO
-```
-
-### Run A Test Campaign
-
-Generate configs, then run a feature or config batch through the orchestrator:
-
-```powershell
-uv run python .\tests\configs\config_manager.py generate --mode both
-uv run python .\test_orchestrator.py .\tests\configs\ble\beacon --mode one_factor --feature beacon --max-fail 1
-```
-
-## Config Layout
-
-Generated test configurations live under `tests/configs`. The config manager supports:
-
-- `generate`
-- `clean`
-- `rebuild`
-- `--mode one_factor|full_sweep|both`
 
 ## Notes On Current Status
 
