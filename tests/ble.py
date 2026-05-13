@@ -799,7 +799,7 @@ def test_beacon(JoulescopeDev,
     capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
     JoulescopeDev.capture(capture_s)
 
-def test_conn_adv(JoulescopeDev,
+def test_legacy_conn_adv(JoulescopeDev,
                   DUT,
                   Tester,
                   DUTLegAdvConfig,
