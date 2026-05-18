@@ -27,14 +27,9 @@ include:
 - path: src
   file_list:
   - path: app.h
-sdk:
-  vendor: null
-  id: simplicity_sdk
-  version: 2025.6.2
 toolchain_settings: [
   ]
 component:
-- id: EFR32MG22C224F512IM40
 - id: app_assert
 - id: app_os_helper
 - id: bluetooth_feature_connection_role_central
