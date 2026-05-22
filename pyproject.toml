@@ -35,4 +35,4 @@ filterwarnings = [
 ]
 
 [tool.uv.sources]
-power-profiling-tools-val = { git = "ssh://git@stash.silabs.com/mcuw_val_sw/power_profiling_tools_val.git", branch = "feature/battery-estimator-integration" }
+power-profiling-tools-val = { git = "ssh://git@stash.silabs.com/mcuw_val_sw/power_profiling_tools_val.git" }
