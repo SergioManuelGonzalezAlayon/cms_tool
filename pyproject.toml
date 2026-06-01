@@ -19,6 +19,8 @@ dependencies = [
   "pyjoulescope-driver",
   "pytest>=9",
   "power-profiling-tools-val",
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
 ]
 
 [tool.setuptools]
