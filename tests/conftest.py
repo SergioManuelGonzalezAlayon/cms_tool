@@ -1,16 +1,26 @@
 import json
 import hashlib
 import subprocess
-import shutil
 import logging
 from pathlib import Path
 from dataclasses import fields
 import pytest
-from apps.app_manager import read_dev_config as _read_dev_config, resolve_bootloader_slcp
+from apps.app_manager import (
+    read_dev_config as _read_dev_config,
+    resolve_bootloader_slcp,
+    resolve_tool,
+)
 from joulescope_interface import write_joulescope_artifacts
 from results_generator import ResultGenerator
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_commander() -> str:
+    try:
+        return resolve_tool("commander")
+    except RuntimeError as exc:
+        pytest.fail(str(exc))
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
@@ -90,12 +100,7 @@ def HWInit(request: pytest.FixtureRequest) -> None:
             "Missing tester probe serial. Set dev_config.json tester.probe_sn."
         )
 
-    exe = shutil.which("commander")
-    if exe is None:
-        pytest.fail(
-            "Required tool 'commander' not found on PATH. "
-            "Ensure Simplicity Studio CLI tools are installed and available."
-        )
+    exe = _resolve_commander()
 
     log.info(
         "Setting tester adapter voltage: serial=%s voltage=%s V",
@@ -161,12 +166,7 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixt
 
 
 def _flash(image: Path, probe_sn: str):
-    exe = shutil.which("commander")
-    if exe is None:
-        pytest.fail(
-            "Required tool 'commander' not found on PATH. "
-            "Ensure Simplicity Studio CLI tools are installed and available."
-        )
+    exe = _resolve_commander()
     subprocess.run([exe, "flash", str(image), "--serialno", probe_sn], check=True, text=True)
 
 
