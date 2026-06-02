@@ -20,6 +20,7 @@ TOOL_ENV_VARS = {
     "commander": "COMMANDER_PATH",
 }
 SL_BT_XAPI_PATH = Path("bluetooth_le_host") / "api" / "sl_bt.xapi"
+SLC_SDK_PACKAGE_PATH_FLAG = "--sdk-package-path"
 
 
 def _resolve_executable_candidate(value: str | None) -> str | None:
@@ -223,12 +224,14 @@ def output_dir_for(slcp: Path, build_root: Path) -> Path:
     return build_root / slcp.stem
 
 
-def generate_slcp(slcp: Path, *, out_dir: Path, board: str, sdk_path: Path | None = None) -> None:
+def generate_slcp(slcp: Path, *, out_dir: Path, board: str, sdk_path: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         "slc",
         "generate",
         str(slcp),
+        "--sdk-package-path",
+        str(sdk_path),
         "-d",
         str(out_dir),
         f"-name={slcp.stem}",
@@ -236,8 +239,6 @@ def generate_slcp(slcp: Path, *, out_dir: Path, board: str, sdk_path: Path | Non
         board,
         "--generator-timeout=60000",
     ]
-    if sdk_path is not None:
-        cmd.extend(["-s", str(sdk_path)])
     run(cmd, cwd=REPO_ROOT)
 
 
@@ -277,7 +278,7 @@ def build_slcp(*, out_dir: Path) -> Path:
     return candidates[0]
 
 
-def build_project(slcp: Path, *, out_dir: Path, project_name: str, board: str, sdk_path: Path | None = None) -> Path:
+def build_project(slcp: Path, *, out_dir: Path, project_name: str, board: str, sdk_path: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     generate_slcp(slcp, out_dir=out_dir, board=board, sdk_path=sdk_path)
     return build_slcp(out_dir=out_dir)
@@ -290,7 +291,7 @@ def clean_build_root(build_root: Path) -> int:
     return 1
 
 
-def process_slcp(slcp: Path, *, build_root: Path, board: str, sdk_path: Path | None, action: str) -> dict:
+def process_slcp(slcp: Path, *, build_root: Path, board: str, sdk_path: Path, action: str) -> dict:
     out_dir = output_dir_for(slcp, build_root)
     started_at = time.perf_counter()
     generated_slcp = out_dir / slcp.name
@@ -312,7 +313,7 @@ def process_slcp(slcp: Path, *, build_root: Path, board: str, sdk_path: Path | N
         "out_dir": str(out_dir),
         "generated_slcp": str(generated_slcp),
         "image": str(image) if image else "",
-        "sdk_path": str(sdk_path) if sdk_path else "",
+        "sdk_path": str(sdk_path),
         "elapsed_s": round(time.perf_counter() - started_at, 2),
         "action": action,
     }
