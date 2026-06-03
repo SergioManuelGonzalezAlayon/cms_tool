@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -8,11 +9,20 @@ from collections.abc import Callable
 from pathlib import Path
 import sys
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.config_loader import load_effective_config
+
+
 APPS_DIR = REPO_ROOT / "apps"
 DEFAULT_BUILD_ROOT = REPO_ROOT / ".fw_build"
 DEFAULT_BOOTLOADER_SLCP = APPS_DIR / "bootloader-uart-bgapi.slcp"
+BUILD_METADATA_FILENAME = "build_metadata.json"
+FW_DATA_FILENAME = "fw_data.json"
+BGAPI_RUNTIME_DIRNAME = "runtime"
+BGAPI_XAPI_FILENAME = "sl_bt.xapi"
 TOOL_ENV_VARS = {
     "slt": "SLT_PATH",
     "slc": "SLC_PATH",
@@ -21,6 +31,8 @@ TOOL_ENV_VARS = {
 }
 SL_BT_XAPI_PATH = Path("bluetooth_le_host") / "api" / "sl_bt.xapi"
 SLC_SDK_PACKAGE_PATH_FLAG = "--sdk-package-path"
+FIRMWARE_IMAGE_SUFFIXES = (".s37", ".hex", ".bin")
+FIRMWARE_ARTIFACT_SUFFIXES = FIRMWARE_IMAGE_SUFFIXES + (".map", ".out")
 
 
 def _resolve_executable_candidate(value: str | None) -> str | None:
@@ -32,14 +44,14 @@ def _resolve_executable_candidate(value: str | None) -> str | None:
     return shutil.which(value)
 
 
-def resolve_tool(tool_name: str) -> str:
+def resolve_tool(tool_name: str, *, role: str = "build") -> str:
     env_name = TOOL_ENV_VARS.get(tool_name, f"{tool_name.upper()}_PATH")
     env_value = os.getenv(env_name)
     resolved = _resolve_executable_candidate(env_value)
     if resolved:
         return resolved
 
-    dev_cfg = read_dev_config()
+    dev_cfg = load_effective_config(role=role)
     configured = dev_cfg.get("tools", {}).get(tool_name)
     resolved = _resolve_executable_candidate(configured)
     if resolved:
@@ -78,9 +90,11 @@ def run(
 
 
 def read_dev_config(path: Path = REPO_ROOT / "dev_config.json") -> dict:
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    if path != REPO_ROOT / "dev_config.json":
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    return load_effective_config(role="build")
 
 
 def resolve_build_root(cli_value: str | None) -> Path:
@@ -99,6 +113,7 @@ def validate_firmware_config(dev_cfg: dict) -> dict[str, str]:
     resolved_board = firmware.get("board")
     device = firmware.get("device")
     sisdk = firmware.get("sisdk")
+    brev = firmware.get("brev", "")
 
     missing: list[str] = []
     if not resolved_board:
@@ -118,6 +133,7 @@ def validate_firmware_config(dev_cfg: dict) -> dict[str, str]:
 
     return {
         "board": str(resolved_board),
+        "brev": str(brev),
         "device": str(device),
         "sisdk": str(sisdk),
     }
@@ -270,18 +286,143 @@ def upgrade_slcp(slcp: Path, *, out_dir: Path) -> Path:
     return generated_slcp
 
 
+def _relative_to_repo(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path.resolve())
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_artifacts(out_dir: Path, suffixes: tuple[str, ...]) -> list[Path]:
+    root = out_dir / "cmake_gcc"
+    artifacts: list[Path] = []
+    for suffix in suffixes:
+        artifacts.extend(root.rglob(f"*{suffix}"))
+    return sorted({path.resolve() for path in artifacts})
+
+
+def copy_bgapi_xapi(build_root: Path, sdk_path: Path) -> Path:
+    runtime_dir = build_root / BGAPI_RUNTIME_DIRNAME
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    source = sdk_path / SL_BT_XAPI_PATH
+    target = runtime_dir / BGAPI_XAPI_FILENAME
+    shutil.copy2(source, target)
+    return target
+
+
+def _relative_to_build_root(path: Path, build_root: Path) -> str:
+    return str(path.resolve().relative_to(build_root.resolve()))
+
+
 def build_slcp(*, out_dir: Path) -> Path:
     run(["cmake", "--workflow", "--preset", "project"], cwd=out_dir / "cmake_gcc")
-    candidates = list((out_dir / "cmake_gcc").rglob("*.s37")) + list((out_dir / "cmake_gcc").rglob("*.hex"))
+    candidates = find_artifacts(out_dir, FIRMWARE_IMAGE_SUFFIXES)
     if not candidates:
         raise RuntimeError(f"No firmware image found under {out_dir}")
     return candidates[0]
 
 
-def build_project(slcp: Path, *, out_dir: Path, project_name: str, board: str, sdk_path: Path) -> Path:
+def find_built_image(out_dir: Path) -> Path | None:
+    candidates = find_artifacts(out_dir, FIRMWARE_IMAGE_SUFFIXES)
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def build_project(slcp: Path, *, out_dir: Path, board: str, sdk_path: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    generate_slcp(slcp, out_dir=out_dir, board=board, sdk_path=sdk_path)
+    image = find_built_image(out_dir)
+    if image is not None:
+        return image
+
+    generated_slcp = out_dir / slcp.name
+    if not generated_slcp.exists():
+        generate_slcp(slcp, out_dir=out_dir, board=board, sdk_path=sdk_path)
     return build_slcp(out_dir=out_dir)
+
+
+def write_build_metadata(
+    *,
+    slcp: Path,
+    out_dir: Path,
+    image: Path,
+) -> Path:
+    artifacts = [
+        {
+            "name": path.name,
+            "path": _relative_to_repo(path),
+            "suffix": path.suffix.lower(),
+            "size": path.stat().st_size,
+            "sha256": _sha256(path),
+        }
+        for path in find_artifacts(out_dir, FIRMWARE_ARTIFACT_SUFFIXES)
+    ]
+    metadata = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "project_name": slcp.stem,
+        "slcp": _relative_to_repo(slcp),
+        "generated_slcp": _relative_to_repo(out_dir / slcp.name),
+        "selected_image": {
+            "name": image.name,
+            "path": _relative_to_repo(image),
+            "suffix": image.suffix.lower(),
+            "size": image.stat().st_size,
+            "sha256": _sha256(image),
+        },
+        "artifacts": artifacts,
+    }
+    metadata_path = out_dir / BUILD_METADATA_FILENAME
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return metadata_path
+
+
+def write_fw_data(
+    *,
+    build_root: Path,
+    firmware_cfg: dict[str, str],
+    sdk_path: Path,
+    runtime_xapi_path: Path,
+    summaries: list[dict],
+) -> Path:
+    hash_by_role = {
+        "dut_app_hash": "",
+        "tester_app_hash": "",
+        "bootloader_app_hash": "",
+    }
+    for summary in summaries:
+        image_path = summary.get("image")
+        if not image_path:
+            continue
+        image = Path(image_path)
+        project_name = Path(summary["slcp"]).stem.lower()
+        image_hash = _sha256(image)
+        if "bootloader" in project_name:
+            hash_by_role["bootloader_app_hash"] = image_hash
+        elif "tester" in project_name:
+            hash_by_role["tester_app_hash"] = image_hash
+        elif "dut" in project_name:
+            hash_by_role["dut_app_hash"] = image_hash
+
+    fw_data = {
+        "firmware": {
+            "board": firmware_cfg["board"],
+            "brev": firmware_cfg.get("brev", ""),
+            "device": firmware_cfg["device"],
+            "sisdk": firmware_cfg["sisdk"],
+            **hash_by_role,
+        },
+    }
+    fw_data_path = build_root / FW_DATA_FILENAME
+    fw_data_path.write_text(json.dumps(fw_data, indent=2) + "\n", encoding="utf-8")
+    return fw_data_path
 
 
 def clean_build_root(build_root: Path) -> int:
@@ -291,28 +432,48 @@ def clean_build_root(build_root: Path) -> int:
     return 1
 
 
-def process_slcp(slcp: Path, *, build_root: Path, board: str, sdk_path: Path, action: str) -> dict:
+def process_slcp(
+    slcp: Path,
+    *,
+    build_root: Path,
+    firmware_cfg: dict[str, str],
+    sdk_path: Path,
+    runtime_xapi_path: Path | None,
+    action: str,
+) -> dict:
     out_dir = output_dir_for(slcp, build_root)
     started_at = time.perf_counter()
     generated_slcp = out_dir / slcp.name
     image = None
+    metadata_path = None
 
-    if action in {"generate", "upgrade", "build", "rebuild"}:
-        if action == "rebuild" and out_dir.exists():
-            shutil.rmtree(out_dir)
-        generate_slcp(slcp, out_dir=out_dir, board=board, sdk_path=sdk_path)
+    if action == "rebuild" and out_dir.exists():
+        shutil.rmtree(out_dir)
+
+    if action in {"generate", "upgrade", "rebuild"}:
+        generate_slcp(slcp, out_dir=out_dir, board=firmware_cfg["board"], sdk_path=sdk_path)
 
     if action == "upgrade":
         generated_slcp = upgrade_slcp(slcp, out_dir=out_dir)
 
-    if action in {"build", "rebuild"}:
+    if action == "build":
+        image = build_project(slcp, out_dir=out_dir, board=firmware_cfg["board"], sdk_path=sdk_path)
+    elif action == "rebuild":
         image = build_slcp(out_dir=out_dir)
+
+    if image is not None:
+        metadata_path = write_build_metadata(
+            slcp=slcp,
+            out_dir=out_dir,
+            image=image
+        )
 
     return {
         "slcp": str(slcp),
         "out_dir": str(out_dir),
         "generated_slcp": str(generated_slcp),
         "image": str(image) if image else "",
+        "metadata": str(metadata_path) if metadata_path else "",
         "sdk_path": str(sdk_path),
         "elapsed_s": round(time.perf_counter() - started_at, 2),
         "action": action,
@@ -335,11 +496,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     return parser.parse_args(argv)
 
-def update_bgapi_xapi(sisdk_path: Path, dev_cfg: dict, config_path: Path):
-    sl_bt_xapi_file = sisdk_path / SL_BT_XAPI_PATH
-    dev_cfg.setdefault("ble", {})["xapi"] = str(sl_bt_xapi_file)
-    config_path.write_text(json.dumps(dev_cfg, indent=2) + "\n", encoding="utf-8")
-
 def main(argv: list[str] | None = None) -> int:
     parsed = parse_args(list(argv if argv is not None else sys.argv[1:]))
     build_root = resolve_build_root(None)
@@ -359,37 +515,58 @@ def main(argv: list[str] | None = None) -> int:
 
     dev_cfg = read_dev_config()
     firmware_cfg = validate_firmware_config(dev_cfg)
-    board = firmware_cfg["board"]
     sdk_path = resolve_sisdk_path(firmware_cfg["sisdk"])
     trust_sisdk(sdk_path)
+    runtime_xapi_path = None
+    if parsed.action in {"build", "rebuild"}:
+        runtime_xapi_path = copy_bgapi_xapi(build_root, sdk_path)
 
     slcps = discover_slcps(parsed.targets)
     if not slcps:
         print("No .slcp files found.")
         return 1
 
+    summaries: list[dict] = []
     for slcp in slcps:
-        summary = process_slcp(slcp, build_root=build_root, board=board, sdk_path=sdk_path, action=parsed.action)
+        summary = process_slcp(
+            slcp,
+            build_root=build_root,
+            firmware_cfg=firmware_cfg,
+            sdk_path=sdk_path,
+            runtime_xapi_path=runtime_xapi_path,
+            action=parsed.action,
+        )
+        summaries.append(summary)
         print(
             f"{Path(summary['slcp']).name}: "
             f"action={summary['action']} "
             f"out={summary['out_dir']} "
             f"image={summary['image']} "
+            f"metadata={summary['metadata']} "
             f"sdk={summary['sdk_path']} "
             f"elapsed_s={summary['elapsed_s']:.2f}"
+        )
+
+    fw_data_path = None
+    if parsed.action in {"build", "rebuild"} and runtime_xapi_path is not None:
+        fw_data_path = write_fw_data(
+            build_root=build_root,
+            firmware_cfg=firmware_cfg,
+            sdk_path=sdk_path,
+            runtime_xapi_path=runtime_xapi_path,
+            summaries=summaries,
         )
 
     print(
         "App manager: "
         f"action={parsed.action} "
         f"apps={len(slcps)} "
-        f"board={board} "
+        f"board={firmware_cfg['board']} "
         f"sisdk={firmware_cfg['sisdk']} "
+        f"fw_data={fw_data_path or ''} "
         f"build_root={build_root} "
         f"elapsed_s={time.perf_counter() - total_start:.2f}"
     )
-
-    update_bgapi_xapi(sdk_path, dev_cfg, REPO_ROOT / "dev_config.json")
     return 0
 
 
