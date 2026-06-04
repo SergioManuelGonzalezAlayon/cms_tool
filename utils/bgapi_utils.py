@@ -8,6 +8,7 @@ from time import sleep
 
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
+from utils.config_loader import load_effective_config
 
 log = logging.getLogger(__name__)
 
@@ -245,9 +246,12 @@ def normalize_connection_parameters(params: ConnectionParameters) -> ConnectionP
 
 
 def read_dev_config(section, key=None, default=None, *, path="dev_config.json"):
-    config_path = os.path.join(os.getcwd(), path)
-    with open(config_path, "r", encoding="utf-8-sig") as f:
-        data = json.load(f)
+    if path == "dev_config.json":
+        data = load_effective_config(role="runtime")
+    else:
+        config_path = os.path.join(os.getcwd(), path)
+        with open(config_path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
 
     if key is None:
         return data.get(section, default)

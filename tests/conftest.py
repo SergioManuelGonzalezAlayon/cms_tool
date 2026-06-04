@@ -1,16 +1,26 @@
 import json
 import hashlib
 import subprocess
-import shutil
 import logging
 from pathlib import Path
 from dataclasses import fields
 import pytest
-from apps.app_manager import read_dev_config as _read_dev_config, resolve_bootloader_slcp
+from apps.app_manager import (
+    resolve_bootloader_slcp,
+    resolve_tool,
+)
 from joulescope_interface import write_joulescope_artifacts
 from results_generator import ResultGenerator
+from utils.config_loader import load_effective_config
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_commander() -> str:
+    try:
+        return resolve_tool("commander", role="runtime")
+    except RuntimeError as exc:
+        pytest.fail(str(exc))
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
@@ -58,7 +68,7 @@ def Config(request: pytest.FixtureRequest) -> dict:
         )
 
     cfg_data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
-    dev_cfg = _read_dev_config(Path("dev_config.json"))
+    dev_cfg = load_effective_config(role="runtime")
     dev_fw = dev_cfg.get("firmware", {})
 
     fw = dict(cfg_data.get("firmware", {}))
@@ -83,19 +93,14 @@ def HWInit(request: pytest.FixtureRequest) -> None:
     if supply_v is None:
         pytest.fail("Missing 'hw.supply_v' in test config.")
 
-    dev_cfg = _read_dev_config(Path("dev_config.json"))
+    dev_cfg = load_effective_config(role="runtime")
     tester_sn = dev_cfg.get("tester", {}).get("probe_sn")
     if not tester_sn:
         pytest.fail(
             "Missing tester probe serial. Set dev_config.json tester.probe_sn."
         )
 
-    exe = shutil.which("commander")
-    if exe is None:
-        pytest.fail(
-            "Required tool 'commander' not found on PATH. "
-            "Ensure Simplicity Studio CLI tools are installed and available."
-        )
+    exe = _resolve_commander()
 
     log.info(
         "Setting tester adapter voltage: serial=%s voltage=%s V",
@@ -161,12 +166,7 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixt
 
 
 def _flash(image: Path, probe_sn: str):
-    exe = shutil.which("commander")
-    if exe is None:
-        pytest.fail(
-            "Required tool 'commander' not found on PATH. "
-            "Ensure Simplicity Studio CLI tools are installed and available."
-        )
+    exe = _resolve_commander()
     subprocess.run([exe, "flash", str(image), "--serialno", probe_sn], check=True, text=True)
 
 
@@ -295,7 +295,7 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
     if missing:
         pytest.fail("Missing 'firmware' fields in test config: " + ", ".join(missing))
 
-    dev_cfg = _read_dev_config(Path("dev_config.json"))
+    dev_cfg = load_effective_config(role="runtime")
     build_root_str = fw.get("build_root") or dev_cfg.get("firmware", {}).get("build_root")
     if not build_root_str:
         pytest.fail(
