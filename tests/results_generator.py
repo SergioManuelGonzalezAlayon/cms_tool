@@ -219,6 +219,11 @@ def _build_result_summary(analyzer) -> list[dict]:
 
 def _build_window_rows(analyzer) -> list[dict]:
     rows = []
+    outlier_report = analyzer.outlier_report
+    outlier_indices = set()
+    if outlier_report and outlier_report.get("outlier_windows"):
+            outlier_indices = {w["index"] for w in outlier_report["outlier_windows"]}
+
     for index, stats in enumerate(analyzer.window_stats, start=1):
         sub_windows = analyzer.sub_window_stats[index - 1] if len(analyzer.sub_window_stats) >= index else []
         rows.append(
@@ -229,7 +234,7 @@ def _build_window_rows(analyzer) -> list[dict]:
                 "i_window_mean_ma": stats["avg_current"] * 1e3,
                 "t_duration_us": stats["duration"] * 1e6,
                 "e_nj": stats["energy"] * 1e9,
-                "is_outlier": False,
+                "is_outlier": (index - 1) in outlier_indices,
                 "subwindow_stats_json": sub_windows,
             }
         )
