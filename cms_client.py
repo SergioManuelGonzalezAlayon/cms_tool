@@ -7,8 +7,9 @@ control to `cmsd.py` and `cms_bench.py`.
 
 from __future__ import annotations
 
-from pathlib import Path
+import platform
 
+from pathlib import Path
 from cms_protocol import BenchHealthReport, BenchStatus, MeasurementRequest, MeasurementResult
 
 
@@ -50,3 +51,10 @@ class CMSClient:
     def download_artifact(self, measurement_id: str, artifact_name: str, out_dir: Path) -> Path:
         """Copy one published result artifact from the daemon to the client host."""
         raise NotImplementedError
+
+if __name__ == "__main__":
+
+    cms_cli = CMSClient(
+        base_url    = platform.node(),
+        api_token   = "silabs-cms"
+    )

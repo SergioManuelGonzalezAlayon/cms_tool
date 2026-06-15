@@ -43,7 +43,6 @@ class BenchIdentity:
     bench_id: str
     board: str = ""
     device: str = ""
-    profile: str = "bench-lite"
 
 
 @dataclass(slots=True)

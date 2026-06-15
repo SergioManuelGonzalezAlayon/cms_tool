@@ -1,4 +1,5 @@
-"""CMS daemon bringup for client-to-bench communication.
+"""
+CMS daemon bringup for client-to-bench communication.
 
 `cmsd.py` owns the network-facing daemon and daemon-side staging area. It does
 not construct or initialize `CMSBench` during bringup; the bench can be launched
@@ -7,13 +8,14 @@ later after the client/daemon interface is proven.
 
 from __future__ import annotations
 
-import json
+import json, platform, subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cms_bench import BenchSession
+from cms_bench import BenchSession, CMSBench
 from cms_protocol import (
+    BenchIdentity,
     BenchHealthReport,
     BenchState,
     DeviceState,
@@ -21,6 +23,7 @@ from cms_protocol import (
     MeasurementResult,
 )
 
+SIMPLICITY_COMMANDER = Path("./tools/commander-cli/commander-cli")
 
 @dataclass(slots=True)
 class DaemonConfig:
@@ -66,6 +69,7 @@ class CMSDaemon:
         self.files = self._daemon_files()
         self.initialized = False
         self.startup_error = ""
+        self.bench: CMSBench = None
 
     def initialize(self) -> None:
         """Prepare daemon runtime directories and staging files."""
@@ -86,6 +90,23 @@ class CMSDaemon:
         workspace = self.config.runtime_root / "measurements" / measurement_id
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
+    
+    def initBench(self):
+        def get_device():
+            # Get the device type from commander
+            res = subprocess.run([SIMPLICITY_COMMANDER, "-v"])
+            pass
+        def get_board():
+            # Get the board type from commander
+            pass
+        bench_identity = BenchIdentity(
+            platform.node(),
+            get_board()
+            get_device(),
+        )
+    
+            )
+        self.bench = CMSBench(bench_identity)
 
     def fw_fetch(self, request: MeasurementRequest, runtime_dir: Path) -> None:
         """Stage or fetch the requested firmware payloads into the runtime area."""
@@ -215,3 +236,13 @@ def _measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
         "mode": request.mode.value,
         "requested_by": request.requested_by,
     }
+
+if __name__ == "__main__":
+    # Not entering a DaemonConfig sets the default DaemonConfig on the CMSDeamon
+    cmsd = CMSDaemon()
+
+    cmsd.initialize()
+    cmsd.create_runtime_workspace("bench-001")
+
+    # CMS Daemon stars the HTTP service
+    cmsd.start_service()

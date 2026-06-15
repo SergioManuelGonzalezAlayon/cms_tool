@@ -8,6 +8,8 @@ bench hardware and execute one measurement run at a time when asked by
 
 from __future__ import annotations
 
+import json
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,6 +22,7 @@ from cms_protocol import (
     MeasurementResult,
 )
 
+CMS_BENCH_CONFIG = "cms_bench_runtime.json"
 
 @dataclass(slots=True)
 class BenchResources:
@@ -29,7 +32,6 @@ class BenchResources:
     tester_probe_sn: str = ""
     dut_serial_port: str = ""
     tester_serial_port: str = ""
-    joulescope_serial: str = ""
     board: str = ""
     device: str = ""
     result_db: str = ""
@@ -48,13 +50,23 @@ class BenchSession:
 class CMSBench:
     """Own the hardware-facing steps for one current-measurement bench."""
 
-    def __init__(self, identity: BenchIdentity, resources: BenchResources):
-        self.identity = identity
-        self.resources = resources
+    def __init__(self):
+        self.identity = None
+        self.resources = None
         self.state = BenchState.IDLE
 
     def initialize(self) -> None:
         """Validate that the local probes, serial ports, and tools are usable."""
+        config = None
+        with open(CMS_BENCH_CONFIG, "r") as f:
+            config = json.load(f)
+
+        identity = BenchIdentity(
+            platform.node(),
+            config.get_board(),
+            config.get_device()            
+        )
+        
         raise NotImplementedError
 
     def health_check(self) -> BenchHealthReport:

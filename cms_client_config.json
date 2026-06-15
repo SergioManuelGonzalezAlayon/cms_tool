@@ -1,0 +1,20 @@
+{
+    "Joulescope": {
+        "serial_port": "scope",
+        "wake_gpio": 0
+    },
+    "dut": {
+        "serial_port": "dut",
+        "baudrate": 115200,
+        "probe_sn": "REPLACE_WITH_DUT_PROBE_SN"
+    },
+    "tester": {
+        "serial_port": "tester",
+        "baudrate": 115200,
+        "probe_sn": "REPLACE_WITH_TESTER_PROBE_SN"
+    },
+    "tools": {
+        "slc": "C:\\\\path\\\\to\\\\slc.exe",
+        "cmake": "C:\\\\path\\\\to\\\\cmake.exe"
+    }
+}
