@@ -37,4 +37,4 @@ filterwarnings = [
 ]
 
 [tool.uv.sources]
-power-profiling-tools-val = { git = "ssh://git@stash.silabs.com/mcuw_val_sw/power_profiling_tools_val.git" }
+power-profiling-tools-val = { git = "https://stash.silabs.com/scm/mcuw_val_sw/power_profiling_tools_val.git" }
