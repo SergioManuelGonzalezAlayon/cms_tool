@@ -53,7 +53,6 @@ component:
 - id: bluetooth_feature_system
 - id: bluetooth_feature_test
 - id: bluetooth_stack
-- id: bootloader_interface
 - id: brd4002a
 - id: brd4182a_b06
 - id: clock_manager

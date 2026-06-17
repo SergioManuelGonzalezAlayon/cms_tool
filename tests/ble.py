@@ -119,11 +119,15 @@ def _log_sync_event(evt) -> bool:
     return False
 
 @pytest.fixture
-def BLEDev():
+def BLEDev(EffectiveDevConfig):
     created =[]
 
     def _create_ble_dev(device : str):
-        port= read_dev_config(device, "serial_port" )
+        xapi_path = EffectiveDevConfig.get("ble", {}).get("xapi")
+        if xapi_path:
+            os.environ["BGAPI_XAPI"] = str(xapi_path)
+
+        port = EffectiveDevConfig.get(device, {}).get("serial_port")
 
         if port is None:
             raise RuntimeError("No serial_port found")

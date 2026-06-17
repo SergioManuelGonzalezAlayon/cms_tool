@@ -1,0 +1,27 @@
+{
+  "bench": {
+    "bench_id": "Timmothy",
+    "profile": "bench-lite"
+  },
+  "dut": {
+    "serial_port": "dut",
+    "baudrate": 115200,
+    "probe_sn": "REPLACE_WITH_DUT_PROBE_SN"
+  },
+  "tester": {
+    "serial_port": "tester",
+    "baudrate": 115200,
+    "probe_sn": "REPLACE_WITH_TESTER_PROBE_SN"
+  },
+  "tools": {
+    "commander": "C:\\path\\to\\commander.exe"
+  },
+  "ble": {
+    "xapi": "build\\test_write_fw_data\\runtime\\sl_bt.xapi"
+  },
+  "devices": {
+    "board": "REPLACE_WITH_BOARD_ID",
+    "board_rev": "REPLACE_WITH_BOARD_REV",
+    "device": "REPLACE_WITH_DEVICE_ID"
+  }
+}

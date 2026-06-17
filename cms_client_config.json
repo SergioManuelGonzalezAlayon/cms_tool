@@ -1,0 +1,19 @@
+{
+    "daemon": {
+        "scheme": "http",
+        "host": "cms-bench-001",
+        "port": 8000,
+        "api_token": "silabs-cms",
+        "timeout_s": 30.0
+    },
+    "tools": {
+        "slc": "C:\\\\path\\\\to\\\\slc.exe",
+        "cmake": "C:\\\\path\\\\to\\\\cmake.exe"
+    },
+    "target": {
+        "board": "brd4182a",
+        "board_rev": "a06",
+        "device": "EFR32MG22C224F512IM40",
+        "sisdk": "2025.12.0"
+    }
+}
