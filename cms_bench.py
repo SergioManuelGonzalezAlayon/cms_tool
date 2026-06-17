@@ -13,6 +13,9 @@ import platform
 import shutil
 import hashlib
 import re
+import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -49,6 +52,7 @@ class BenchResources:
     joulescope_serial: str = ""
     joulescope_wake_gpio: int | None = None
     board: str = ""
+    board_rev: str = ""
     device: str = ""
     result_db: str = ""
     commander_path: str = ""
@@ -186,7 +190,11 @@ class CMSBench:
                     "Joulescope mapping is not configured",
                 ),
                 _tool_check("commander", resources.commander_path),
-                _tool_check("xapi", resources.xapi_path),
+                _optional_tool_check(
+                    "xapi",
+                    resources.xapi_path,
+                    "client-supplied sl_bt.xapi will be used for remote tests",
+                ),
                 BenchCheckResult(
                     name="bench_state",
                     status=BenchCheckStatus.PASS
@@ -275,6 +283,13 @@ class CMSBench:
                 bootloader_path,
                 session.manifest.bootloader_img.sha256 or session.manifest.bootloader_img_hash,
             )
+        if session.manifest.xapi_file is None:
+            raise RuntimeError("sl_bt.xapi was not supplied by the CMS client")
+        xapi_path = session.runtime_dir / session.manifest.xapi_file.name
+        _validate_firmware_file(
+            xapi_path,
+            session.manifest.xapi_file.sha256 or session.manifest.xapi_file_hash,
+        )
 
     def test_smoke(self, session: BenchSession) -> None:
         """Run a lightweight preflight before spending time on a full run."""
@@ -290,21 +305,25 @@ class CMSBench:
         self.state = BenchState.TESTING
         try:
             self.test_smoke(session)
-            result_path = session.runtime_dir / "result.json"
+            prepared = _prepare_pytest_runtime(session, self.resources or BenchResources())
+            completed = _run_test_orchestrator(session, prepared["results_log"], prepared["metadata_path"])
             result = MeasurementResult(
                 measurement_id=session.measurement_id,
-                state=MeasurementState.PASSED,
+                state=MeasurementState.PASSED if completed.returncode == 0 else MeasurementState.FAILED,
                 started_at=started_at,
                 finished_at=datetime.utcnow(),
                 progress_percent=90,
                 current_step=MeasurementState.COLLECTING_ARTIFACTS.value,
-                message="measurement placeholder completed",
+                message="test execution completed" if completed.returncode == 0 else "test execution failed",
             )
-            result_path.write_text(
+            run_summary_path = session.runtime_dir / "cms_test_run.json"
+            run_summary_path.write_text(
                 json.dumps(
                     {
-                        "measurement": measurement_result_to_dict(result),
                         "request": measurement_request_to_dict(session.request),
+                        "returncode": completed.returncode,
+                        "stdout": completed.stdout,
+                        "stderr": completed.stderr,
                         "notes": session.notes,
                     },
                     indent=2,
@@ -312,7 +331,7 @@ class CMSBench:
                 + "\n",
                 encoding="utf-8",
             )
-            return self.collect_artifacts(session, result)
+            return self.collect_artifacts(session, result, artifact_since=prepared["artifact_since"])
         except RuntimeError as exc:
             return MeasurementResult(
                 measurement_id=session.measurement_id,
@@ -330,15 +349,23 @@ class CMSBench:
         self,
         session: BenchSession,
         result: MeasurementResult,
+        *,
+        artifact_since: float | None = None,
     ) -> MeasurementResult:
         """Attach local artifact metadata after the execution step finishes."""
-        for path in sorted(session.runtime_dir.glob("*")):
-            if path.is_file():
-                result.artifacts.append(Artifacts(name=path.name, path=path))
+        for path in _run_diagnostic_artifacts(session):
+            result.artifacts.append(
+                Artifacts(
+                    name=(Path("cmsd") / session.measurement_id / path.name).as_posix(),
+                    path=path,
+                )
+            )
+        for path in _real_test_artifacts(session, since=artifact_since):
+            result.artifacts.append(Artifacts(name=_artifact_name(Path("artifacts"), path), path=path))
         result.progress_percent = 100
         if result.state is MeasurementState.PASSED:
             result.current_step = MeasurementState.PASSED.value
-            result.message = "measurement artifacts collected"
+            result.message = "test artifacts collected"
         return result
 
     def init(self, dev_config: dict[str, Any], js: Any = None) -> BenchResources:
@@ -391,7 +418,6 @@ class CMSBench:
             "dut.serial_port": resources.dut_serial_port,
             "tester.serial_port": resources.tester_serial_port,
             "commander": resources.commander_path,
-            "ble.xapi": resources.xapi_path,
         }
         return [name for name, value in required.items() if not str(value).strip()]
 
@@ -428,6 +454,7 @@ def load_bench_runtime_config(path: str | Path = CMS_BENCH_CONFIG) -> tuple[Benc
         ),
         joulescope_wake_gpio=_optional_int(joulescope.get("wake_gpio")),
         board=identity.board,
+        board_rev=str(devices.get("board_rev", devices.get("brev", ""))),
         device=identity.device,
         result_db=str(config.get("result_db", "")),
         commander_path=str(tools.get("commander", config.get("commander", ""))),
@@ -453,6 +480,7 @@ def resolve_cms_resources_from_dev_config(dev_config: dict[str, Any]) -> BenchRe
         ),
         joulescope_wake_gpio=_optional_int(joulescope.get("wake_gpio")),
         board=str(firmware.get("board", "")),
+        board_rev=str(firmware.get("brev", firmware.get("board_rev", ""))),
         device=str(firmware.get("device", "")),
         commander_path=str(tools.get("commander", dev_config.get("commander", ""))),
         xapi_path=str(ble.get("xapi", tools.get("xapi", dev_config.get("xapi", "")))),
@@ -494,8 +522,194 @@ def resolve_cms_resources_from_hwmux(group_json: dict[str, Any]) -> BenchResourc
         joulescope_serial=str(joulescope_metadata.get("serial_number", "")),
         joulescope_wake_gpio=_optional_int(metadata.get("joulescope_dut_wake_gpio")),
         board=str(metadata.get("cms_board", dut.get("part", {}).get("board_no", ""))),
+        board_rev=str(metadata.get("cms_board_rev", dut.get("part", {}).get("board_rev", ""))),
         device=str(metadata.get("cms_device", dut.get("part", {}).get("variant", ""))),
     )
+
+
+def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) -> dict[str, Path]:
+    build_root = session.runtime_dir / "fw_build"
+    config_data = _load_requested_test_config(session)
+    firmware = config_data.get("firmware", {})
+    dut_project = build_root / Path(str(firmware.get("dut_slcp", session.manifest.dut_img.name))).stem
+    tester_project = build_root / Path(str(firmware.get("tester_slcp", session.manifest.tester_img.name))).stem
+
+    dut_copied_image = _copy_image_to_project(
+        session.runtime_dir / session.manifest.dut_img.name,
+        dut_project,
+    )
+    tester_copied_image = _copy_image_to_project(
+        session.runtime_dir / session.manifest.tester_img.name,
+        tester_project,
+    )
+    bootloader_copied_image = _copy_bootloader_image(session, build_root)
+    xapi_path = _staged_xapi_path(session)
+
+    metadata = {
+        "firmware": {
+            "build_root": str(build_root),
+            "provision_state_root": str(Path("artifacts") / "cmsd" / "provision_state"),
+            "board": resources.board,
+            "brev": resources.board_rev,
+            "device": resources.device,
+            "sisdk": session.manifest.sisdk_version,
+            "dut_image": str(session.runtime_dir / session.manifest.dut_img.name),
+            "tester_image": str(session.runtime_dir / session.manifest.tester_img.name),
+            "dut_image_sha256": session.manifest.dut_img.sha256
+            or session.manifest.dut_img_hash
+            or _sha256_file(dut_copied_image),
+            "tester_image_sha256": session.manifest.tester_img.sha256
+            or session.manifest.tester_img_hash
+            or _sha256_file(tester_copied_image),
+            "dut_slcp": str(firmware.get("dut_slcp", "")),
+            "tester_slcp": str(firmware.get("tester_slcp", "")),
+            "bootloader_image": str(bootloader_copied_image) if bootloader_copied_image is not None else "",
+            "bootloader_image_sha256": (
+                session.manifest.bootloader_img.sha256
+                or session.manifest.bootloader_img_hash
+                or _sha256_file(bootloader_copied_image)
+            ) if session.manifest.bootloader_img is not None and bootloader_copied_image is not None else "",
+        },
+        "dut": {
+            "serial_port": resources.dut_serial_port,
+            "probe_sn": resources.dut_probe_sn,
+        },
+        "tester": {
+            "serial_port": resources.tester_serial_port,
+            "probe_sn": resources.tester_probe_sn,
+        },
+        "tools": {
+            "commander": resources.commander_path,
+        },
+        "ble": {
+            "xapi": str(xapi_path),
+        },
+    }
+    metadata_path = session.runtime_dir / "cms_fw_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return {
+        "build_root": build_root,
+        "results_log": session.runtime_dir / "orchestrator_results.jsonl",
+        "metadata_path": metadata_path,
+        "artifact_since": time.time(),
+    }
+
+
+def _staged_xapi_path(session: BenchSession) -> Path:
+    if session.manifest.xapi_file is None:
+        raise RuntimeError("sl_bt.xapi was not supplied by the CMS client")
+    xapi_path = session.runtime_dir / session.manifest.xapi_file.name
+    if not xapi_path.exists():
+        raise RuntimeError(f"staged sl_bt.xapi is missing: {xapi_path}")
+    return xapi_path
+
+
+def _copy_image_to_project(source: Path, project_dir: Path) -> Path:
+    if not source.exists():
+        raise RuntimeError(f"staged firmware image is missing: {source}")
+    destination = project_dir / "cmake_gcc" / "build" / "base" / source.name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return destination
+
+
+def _copy_bootloader_image(session: BenchSession, build_root: Path) -> Path | None:
+    if session.manifest.bootloader_img is None:
+        return None
+    source = session.runtime_dir / session.manifest.bootloader_img.name
+    return _copy_image_to_project(source, build_root / "bootloader-uart-bgapi")
+
+
+def _run_test_orchestrator(session: BenchSession, results_log: Path, metadata_path: Path) -> subprocess.CompletedProcess:
+    feature = session.request.selector.feature
+    if not feature:
+        raise RuntimeError("test feature is required")
+    config_dir = Path("tests") / "configs" / session.request.selector.mode / feature
+    if not config_dir.exists():
+        raise RuntimeError(f"test config directory does not exist: {config_dir}")
+
+    mode = session.request.mode.value
+    orchestrator_mode = "full_sweep" if mode == "full_sweep" else "default"
+    cmd = [
+        sys.executable,
+        "test_orchestrator.py",
+        str(config_dir),
+        "--mode",
+        orchestrator_mode,
+        "--feature",
+        feature,
+        "--results-log",
+        str(results_log),
+        "--cms-runtime-config",
+        str(Path(CMS_BENCH_CONFIG)),
+        "--cms-fw-metadata",
+        str(metadata_path),
+        "--log-file",
+        str(session.runtime_dir / "pytest.log"),
+        "--log-file-level",
+        "INFO",
+        "--log-file-mode",
+        "w",
+    ]
+    if session.request.selector.config != "default":
+        cmd.extend(["--cfg", session.request.selector.config])
+
+    completed = subprocess.run(cmd, cwd=Path("."), check=False, text=True, capture_output=True)
+    (session.runtime_dir / "test_stdout.log").write_text(completed.stdout, encoding="utf-8")
+    (session.runtime_dir / "test_stderr.log").write_text(completed.stderr, encoding="utf-8")
+    return completed
+
+
+def _run_diagnostic_artifacts(session: BenchSession) -> list[Path]:
+    names = [
+        "cms_fw_metadata.json",
+        "cms_test_run.json",
+        "orchestrator_results.jsonl",
+        "pytest.log",
+        "test_stdout.log",
+        "test_stderr.log",
+    ]
+    return [path for name in names if (path := session.runtime_dir / name).exists()]
+
+
+def _load_requested_test_config(session: BenchSession) -> dict[str, Any]:
+    config_path = _requested_test_config_path(session)
+    if not config_path.exists():
+        raise RuntimeError(f"test config does not exist: {config_path}")
+    return json.loads(config_path.read_text(encoding="utf-8-sig"))
+
+
+def _requested_test_config_path(session: BenchSession) -> Path:
+    config_dir = Path("tests") / "configs" / session.request.selector.mode / session.request.selector.feature
+    config_name = session.request.selector.config or "default"
+    if config_name.endswith(".json"):
+        return config_dir / config_name
+    return config_dir / f"{config_name}.json"
+
+
+def _real_test_artifacts(session: BenchSession, *, since: float | None = None) -> list[Path]:
+    feature = session.request.selector.feature
+    mode = "full_sweep" if session.request.mode.value == "full_sweep" else "default"
+    candidates = [
+        Path("artifacts") / session.request.selector.mode / feature / mode,
+        Path("artifacts") / "orchestrator",
+    ]
+    artifacts: list[Path] = []
+    for candidate in candidates:
+        if candidate.exists():
+            artifacts.extend(
+                path
+                for path in sorted(candidate.rglob("*"))
+                if path.is_file() and (since is None or path.stat().st_mtime >= since)
+            )
+    return artifacts
+
+
+def _artifact_name(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _validate_firmware_file(path: Path, expected_sha256: str = "") -> None:
@@ -570,6 +784,15 @@ def _tool_check(name: str, value: str) -> BenchCheckResult:
         summary=f"{name} path is not available",
         detail=str(path),
     )
+
+
+def _optional_tool_check(name: str, value: str, missing_summary: str) -> BenchCheckResult:
+    if not str(value).strip():
+        return BenchCheckResult(name=name, status=BenchCheckStatus.WARN, summary=missing_summary)
+    check = _tool_check(name, value)
+    if check.status is BenchCheckStatus.FAIL:
+        check.status = BenchCheckStatus.WARN
+    return check
 
 
 def _load_json_with_trailing_commas(path: Path) -> dict[str, Any]:

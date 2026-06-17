@@ -124,6 +124,11 @@ class CMSDaemon:
         """Stage or fetch the requested firmware payloads into the runtime area."""
         _stage_firmware_image(request.firmware.dut_img.url, runtime_dir / request.firmware.dut_img.name)
         _stage_firmware_image(request.firmware.tester_img.url, runtime_dir / request.firmware.tester_img.name)
+        if request.firmware.xapi_file is not None:
+            _stage_firmware_image(
+                request.firmware.xapi_file.url,
+                runtime_dir / request.firmware.xapi_file.name,
+            )
         if request.firmware.bootloader_img is not None:
             _stage_firmware_image(
                 request.firmware.bootloader_img.url,
@@ -363,11 +368,17 @@ class CMSDaemon:
         for artifact in result.artifacts:
             if artifact.path is None or not artifact.path.exists():
                 continue
-            destination = published_dir / artifact.path.name
+            artifact_name = _safe_artifact_name(artifact.name or artifact.path.name)
+            destination = published_dir / artifact_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
             if artifact.path.resolve() != destination.resolve():
                 shutil.copy2(artifact.path, destination)
             artifact.path = destination
-            artifact.url = f"/measurement/{result.measurement_id}/artifacts/{destination.name}"
+            artifact.name = artifact_name
+            artifact.url = (
+                f"/measurement/{result.measurement_id}/artifacts/"
+                f"{urllib.parse.quote(artifact_name, safe='/')}"
+            )
             published_artifacts.append(artifact)
 
         result.artifacts = published_artifacts
@@ -377,11 +388,18 @@ class CMSDaemon:
             encoding="utf-8",
         )
         if not any(artifact.name == result_path.name for artifact in result.artifacts):
+            result_artifact_name = (Path("cmsd") / result.measurement_id / result_path.name).as_posix()
+            result_artifact_path = published_dir / result_artifact_name
+            result_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(result_path, result_artifact_path)
             result.artifacts.append(
                 Artifacts(
-                    name=result_path.name,
-                    path=result_path,
-                    url=f"/measurement/{result.measurement_id}/artifacts/{result_path.name}",
+                    name=result_artifact_name,
+                    path=result_artifact_path,
+                    url=(
+                        f"/measurement/{result.measurement_id}/artifacts/"
+                        f"{urllib.parse.quote(result_artifact_name, safe='/')}"
+                    ),
                 )
             )
         self.measurements[result.measurement_id] = result
@@ -574,9 +592,10 @@ class CMSDaemon:
                 "artifacts": measurement_result_to_dict(result)["artifacts"],
             }
 
-        @app.get("/measurement/{measurement_id}/artifacts/{artifact_name}")
-        def measurement_artifact_file(measurement_id: str, artifact_name: str) -> FileResponse:
-            artifact_path = self.config.artifacts_root / "measurements" / measurement_id / artifact_name
+        @app.get("/measurement/{measurement_id}/artifacts/{artifact_path:path}")
+        def measurement_artifact_file(measurement_id: str, artifact_path: str) -> FileResponse:
+            safe_name = _safe_artifact_name(urllib.parse.unquote(artifact_path))
+            artifact_path = self.config.artifacts_root / "measurements" / measurement_id / safe_name
             return FileResponse(artifact_path)
 
         @app.post("/measurement/{measurement_id}/cancel")
@@ -701,12 +720,21 @@ def _stage_firmware_image(source: str, destination: Path) -> None:
     shutil.copy2(source_path, destination)
 
 
+def _safe_artifact_name(name: str) -> str:
+    normalized = Path(name.replace("\\", "/"))
+    if normalized.is_absolute() or any(part in {"", ".", ".."} for part in normalized.parts):
+        raise RuntimeError(f"invalid artifact name: {name}")
+    return normalized.as_posix()
+
+
 def _copy_staged_firmware(
     request: MeasurementRequest,
     staged_runtime_dir: Path,
     runtime_dir: Path,
 ) -> None:
     images = [request.firmware.dut_img, request.firmware.tester_img]
+    if request.firmware.xapi_file is not None:
+        images.append(request.firmware.xapi_file)
     if request.firmware.bootloader_img is not None:
         images.append(request.firmware.bootloader_img)
 
@@ -727,6 +755,8 @@ def _write_firmware_payloads(
         "dut_img": request.firmware.dut_img,
         "tester_img": request.firmware.tester_img,
     }
+    if request.firmware.xapi_file is not None:
+        targets["xapi_file"] = request.firmware.xapi_file
     if request.firmware.bootloader_img is not None:
         targets["bootloader_img"] = request.firmware.bootloader_img
 

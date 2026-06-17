@@ -81,6 +81,8 @@ class FirmwareData:
     tester_img_hash: str = ""
     bootloader_img: FirmwareImage | None = None
     bootloader_img_hash: str = ""
+    xapi_file: FirmwareImage | None = None
+    xapi_file_hash: str = ""
     git_commit: str = ""
     sisdk_version: str = ""
     sisdk_commit: str = ""
@@ -258,6 +260,8 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
         "tester_img_hash": firmware.tester_img_hash,
         "bootloader_img": firmware_image_to_dict(firmware.bootloader_img),
         "bootloader_img_hash": firmware.bootloader_img_hash,
+        "xapi_file": firmware_image_to_dict(firmware.xapi_file),
+        "xapi_file_hash": firmware.xapi_file_hash,
         "git_commit": firmware.git_commit,
         "sisdk_version": firmware.sisdk_version,
         "sisdk_commit": firmware.sisdk_commit,
@@ -283,6 +287,8 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         tester_img_hash=str(data.get("tester_img_hash", data.get("tester_image_hash", tester_img.sha256))),
         bootloader_img=firmware_image_from_dict(data.get("bootloader_img")),
         bootloader_img_hash=str(data.get("bootloader_img_hash", "")),
+        xapi_file=firmware_image_from_dict(data.get("xapi_file")),
+        xapi_file_hash=str(data.get("xapi_file_hash", "")),
         git_commit=str(data.get("git_commit", "")),
         sisdk_version=str(data.get("sisdk_version", "")),
         sisdk_commit=str(data.get("sisdk_commit", "")),

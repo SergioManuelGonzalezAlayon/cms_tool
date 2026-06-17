@@ -261,7 +261,7 @@ def read_dev_config(section, key=None, default=None, *, path="dev_config.json"):
 
 def get_ble_dev(serialPort):
     try:
-        xapi_path = read_dev_config("ble", "xapi") or os.getenv("BGAPI_XAPI")
+        xapi_path = os.getenv("BGAPI_XAPI") or read_dev_config("ble", "xapi")
         if not xapi_path:
             raise RuntimeError(
                 "Missing BGAPI XAPI path. Set dev_config.json 'ble.xapi' or environment variable BGAPI_XAPI."

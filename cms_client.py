@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import platform
 import shutil
@@ -149,6 +150,7 @@ class CMSClient:
 
         out_dir.mkdir(parents=True, exist_ok=True)
         destination = out_dir / artifact_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
         source_url = str(artifact.get("url", ""))
         source_path = str(artifact.get("path", ""))
         if source_path and Path(source_path).exists():
@@ -172,12 +174,11 @@ class CMSClient:
             raise RuntimeError("no completed test artifacts are available")
 
         saved: list[Path] = []
-        target_dir = out_dir / measurement_id
         for artifact in artifacts:
             name = str(artifact.get("name", ""))
             if not name:
                 continue
-            saved.append(self._download_artifact_payload(artifact, target_dir))
+            saved.append(self._download_artifact_payload(artifact, out_dir))
         return saved
 
     def _request_json(
@@ -213,6 +214,7 @@ class CMSClient:
         name = str(artifact.get("name", ""))
         out_dir.mkdir(parents=True, exist_ok=True)
         destination = out_dir / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
         source_url = str(artifact.get("url", ""))
         source_path = str(artifact.get("path", ""))
         if source_path and Path(source_path).exists():
@@ -274,8 +276,10 @@ def build_cli_parser() -> argparse.ArgumentParser:
     send_fw.add_argument("--request-id", default="", help="firmware staging id")
     send_fw.add_argument("--dut-image", default="", help="DUT firmware path or URL")
     send_fw.add_argument("--tester-image", default="", help="tester firmware path or URL")
+    send_fw.add_argument("--bootloader-image", default="", help="bootloader firmware path or URL")
     send_fw.add_argument("--dut-sha256", default="", help="expected DUT firmware SHA-256")
     send_fw.add_argument("--tester-sha256", default="", help="expected tester firmware SHA-256")
+    send_fw.add_argument("--bootloader-sha256", default="", help="expected bootloader firmware SHA-256")
     send_fw.add_argument("--board", default="", help="target board id")
     send_fw.add_argument("--device", default="", help="target device id")
     send_fw.add_argument("--git-commit", default="", help="firmware source commit")
@@ -288,7 +292,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     test.add_argument("feature")
     test.add_argument("--config-name", default="default", help="test config")
     test.add_argument("--request-id", default="", help="test run id")
-    test.add_argument("--out-dir", default="artifacts/cms_client", help="local artifact root")
+    test.add_argument("--out-dir", default="artifacts", help="local artifact root")
 
     measurement = subparsers.add_parser("measurement", help="show measurement status")
     measurement.add_argument("measurement_id")
@@ -296,7 +300,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     cancel = subparsers.add_parser("cancel", aliases=["CANCEL"], help="cancel the active test")
 
     artifacts = subparsers.add_parser("artifacts", aliases=["ARTIFACTS"], help="download artifacts from the last test")
-    artifacts.add_argument("--out-dir", default="artifacts/cms_client")
+    artifacts.add_argument("--out-dir", default="artifacts")
     return parser
 
 
@@ -354,9 +358,10 @@ def main(argv: list[str] | None = None) -> int:
             result = _poll_test_progress(client, result.measurement_id)
         else:
             _print_measurement_result(result)
-        if result.state is MeasurementState.PASSED:
+        if result.artifacts:
             for path in client.download_last_artifacts(Path(args.out_dir)):
                 print(f"saved {path}")
+        if result.state is MeasurementState.PASSED:
             return 0
         return 1
 
@@ -385,8 +390,16 @@ def _request_from_send_fw_args(
     target_cfg = client_config.target if client_config and client_config.target else {}
     dut_image_arg = args.dut_image or str(target_cfg.get("dut_image", ""))
     tester_image_arg = args.tester_image or str(target_cfg.get("tester_image", ""))
+    bootloader_image_arg = args.bootloader_image or str(target_cfg.get("bootloader_image", ""))
     dut_image = _firmware_image_from_arg(dut_image_arg, "dut", firmware_cfg)
     tester_image = _firmware_image_from_arg(tester_image_arg, "tester", firmware_cfg)
+    bootloader_image = _firmware_image_from_arg(
+        bootloader_image_arg,
+        "bootloader",
+        firmware_cfg,
+    ) if bootloader_image_arg or firmware_cfg.get("bootloader_slcp") else None
+    xapi_file = _xapi_file_from_config(dev_cfg, target_cfg)
+    xapi_hash = _sha256_file(xapi_file)
 
     request_id = args.request_id or f"cms-{int(time.time())}"
     return MeasurementRequest(
@@ -403,8 +416,20 @@ def _request_from_send_fw_args(
                 url=tester_image["url"],
                 sha256=args.tester_sha256 or str(target_cfg.get("tester_sha256", "")),
             ),
+            bootloader_img=FirmwareImage(
+                name=bootloader_image["name"],
+                url=bootloader_image["url"],
+                sha256=args.bootloader_sha256 or str(target_cfg.get("bootloader_sha256", "")),
+            ) if bootloader_image is not None else None,
+            bootloader_img_hash=args.bootloader_sha256 or str(target_cfg.get("bootloader_sha256", "")),
             board=args.board or str(target_cfg.get("board", firmware_cfg.get("board", ""))),
             device=args.device or str(target_cfg.get("device", firmware_cfg.get("device", ""))),
+            xapi_file=FirmwareImage(
+                name=xapi_file.name,
+                url=str(xapi_file),
+                sha256=xapi_hash,
+            ),
+            xapi_file_hash=xapi_hash,
             git_commit=args.git_commit,
             sisdk_version=args.sisdk_version or str(target_cfg.get("sisdk", firmware_cfg.get("sisdk", ""))),
             sisdk_commit=args.sisdk_commit or str(target_cfg.get("sisdk_commit", "")),
@@ -430,6 +455,7 @@ def _discover_built_firmware(role: str, firmware_cfg: dict[str, Any]) -> Path:
     candidates_by_role = {
         "dut": ["ncp_ble_dut_dcdc", "ncp_ble_dut"],
         "tester": ["ncp_ble_tester"],
+        "bootloader": ["bootloader-uart-bgapi"],
     }
     for app_name in candidates_by_role[role]:
         app_dir = build_root / app_name
@@ -450,6 +476,24 @@ def _firmware_image_from_arg(value: str, role: str, firmware_cfg: dict[str, Any]
     return {"name": path.name, "url": str(path)}
 
 
+def _xapi_file_from_config(dev_cfg: dict[str, Any], target_cfg: dict[str, str]) -> Path:
+    value = str(target_cfg.get("xapi", "") or dev_cfg.get("ble", {}).get("xapi", "")).strip()
+    if not value:
+        raise RuntimeError("No sl_bt.xapi configured. Set dev_config.json ble.xapi or cms_client_config.json target.xapi.")
+    path = Path(value)
+    if not path.exists() or not path.is_file():
+        raise RuntimeError(f"sl_bt.xapi does not exist: {path}")
+    return path
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
     payloads: dict[str, str] = {}
     for key, image in (("dut_img", request.firmware.dut_img), ("tester_img", request.firmware.tester_img)):
@@ -460,6 +504,10 @@ def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
         path = Path(request.firmware.bootloader_img.url)
         if path.exists() and path.is_file():
             payloads["bootloader_img"] = base64.b64encode(path.read_bytes()).decode("ascii")
+    if request.firmware.xapi_file is not None:
+        path = Path(request.firmware.xapi_file.url)
+        if path.exists() and path.is_file():
+            payloads["xapi_file"] = base64.b64encode(path.read_bytes()).decode("ascii")
     return payloads
 
 
