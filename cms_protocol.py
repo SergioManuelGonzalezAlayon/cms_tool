@@ -104,6 +104,7 @@ class MeasurementRequest:
     firmware: FirmwareData
     mode: MeasurementMode = MeasurementMode.DEFAULT
     requested_by: str = ""
+    upload_results_to_database: bool = False
 
 
 @dataclass(slots=True)
@@ -306,6 +307,7 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
         "firmware": firmware_data_to_dict(request.firmware),
         "mode": request.mode.value,
         "requested_by": request.requested_by,
+        "upload_results_to_database": request.upload_results_to_database,
     }
 
 
@@ -321,6 +323,7 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
         firmware=firmware_data_from_dict(data.get("firmware", data)),
         mode=MeasurementMode(str(data.get("mode", MeasurementMode.DEFAULT.value))),
         requested_by=str(data.get("requested_by", "")),
+        upload_results_to_database=bool(data.get("upload_results_to_database", False)),
     )
 
 

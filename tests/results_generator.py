@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -7,9 +8,10 @@ from pathlib import Path
 import numpy as np
 
 
+log = logging.getLogger(__name__)
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
 
 @dataclass
 class ResultContext:
@@ -95,6 +97,12 @@ def _json_ready(value):
             pass
     return value
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+def upload_result_json_to_database(result_json_path: Path | str):
+    from s3_upload import upload_json_to_data_lake
+    return upload_json_to_data_lake(result_json_path)
 
 def _representative_indices(total: int, count: int) -> list[int]:
     if total <= 0 or count <= 0:
@@ -365,11 +373,16 @@ def write_result_json(
 
 
 class ResultGenerator:
-    def __init__(self, *, campaign_id: str | None = None):
+    def __init__(self, *, campaign_id: str | None = None, upload_results_to_database: bool | None = None):
         self.context = ResultContext(
             campaign_id=campaign_id
             or os.environ.get("CURRENT_MEASUREMENT_CAMPAIGN_ID")
             or utc_now().replace(":", "").replace("-", "")
+        )
+        self.upload_results_to_database =(
+            _env_flag("CURRRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE")
+            if upload_results_to_database is None
+            else upload_results_to_database
         )
 
     def set_context(
@@ -395,8 +408,8 @@ class ResultGenerator:
         artifact_stem: str,
         result_paths: dict,
         measured_at: str | None = None,
-    ) -> Path:
-        return write_result_json(
+    ) -> Path:    
+        result_json_path = write_result_json(
             profile=profile,
             out_dir=out_dir,
             artifact_stem=artifact_stem,
@@ -409,3 +422,7 @@ class ResultGenerator:
             campaign_id=self.context.campaign_id,
             supply_v=self.context.supply_v,
         )
+        if self.upload_results_to_database:
+            response = upload_result_json_to_database(result_json_path)
+            log.info("Result JSON uploaded to database: %s", response)
+        return result_json_path

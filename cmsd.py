@@ -282,6 +282,7 @@ class CMSDaemon:
         feature: str,
         config: str = "default",
         request_id: str = "",
+        upload_results_to_database: bool = False,
     ) -> MeasurementResult:
         """Run a test using the most recently staged firmware request."""
 
@@ -300,6 +301,7 @@ class CMSDaemon:
         request.selector.mode = "ble"
         request.selector.feature = feature
         request.selector.config = config
+        request.upload_results_to_database = upload_results_to_database
         result = self.execute_measurement(request)
         self.last_measurement_id = result.measurement_id
         return result
@@ -311,6 +313,7 @@ class CMSDaemon:
         feature: str,
         config: str = "default",
         request_id: str = "",
+        upload_results_to_database: bool = False,
     ) -> MeasurementResult:
         """Start a test in the background using the most recently staged firmware."""
 
@@ -330,6 +333,7 @@ class CMSDaemon:
         request.selector.mode = "ble"
         request.selector.feature = feature
         request.selector.config = config
+        request.upload_results_to_database = upload_results_to_database
 
         started = MeasurementResult(
             measurement_id=request.request_id,
@@ -544,6 +548,7 @@ class CMSDaemon:
                 feature=str(request.get("feature", "")),
                 config=str(request.get("config", "default")),
                 request_id=str(request.get("request_id", "")),
+                upload_results_to_database=bool(request.get("upload_results_to_database", False)),
             )
             return measurement_result_to_dict(result)
 

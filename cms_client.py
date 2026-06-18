@@ -112,6 +112,7 @@ class CMSClient:
         feature: str,
         config: str = "default",
         request_id: str = "",
+        upload_results_to_database: bool = False
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
         payload = self._request_json(
@@ -122,6 +123,7 @@ class CMSClient:
                 "feature": feature,
                 "config": config,
                 "request_id": request_id,
+                "upload_results_to_database": upload_results_to_database,
             },
         )
         return measurement_result_from_dict(payload)
@@ -293,6 +295,14 @@ def build_cli_parser() -> argparse.ArgumentParser:
     test.add_argument("--config-name", default="default", help="test config")
     test.add_argument("--request-id", default="", help="test run id")
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
+    test.add_argument(
+        "--send-to-database",
+        "--upload-results-to-database",
+        action="store_true",
+        dest="upload_results_to_database",
+        help="also upload generated result JSON files to the configured database/data lake",
+    )
+
 
     measurement = subparsers.add_parser("measurement", help="show measurement status")
     measurement.add_argument("measurement_id")
@@ -353,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
             args.feature,
             config=args.config_name,
             request_id=args.request_id,
+            upload_results_to_database=args.upload_results_to_database
         )
         if result.measurement_id:
             result = _poll_test_progress(client, result.measurement_id)
