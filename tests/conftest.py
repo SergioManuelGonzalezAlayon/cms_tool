@@ -202,8 +202,9 @@ def HWInit(request: pytest.FixtureRequest) -> None:
 
 @pytest.fixture(autouse=True)
 def ResultGeneratorFixture(request: pytest.FixtureRequest) -> ResultGenerator:
+    upload_flag = bool(request.config.getoption("--upload-results-to-database"))
     return ResultGenerator(
-        upload_results_to_database=bool(request.config.getoption("--upload-results-to-database"))
+        upload_results_to_database=True if upload_flag else None
     )
 
 

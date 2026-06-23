@@ -100,6 +100,12 @@ def _json_ready(value):
 def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
+def _upload_results_to_database_from_env() -> bool:
+    return (
+        _env_flag("CURRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE")
+        or _env_flag("CURRRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE")
+    )
+
 def upload_result_json_to_database(result_json_path: Path | str):
     from s3_upload import upload_json_to_data_lake
     return upload_json_to_data_lake(result_json_path)
@@ -379,8 +385,8 @@ class ResultGenerator:
             or os.environ.get("CURRENT_MEASUREMENT_CAMPAIGN_ID")
             or utc_now().replace(":", "").replace("-", "")
         )
-        self.upload_results_to_database =(
-            _env_flag("CURRRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE")
+        self.upload_results_to_database = (
+            _upload_results_to_database_from_env()
             if upload_results_to_database is None
             else upload_results_to_database
         )

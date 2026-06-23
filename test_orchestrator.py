@@ -258,6 +258,30 @@ def run_job(job: Job, pytest_args: list[str]) -> tuple[int, float]:
     return result.returncode, time.perf_counter() - started
 
 
+def strip_forwarded_cfg_args(pytest_args: list[str]) -> tuple[list[str], list[str]]:
+    """Drop forwarded pytest --cfg values so orchestrated jobs keep their own config."""
+    stripped: list[str] = []
+    removed: list[str] = []
+    index = 0
+    while index < len(pytest_args):
+        arg = pytest_args[index]
+        if arg == "--cfg":
+            if index + 1 < len(pytest_args):
+                removed.append(pytest_args[index + 1])
+                index += 2
+            else:
+                removed.append("")
+                index += 1
+            continue
+        if arg.startswith("--cfg="):
+            removed.append(arg.split("=", 1)[1])
+            index += 1
+            continue
+        stripped.append(arg)
+        index += 1
+    return stripped, removed
+
+
 def parse_args_with_pytest(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(description="Generate, order, and execute config-driven pytest campaigns.")
     parser.add_argument(
@@ -346,6 +370,12 @@ def main(argv: list[str] | None = None) -> int:
     parsed, pytest_args = parse_args_with_pytest(list(argv if argv is not None else sys.argv[1:]))
     targets = [Path(target) for target in parsed.targets]
     results_log = Path(parsed.results_log)
+    pytest_args, ignored_cfg_args = strip_forwarded_cfg_args(pytest_args)
+    if ignored_cfg_args:
+        print(
+            "Ignoring forwarded --cfg argument(s); "
+            "test_orchestrator selects configs from discovered jobs."
+        )
     pytest_args = [*cms_pytest_args(parsed), *pytest_args]
 
     if parsed.generate:
