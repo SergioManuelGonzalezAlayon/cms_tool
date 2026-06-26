@@ -76,11 +76,18 @@ def set_path(config: dict, path: str, value) -> None:
 
 
 def apply_value(config: dict, parameter: dict, raw_value) -> None:
-    config_path = parameter["config_path"]
+    paths = parameter.get("config_paths")
+
+    if paths is None:
+        paths = [parameter["config_path"]]
+
     if parameter["name"] == "dcdc":
-        set_path(config, config_path, parameter["options"][raw_value])
-        return
-    set_path(config, config_path, raw_value)
+        value = parameter["options"][raw_value]
+    else:
+        value = raw_value
+
+    for path in paths:
+        set_path(config, path, value)
 
 
 def quantity_to_runtime(value: Decimal, default_unit: str):

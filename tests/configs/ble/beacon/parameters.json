@@ -86,7 +86,11 @@
             "control": "bgapi",
             "default": "1mbps",
             "file_token": "phy",
-            "config_path": "advertiser.phy",
+            "config_paths": [
+                "advertiser.phy",
+                "scanner.phy"
+            ],
+
             "values": [
                 "125kbps",
                 "500kbps",

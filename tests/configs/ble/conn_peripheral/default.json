@@ -4,11 +4,13 @@
     },
     "advertiser": {
         "interval": 20,
-        "payload": 10
+        "payload": 10,
+        "phy": "1mbps",
     },
     "scanner": {
         "interval": 100,
-        "window": 50
+        "window": 50,
+        "phy": "1mbps"
     },
     "connection": {
         "interval": 15,

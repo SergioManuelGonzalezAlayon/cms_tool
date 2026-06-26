@@ -10,7 +10,8 @@
     },
     "scanner": {
         "interval": 100,
-        "window": 50
+        "window": 50,
+        "phy": "1mbps"
     },
     "firmware": {
         "dut_slcp": "apps/ncp_ble_dut_dcdc.slcp",

@@ -10,7 +10,8 @@
     },
     "scanner": {
         "interval": 100,
-        "window": 50
+        "window": 50,
+        "phy": "1mbps"
     },
     "pawr": {
         "interval": 1000,
