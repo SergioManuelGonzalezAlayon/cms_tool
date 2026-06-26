@@ -11,6 +11,7 @@ import pytest
 from apps.app_manager import read_dev_config as _read_dev_config
 from joulescope_interface import write_joulescope_artifacts
 from results_generator import ResultGenerator
+from serial import Serial, SerialException
 
 log = logging.getLogger(__name__)
 
@@ -390,6 +391,23 @@ def _log_flash_decision(label: str, required: dict, previous: dict | None, shoul
         _short_hash(required),
     )
 
+def _wait_for_serial_port(serial_port):
+    if not serial_port:
+        raise RuntimeError("Missing serial port")
+
+    deadline = time.monotonic() + 15
+
+    while time.monotonic() < deadline:
+        if Path(serial_port).exists():
+            try:
+                with Serial(serial_port, timeout=0.2):
+                    log.info("Waiting for serial port %s", serial_port)
+                    return
+            except SerialException:
+                pass
+        time.sleep(0.25)
+
+    raise TimeoutError(f"Timed out waiting for serial port {serial_port}")
 
 @pytest.fixture(autouse=True)
 def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
@@ -400,6 +418,10 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
 
     config = request.getfixturevalue("Config")
     fw = config.get("firmware", {})
+
+    dev_cfg = _effective_dev_config(request)
+    dut_serial_port = dev_cfg.get("dut", {}).get("serial_port", {})
+    tester_serial_port = dev_cfg.get("tester", {}).get("serial_port", {})
     required = (
         "dut_slcp",
         "tester_slcp",
@@ -508,18 +530,23 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
     if bootloader_required_dut is not None and not dut_bootloader_matches:
         _flash(bootloader_image, dut_probe_sn, commander=commander)
         log.info("DUT bootloader flashed successfully: %s", bootloader_image)
+    
     if bootloader_required_tester is not None and not tester_bootloader_matches:
         _flash(bootloader_image, tester_probe_sn, commander=commander)
         log.info("Tester bootloader flashed successfully: %s", bootloader_image)
+
     if not dut_matches:
         _flash(dut_image, dut_probe_sn, commander=commander)
         log.info("DUT flashed successfully: %s", dut_image)
+        _wait_for_serial_port(dut_serial_port)
+
     if not tester_matches:
         _flash(tester_image, tester_probe_sn, commander=commander)
         log.info("Tester flashed successfully: %s", tester_image)
-    if not dut_matches or not tester_matches or not dut_bootloader_matches or not tester_bootloader_matches:
-        log.info("Waiting for flashed devices to settle before BGAPI open")
-        time.sleep(2.0)
+        _wait_for_serial_port(tester_serial_port)
+
+    # Having a small 250ms wait gives a short grace period in case something took a little longer
+    time.sleep(0.25)
 
     if bootloader_required_dut is not None:
         _write_provision_state(
