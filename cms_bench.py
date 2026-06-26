@@ -653,8 +653,8 @@ def _run_test_orchestrator(session: BenchSession, results_log: Path, metadata_pa
     ]
     if session.request.selector.config != "default":
         cmd.extend(["--cfg", session.request.selector.config])
-    if session.request.selector.config != "default":
-        cmd.extend("--upload-results-to-database")
+    if session.request.upload_results_to_database:
+        cmd.append("--upload-results-to-database")
 
     completed = subprocess.run(cmd, cwd=Path("."), check=False, text=True, capture_output=True)
     (session.runtime_dir / "test_stdout.log").write_text(completed.stdout, encoding="utf-8")
