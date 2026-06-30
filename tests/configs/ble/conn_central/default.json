@@ -10,7 +10,7 @@
     "scanner": {
         "interval": 100,
         "window": 50,
-        "phy": "1mbps",
+        "phy": "1mbps"
     },
     "connection": {
         "interval": 100,
