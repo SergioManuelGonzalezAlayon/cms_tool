@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -43,6 +44,57 @@ def _resolve_explicit_path(env_name: str) -> Path | None:
 def _default_path(filename: str) -> Path:
     return REPO_ROOT / filename
 
+def _load_json(path: Path) -> dict:
+    raw = path.read_text(encoding="utf-8-sig")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return json.loads(re.sub(r",(\s*[}\]])", r"\1", raw))
+
+def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
+    if not runtime_path and not metadata_path:
+        return load_effective_config(role="runtime")
+
+    runtime = _load_json(runtime_path) if runtime_path else {}
+    metadata = _load_json(metadata_path) if metadata_path else {}
+
+    devices = runtime.get("devices", {})
+    dut = runtime.get("dut", {})
+    tester = runtime.get("tester", {})
+    tools = runtime.get("tools", {})
+    ble = runtime.get("ble", {})
+    js = runtime.get("js", {})
+    fw_metadata = metadata.get("firmware", {})
+
+    return {
+        "dut": {
+            "serial_port": dut.get("serial_port") or metadata.get("dut", {}).get("serial_port"),
+            "probe_sn": dut.get("probe_sn") or metadata.get("dut", {}).get("probe_sn"),
+        },
+        "tester": {
+            "serial_port": tester.get("serial_port") or metadata.get("tester", {}).get("probe_sn"),
+            "probe_sn": tester.get("probe_sn") or metadata.get("tester", {}).get("probe_sn"),
+        },
+        "tools": {
+            "commander": tools.get("commander") or metadata.get("tools", {}).get("commander"),
+        },
+        "ble": {
+            "xapi": metadata.get("ble", {}).get("xapi") or ble.get("xapi"),
+        },
+        "js": {
+            "usb_id": js.get("usb_id") or metadata.get("js", {}).get("usb_id"),
+        },
+        "firmware": {
+            "build_root": fw_metadata.get("build_root"),
+            "provision_state_root": fw_metadata.get("provision_state_root"),
+            "bootloader_image": fw_metadata.get("bootloader_image"),
+            "bootloader_image_sha256": fw_metadata.get("bootloader_image_sha256"),
+            "board": fw_metadata.get("board") or devices.get("board"),
+            "brev": fw_metadata.get("brev") or devices.get("board_rev"),
+            "device": fw_metadata.get("device") or devices.get("device"),
+            "sisdk": fw_metadata.get("sisdk"),
+        },
+    }
 
 def get_effective_config_paths(*, role: str | None = None) -> list[Path]:
     paths: list[Path] = []

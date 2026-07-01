@@ -1,12 +1,14 @@
 import pytest, logging
 from dataclasses import dataclass, asdict
 import json
+import subprocess
 from instruments.joulescope.read_pyjoulescope_driver import Joulescope, get_profile
 from algorithms.single_pattern_analysis import SinglePatternCurrentProfileAnalyzer
 from presentation.html_report import generate_report
 from presentation.outlier_plots import OutlierPlotsGenerator
 from pathlib import Path
 from time import sleep
+from utils.config_loader import effective_dev_config
 
 log = logging.getLogger(__name__)
 DUT_WAKE_GPIO = 0
@@ -309,7 +311,6 @@ class JoulescopeConfig:
     signals: str = "i,r,0,1"
     duration: str | float = 1
     frequency: int = 1_000_000
-    serial_number: str | None = None
     open_mode: str = "defaults"
     vref: str = "3v3"
     post_process: str = "profile"
@@ -321,7 +322,42 @@ class JoulescopeConfig:
     verbose: bool = False
 
 @pytest.fixture(scope="session")
-def JoulescopeDev():
+def JoulescopeUsbReset(request: pytest.FixtureRequest):
+    cfg = effective_dev_config(
+        runtime_path=request.config.getoption("--cms-runtime-config"),
+        metadata_path=request.config.getoption("--cms-fw-metadata"),
+    )
+    usb_id = cfg.get("js",{}).get("usb_id")
+
+    if not usb_id:
+        log.warning("No js.usb_id configured; skipping Joulescope USB reset")
+        return
+
+    # Reset the JS USB to avoid the USB driver deaklocking the whole test run
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(
+                ["sudo", "usbreset", usb_id],
+                capture_output=True,
+                text=True,
+                check=True)
+            log.info("usbreset: %s", result.stdout.strip())
+            break
+
+        except subprocess.CalledProcessError as e:
+            log.error(
+                "usbreset failed: rc=%d stdout=%r stderr=%r",
+                e.returncode,
+                e.stdout,
+                e.stderr,
+            )
+            if attempts == attempt:
+                raise
+        sleep(0.5)
+
+@pytest.fixture(scope="session")
+def JoulescopeDev(JoulescopeUsbReset):
     log.info("Enabling Joulescope")
     cfg = JoulescopeConfig(open_mode="restore")
     js = WakePinJoulescope(**asdict(cfg))

@@ -3,6 +3,9 @@
     "bench_id": "Timmothy",
     "profile": "bench-lite"
   },
+  "js" : {
+    "usb_id" : "JS_USB_ID"
+  },
   "dut": {
     "serial_port": "dut",
     "baudrate": 115200,

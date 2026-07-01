@@ -12,6 +12,7 @@ from apps.app_manager import read_dev_config as _read_dev_config
 from joulescope_interface import write_joulescope_artifacts
 from results_generator import ResultGenerator
 from serial import Serial, SerialException
+from utils.config_loader import effective_dev_config
 
 log = logging.getLogger(__name__)
 
@@ -61,58 +62,11 @@ def _test_config_path(request: pytest.FixtureRequest) -> Path:
         return cfg_dir / cfg_name
     return cfg_dir / "default.json"
 
-
-def _load_json(path: Path) -> dict:
-    raw = path.read_text(encoding="utf-8-sig")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return json.loads(re.sub(r",(\s*[}\]])", r"\1", raw))
-
-
 def _effective_dev_config(request: pytest.FixtureRequest) -> dict:
-    runtime_path = request.config.getoption("--cms-runtime-config")
-    metadata_path = request.config.getoption("--cms-fw-metadata")
-    if not runtime_path and not metadata_path:
-        return _read_dev_config(Path("dev_config.json"))
-
-    runtime = _load_json(Path(runtime_path)) if runtime_path else {}
-    metadata = _load_json(Path(metadata_path)) if metadata_path else {}
-
-    devices = runtime.get("devices", {})
-    dut = runtime.get("dut", {})
-    tester = runtime.get("tester", {})
-    tools = runtime.get("tools", {})
-    ble = runtime.get("ble", {})
-    fw_metadata = metadata.get("firmware", {})
-
-    return {
-        "dut": {
-            "serial_port": dut.get("serial_port") or metadata.get("dut", {}).get("serial_port"),
-            "probe_sn": dut.get("probe_sn") or metadata.get("dut", {}).get("probe_sn"),
-        },
-        "tester": {
-            "serial_port": tester.get("serial_port") or metadata.get("tester", {}).get("serial_port"),
-            "probe_sn": tester.get("probe_sn") or metadata.get("tester", {}).get("probe_sn"),
-        },
-        "tools": {
-            "commander": tools.get("commander") or metadata.get("tools", {}).get("commander"),
-        },
-        "ble": {
-            "xapi": metadata.get("ble", {}).get("xapi") or ble.get("xapi"),
-        },
-        "firmware": {
-            "build_root": fw_metadata.get("build_root"),
-            "provision_state_root": fw_metadata.get("provision_state_root"),
-            "bootloader_image": fw_metadata.get("bootloader_image"),
-            "bootloader_image_sha256": fw_metadata.get("bootloader_image_sha256"),
-            "board": fw_metadata.get("board") or devices.get("board"),
-            "brev": fw_metadata.get("brev") or devices.get("board_rev"),
-            "device": fw_metadata.get("device") or devices.get("device"),
-            "sisdk": fw_metadata.get("sisdk"),
-        },
-    }
-
+    return effective_dev_config(
+        runtime_path=request.config.getoption("--cms-runtime-config"),
+        metadata_path=request.config.getoption("--cms-fw-metadata"),
+    )
 
 @pytest.fixture
 def EffectiveDevConfig(request: pytest.FixtureRequest) -> dict:
