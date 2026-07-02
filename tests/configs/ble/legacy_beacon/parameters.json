@@ -84,7 +84,7 @@
             "name": "phy",
             "label": "Phy",
             "control": "bgapi",
-            "default": "1mbps",
+            "default": "1m",
             "file_token": "phy",
             "config_paths": [
                 "advertiser.phy",
@@ -92,10 +92,7 @@
             ],
 
             "values": [
-                "125kbps",
-                "500kbps",
-                "1000kbps",
-                "2000kbps"
+                "1m"
             ]
         },
         {

@@ -359,7 +359,7 @@ def JoulescopeUsbReset(request: pytest.FixtureRequest):
 @pytest.fixture(scope="session")
 def JoulescopeDev(JoulescopeUsbReset):
     log.info("Enabling Joulescope")
-    cfg = JoulescopeConfig(open_mode="restore")
+    cfg = JoulescopeConfig(open_mode="defaults")
     js = WakePinJoulescope(**asdict(cfg))
 
     js.create_driver()

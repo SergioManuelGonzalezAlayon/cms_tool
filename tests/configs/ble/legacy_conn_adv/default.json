@@ -5,13 +5,13 @@
     "advertiser": {
         "interval": 20,
         "payload": 10,
-        "phy": "1mbps",
+        "phy": "1m",
         "tx_power": 0
     },
     "scanner": {
         "interval": 100,
         "window": 50,
-        "phy": "1mbps"
+        "phy": "1m"
     },
     "firmware": {
         "dut_slcp": "apps/ncp_ble_dut_dcdc.slcp",

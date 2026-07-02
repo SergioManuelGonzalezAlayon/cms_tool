@@ -16,6 +16,10 @@ UNIT_SCALE = {
     "s": Decimal("1000"),
     "bytes": Decimal("1"),
 }
+CONN_INTERVAL_UNIT_MS = Decimal("1.25")
+CONN_TIMEOUT_UNIT_MS = Decimal("10")
+CONN_TIMEOUT_MIN_UNITS = 0x000A
+CONN_TIMEOUT_MAX_UNITS = 0x0C80
 
 
 def load_json(path: Path) -> dict:
@@ -75,6 +79,37 @@ def set_path(config: dict, path: str, value) -> None:
     current[parts[-1]] = value
 
 
+def connection_interval_units(milliseconds) -> int:
+    return int((Decimal(str(milliseconds)) / CONN_INTERVAL_UNIT_MS).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def connection_ms_from_units(units: int) -> Decimal:
+    return Decimal(units) * CONN_INTERVAL_UNIT_MS
+
+
+def supervision_timeout_units(interval_ms, latency=0) -> int:
+    interval_units = connection_interval_units(interval_ms)
+    rounded_interval_ms = connection_ms_from_units(interval_units)
+    minimum_ms = Decimal(1 + int(latency)) * rounded_interval_ms * Decimal("2")
+    timeout_units = max(CONN_TIMEOUT_MIN_UNITS, int(minimum_ms / CONN_TIMEOUT_UNIT_MS) + 1)
+    if timeout_units > CONN_TIMEOUT_MAX_UNITS:
+        raise ValueError(
+            "Connection interval/latency require supervision timeout "
+            f"{timeout_units} (10 ms units), above BLE maximum {CONN_TIMEOUT_MAX_UNITS}"
+        )
+    return timeout_units
+
+
+def finalize_config(config: dict) -> None:
+    connection = config.get("connection")
+    if not connection or "interval" not in connection:
+        return
+    connection["timeout"] = supervision_timeout_units(
+        connection["interval"],
+        connection.get("latency", 0),
+    )
+
+
 def apply_value(config: dict, parameter: dict, raw_value) -> None:
     paths = parameter.get("config_paths")
 
@@ -87,7 +122,9 @@ def apply_value(config: dict, parameter: dict, raw_value) -> None:
         value = raw_value
 
     for path in paths:
-        set_path(config, path, value)
+        path_values = parameter.get("config_path_values", {}).get(path, {})
+        path_value = path_values.get(str(value), value)
+        set_path(config, path, path_value)
 
 
 def quantity_to_runtime(value: Decimal, default_unit: str):
@@ -237,6 +274,7 @@ def generate_config_matrix(config_dir: Path, *, modes: set[str]) -> dict:
             for point in points:
                 config = deepcopy(default_config)
                 apply_value(config, parameter, point["runtime"])
+                finalize_config(config)
                 stem = one_factor_name(parameter, point)
                 config["test"] = {"name": stem}
                 output_path = output_dir / f"{stem}.json"
@@ -267,6 +305,7 @@ def generate_config_matrix(config_dir: Path, *, modes: set[str]) -> dict:
                 segment = full_sweep_segment(parameter, point)
                 if segment:
                     segments.append(segment)
+            finalize_config(config)
             stem = schema["generator"]["name_separator"].join(segments)
             config["test"] = {"name": stem}
             target_dir = partition_directory(sweep_dir, full_sweep, combination, ordered_parameters)

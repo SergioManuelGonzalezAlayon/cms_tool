@@ -106,6 +106,14 @@ def _upload_results_to_database_from_env() -> bool:
         or _env_flag("CURRRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE")
     )
 
+def _result_phy(test_name: str, advertiser: dict, scanner: dict, connection: dict):
+    if test_name == "scanner":
+        return scanner.get("phy")
+    if test_name in {"conn_central", "conn_peripheral"}:
+        return connection.get("phy")
+    return advertiser.get("phy") or connection.get("phy") or scanner.get("phy")
+
+
 def upload_result_json_to_database(result_json_path: Path | str):
     from s3_upload import upload_json_to_data_lake
     return upload_json_to_data_lake(result_json_path)
@@ -278,6 +286,7 @@ def write_result_json(
     capture_path = _save_capture_npz(profile, out_dir, artifact_stem) if capture_policy["retained"] else None
     firmware = config_data.get("firmware", {})
     advertiser = config_data.get("advertiser", {})
+    scanner = config_data.get("scanner", {})
     connection = config_data.get("connection", {})
     pawr = config_data.get("pawr", {})
     slcp_meta = _read_slcp_metadata(firmware.get("dut_slcp"))
@@ -350,7 +359,7 @@ def write_result_json(
         },
         "parameters": {
             "supply_voltage_v": supply_v,
-            "phy": advertiser.get("phy") or connection.get("phy"),
+            "phy": _result_phy(test_name, advertiser, scanner, connection),
             "tx_power_dbm": advertiser.get("tx_power") or connection.get("tx_power"),
             "advertising_interval_ms": advertiser.get("interval"),
             "tx_payload_length_bytes": advertiser.get("payload") or connection.get("tx_payload_length"),
