@@ -988,6 +988,7 @@ def test_conn_peripheral(JoulescopeDev,
 def test_scanner(JoulescopeDev,
                  DUT,
                  Tester,
+                 TesterAdvConfig,
                  TesterAdvStart,
                  DUTScanConfig,
                  DUTScanStart):
@@ -999,7 +1000,50 @@ def test_scanner(JoulescopeDev,
     DUTScanStart(
         discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
         mode=scan_mode,
+        phy=scan_config.phy,
     )
+
+    tester_identity = Tester.bt.system.get_identity_address()
+    assert tester_identity.result == 0
+    expected_address = tester_identity.address
+    expected_address_type = tester_identity.type
+    log.info(
+        "Scanner test discovery config: advertiser_primary_phy=%s advertiser_secondary_phy=%s scanner_phy=%s",
+        advertising_phy_to_str(TesterAdvConfig.primary_phy),
+        advertising_phy_to_str(TesterAdvConfig.secondary_phy),
+        advertising_phy_to_str(scan_config.phy),
+    )
+    log.info(
+        "Scanner test expected advertiser: address=%s address_type=%s",
+        _format_bd_addr(expected_address),
+        expected_address_type,
+    )
+
+    def _match_tester_advertisement(evt) -> bool:
+        received_address = getattr(evt, "address", None)
+        received_address_type = getattr(evt, "address_type", None)
+        log.info(
+            "Scanner test received advertisement: address=%s address_type=%s expected_address=%s expected_address_type=%s",
+            _format_bd_addr(received_address),
+            received_address_type,
+            _format_bd_addr(expected_address),
+            expected_address_type,
+        )
+        return (
+            received_address == expected_address
+            and received_address_type == expected_address_type
+        )
+
+    timeout_s = float(advertising_ms_from_units(TesterAdvConfig.max_interval) / 1000)
+    bgapi_check_event(
+        DUT,
+        "scanner",
+        "extended_advertisement_report",
+        _match_tester_advertisement,
+        eventTimeout=max(timeout_s / 5, 0.2),
+        maxTime=max(timeout_s * 5, 5),
+    )
+    log.info("Scanner test expected advertisement received")
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * scan_config.interval) / 1000)
