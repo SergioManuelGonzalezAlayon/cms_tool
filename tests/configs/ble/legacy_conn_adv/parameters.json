@@ -126,7 +126,7 @@
             "file_token": "payload",
             "range": {
                 "min": "0 bytes",
-                "max": "251 bytes"
+                "max": "31 bytes"
             },
             "config_path": "advertiser.payload"
         }
