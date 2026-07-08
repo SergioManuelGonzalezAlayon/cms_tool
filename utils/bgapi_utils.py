@@ -65,6 +65,8 @@ class AdvertiserConfig:
     interval: int | None = None
     payload: int = 20
     phy: str | int = "1m"
+    primary_phy: str | int | None = None
+    secondary_phy: str | int | None = None
     tx_power: int | float = 0
     duration: int = 0
     max_events: int = 0
@@ -165,6 +167,17 @@ def advertising_phy_from_str(value: str | int) -> int:
         raise ValueError(f"Unsupported advertiser phy: {value!r}") from exc
 
 
+def advertising_phy_to_str(phy: str | int) -> str:
+    phy = advertising_phy_from_str(phy)
+    phy_map = {
+        PHY_1M: "1M",
+        PHY_2M: "2M",
+        PHY_CODED: "Coded",
+        PHY_1M_AND_CODED: "1M+Coded",
+    }
+    return phy_map.get(phy, str(phy))
+
+
 def scanner_phy_from_str(value: str | int) -> int:
     if isinstance(value, str) and value.strip().lower().replace(" ", "") == "any":
         return PHY_1M_AND_CODED
@@ -218,7 +231,15 @@ def normalize_advertiser_config(config: AdvertiserConfig) -> AdvertiserConfig:
         raise ValueError(
             f"Advertising max_interval must be >= min_interval, got {max_interval_ms!r} ms < {min_interval_ms!r} ms"
         )
-    config.phy = advertising_phy_from_str(config.phy)
+    legacy_phy = advertising_phy_from_str(config.phy)
+    config.secondary_phy = secondary_advertising_phy(
+        config.secondary_phy if config.secondary_phy is not None else legacy_phy
+    )
+    default_primary_phy = PHY_1M if config.secondary_phy == PHY_2M else config.secondary_phy
+    config.primary_phy = primary_advertising_phy(
+        config.primary_phy if config.primary_phy is not None else default_primary_phy
+    )
+    config.phy = config.secondary_phy
     config.tx_power = advertising_tx_power_from_dbm(config.tx_power)
     if config.duration < 0:
         raise ValueError(f"Advertising duration must be >= 0, got {config.duration}")

@@ -22,7 +22,7 @@ def _format_bd_addr(address) -> str:
 
 
 def _discovery_scan_phy_for_advertiser(phy: str | int) -> int:
-    phy = advertising_phy_from_str(phy)
+    phy = primary_advertising_phy(phy)
     if phy == PHY_CODED:
         return PHY_CODED
     return PHY_1M
@@ -189,7 +189,11 @@ def DUTLegAdvConfig(DUT,
     log.info("DUT Advertiser configured")
 
     DUT.bt.advertiser.set_tx_power(config.set,config.tx_power)
-    DUT.bt.advertiser.set_phy(config.set, config.phy, config.phy)
+    DUT.bt.advertiser.set_phy(config.set, config.primary_phy, config.primary_phy)
+    log.info(
+        "DUT legacy advertiser PHY configured: primary=%s",
+        advertising_phy_to_str(config.primary_phy),
+    )
     DUT.bt.legacy_advertiser.set_data(config.set,
                                       0, # Advertising data packet
                                       config.payload)
@@ -244,8 +248,13 @@ def DUTAdvConfig(DUT,
     
     DUT.bt.extended_advertiser.set_phy(
         config.set,
-        primary_advertising_phy(config.phy),
-        secondary_advertising_phy(config.phy),
+        config.primary_phy,
+        config.secondary_phy,
+    )
+    log.info(
+        "DUT extended advertiser PHY configured: primary=%s secondary=%s",
+        advertising_phy_to_str(config.primary_phy),
+        advertising_phy_to_str(config.secondary_phy),
     )
     DUT.bt.extended_advertiser.set_data(config.set, config.payload)
 
@@ -306,7 +315,7 @@ def DUTScanStart(DUT,
         cfg = DUTScanConfig(mode=mode)
         scan_phy = cfg.phy if phy is None else phy
         DUT.bt.scanner.start(scan_phy, discover_mode)
-        log.info("DUT scanning started: phy=%s", scan_phy)
+        log.info("DUT scanning started: phy=%s", advertising_phy_to_str(scan_phy))
         started = True
 
     yield _start
@@ -327,10 +336,17 @@ def DUTPAwRStart(DUT,
         nonlocal started
         pawr_payload = DUTAdvConfig.payload
 
-        rsp = DUT.bt.extended_advertiser.set_phy(DUTAdvConfig.set,
-                                                 primary_advertising_phy(DUTAdvConfig.phy),
-                                                 secondary_advertising_phy(DUTAdvConfig.phy))
+        rsp = DUT.bt.extended_advertiser.set_phy(
+            DUTAdvConfig.set,
+            DUTAdvConfig.primary_phy,
+            DUTAdvConfig.secondary_phy,
+        )
         assert rsp.result == 0
+        log.info(
+            "DUT PAwR advertiser PHY configured: primary=%s secondary=%s",
+            advertising_phy_to_str(DUTAdvConfig.primary_phy),
+            advertising_phy_to_str(DUTAdvConfig.secondary_phy),
+        )
 
         rsp = DUT.bt.pawr_advertiser.start(
             DUTAdvConfig.set,
@@ -475,8 +491,13 @@ def TesterAdvConfig(Tester,
     Tester.bt.advertiser.set_tx_power(config.set, config.tx_power)
     Tester.bt.extended_advertiser.set_phy(
         config.set,
-        primary_advertising_phy(config.phy),
-        secondary_advertising_phy(config.phy),
+        config.primary_phy,
+        config.secondary_phy,
+    )
+    log.info(
+        "Tester extended advertiser PHY configured: primary=%s secondary=%s",
+        advertising_phy_to_str(config.primary_phy),
+        advertising_phy_to_str(config.secondary_phy),
     )
     Tester.bt.extended_advertiser.set_data(config.set, config.payload)
 
@@ -536,7 +557,7 @@ def TesterScanStart(Tester,
         cfg = TesterScanConfig(mode=mode)
         scan_phy = cfg.phy if phy is None else phy
         Tester.bt.scanner.start(scan_phy, discover_mode)
-        log.info("Tester scanning started: phy=%s", scan_phy)
+        log.info("Tester scanning started: phy=%s", advertising_phy_to_str(scan_phy))
         started = True
 
     yield _start
@@ -643,10 +664,17 @@ def TesterPAwRStart(Tester,
         nonlocal started
         pawr_payload = TesterAdvConfig.payload
 
-        rsp = Tester.bt.extended_advertiser.set_phy(TesterAdvConfig.set,
-                                                    primary_advertising_phy(TesterAdvConfig.phy),
-                                                    secondary_advertising_phy(TesterAdvConfig.phy))
+        rsp = Tester.bt.extended_advertiser.set_phy(
+            TesterAdvConfig.set,
+            TesterAdvConfig.primary_phy,
+            TesterAdvConfig.secondary_phy,
+        )
         assert rsp.result == 0
+        log.info(
+            "Tester PAwR advertiser PHY configured: primary=%s secondary=%s",
+            advertising_phy_to_str(TesterAdvConfig.primary_phy),
+            advertising_phy_to_str(TesterAdvConfig.secondary_phy),
+        )
 
         rsp = Tester.bt.pawr_advertiser.start(
             TesterAdvConfig.set,
@@ -813,7 +841,7 @@ def test_beacon(JoulescopeDev,
     )
     TesterScanStart(
         discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
-        phy=_discovery_scan_phy_for_advertiser(DUTAdvConfig.phy),
+        phy=_discovery_scan_phy_for_advertiser(DUTAdvConfig.primary_phy),
     )
 
     dut_addr = get_device_addr(DUT)
@@ -888,7 +916,7 @@ def test_conn_adv(JoulescopeDev,
     )
     TesterScanStart(
         discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
-        phy=_discovery_scan_phy_for_advertiser(DUTAdvConfig.phy),
+        phy=_discovery_scan_phy_for_advertiser(DUTAdvConfig.primary_phy),
     )
 
     dut_addr = get_device_addr(DUT)
@@ -987,7 +1015,8 @@ def test_PAwR_per(JoulescopeDev,
     dut_address = get_device_addr(DUT)
 
     TesterScanStart(
-        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
+        phy=_discovery_scan_phy_for_advertiser(DUTAdvConfig.primary_phy),
     )
 
     DUTPAwRStart(flags=DUT.bt.periodic_advertiser.FLAGS_AUTO_START_EXTENDED_ADVERTISING)
@@ -1062,7 +1091,7 @@ def test_PAwR_obs(JoulescopeDev,
 
     DUTScanStart(
         discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
-        phy=_discovery_scan_phy_for_advertiser(TesterAdvConfig.phy),
+        phy=_discovery_scan_phy_for_advertiser(TesterAdvConfig.primary_phy),
     )
 
     TesterPAwRStart(flags=Tester.bt.periodic_advertiser.FLAGS_AUTO_START_EXTENDED_ADVERTISING)
