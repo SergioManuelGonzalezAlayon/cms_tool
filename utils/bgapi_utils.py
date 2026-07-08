@@ -26,6 +26,7 @@ PHY_1M = 0x1
 PHY_2M = 0x2
 PHY_CODED = 0x4
 PHY_1M_AND_CODED = PHY_1M | PHY_CODED
+PHY_ANY = 0xFF
 
 
 class BGAPIEventTimeoutError(RuntimeError):
@@ -151,6 +152,10 @@ def advertising_tx_power_from_dbm(value: int | float | Decimal) -> int:
     return int((Decimal(str(value)) * Decimal("10")).to_integral_value(rounding=ROUND_HALF_UP))
 
 
+def connection_tx_power_from_dbm(value: int | float | Decimal) -> int:
+    return int(Decimal(str(value)).to_integral_value(rounding=ROUND_HALF_UP))
+
+
 def advertising_phy_from_str(value: str | int) -> int:
     if isinstance(value, int):
         return value
@@ -205,7 +210,7 @@ def secondary_advertising_phy(phy: str | int) -> int:
 def connection_open_phy(phy: str | int) -> int:
     phy = advertising_phy_from_str(phy)
     if phy == PHY_2M:
-        raise ValueError("Connections cannot be initiated on the 2M PHY")
+        return PHY_1M
     return phy
 
 
@@ -294,7 +299,7 @@ def normalize_connection_parameters(params: ConnectionParameters) -> ConnectionP
             f"(minimum valid value is {required_timeout} in 10 ms units). "
             "Regenerate the test configuration so connection.timeout is derived from connection.interval."
         )
-    params.tx_power = advertising_tx_power_from_dbm(params.tx_power)
+    params.tx_power = connection_tx_power_from_dbm(params.tx_power)
     params.phy = advertising_phy_from_str(params.phy)
     return params
 
@@ -408,7 +413,7 @@ def connection_config_params(dev, params: ConnectionParameters):
         params.min_ce_lenght,
         params.max_ce_lenght)
     
-    dev.bt.connection.set_default_preferred_phy(params.phy, params.phy)
+    dev.bt.connection.set_default_preferred_phy(connection_open_phy(params.phy), PHY_ANY)
     # ATT MTU must be at least 23. Treat rx_payload_length as payload sizing,
     # not a request to force an invalid MTU during default connection setup.
     if params.rx_payload_length >= 23:
@@ -421,9 +426,10 @@ def connection_set_live_params(dev,
     """
         Set connection parameters that cannot be set as a default value:w
     """
+    connection_set_preferred_phy(dev, conn_handle, params)
+
     dev.bt.connection.set_tx_power(
         conn_handle,
-        params.tx_power,
         params.tx_power
     )
     # TX payload length
@@ -440,6 +446,25 @@ def connection_set_live_params(dev,
                 eventTimeout=1,
                 maxTime=5,
     )
+
+
+def connection_set_preferred_phy(dev,
+                                 conn_handle,
+                                 params: ConnectionParameters):
+    dev.bt.connection.set_preferred_phy(
+        conn_handle,
+        params.phy,
+        PHY_ANY,
+    )
+    if params.phy != connection_open_phy(params.phy):
+        bgapi_check_event(
+                    dev,
+                    "connection",
+                    "phy_status",
+                    lambda evt: evt.connection == conn_handle and evt.phy == params.phy,
+                    eventTimeout=1,
+                    maxTime=5,
+        )
 
 
 
@@ -501,6 +526,7 @@ def connect_devices(central,
             peripheral_conn = peripheral_event.connection
 
             if is_conn_handle_valid(central_conn) and is_conn_handle_valid(peripheral_conn):
+                connection_set_preferred_phy(central, central_conn, parameters)
                 log.info("Devices connected")
                 return central_conn, peripheral_conn
 
