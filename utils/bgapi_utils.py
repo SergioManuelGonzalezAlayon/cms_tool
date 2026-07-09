@@ -128,6 +128,12 @@ def ms_from_bgapi_units(units: int, unit_ms: Decimal) -> Decimal:
     return Decimal(units) * unit_ms
 
 
+def _json_number_from_decimal(value: Decimal) -> int | float:
+    if value == value.to_integral_value():
+        return int(value)
+    return float(value)
+
+
 def advertising_units_from_ms(milliseconds) -> int:
     return bgapi_units_from_ms(milliseconds, ADV_INTERVAL_UNIT_MS)
 
@@ -302,6 +308,22 @@ def normalize_connection_parameters(params: ConnectionParameters) -> ConnectionP
     params.tx_power = connection_tx_power_from_dbm(params.tx_power)
     params.phy = advertising_phy_from_str(params.phy)
     return params
+
+
+def sync_connection_config_actuals(config: dict, params: ConnectionParameters) -> None:
+    connection = config.get("connection")
+    if not isinstance(connection, dict):
+        return
+
+    actual_min_interval = _json_number_from_decimal(connection_ms_from_units(params.min_interval))
+    actual_max_interval = _json_number_from_decimal(connection_ms_from_units(params.max_interval))
+
+    if "interval" in connection:
+        connection["interval"] = actual_max_interval
+    if "min_interval" in connection:
+        connection["min_interval"] = actual_min_interval
+    if "max_interval" in connection:
+        connection["max_interval"] = actual_max_interval
 
 
 def read_dev_config(section, key=None, default=None, *, path="dev_config.json"):

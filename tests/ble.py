@@ -748,6 +748,7 @@ def ConnectBLEDevices(Config):
         dev_per = peripheral
         params = dataclass_from_dict(ConnectionParameters, Config.get("connection", {}))
         params = normalize_connection_parameters(params)
+        sync_connection_config_actuals(Config, params)
         timeout = max(5.0, params.timeout / 100.0)
 
         central_conn, peripheral_conn = connect_devices(
