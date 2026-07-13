@@ -14,6 +14,7 @@ from conftest import *
 MAX_TEST_RETRIES = 3
 DUT_OPEN_RETRIES = 3
 DUT_OPEN_RETRY_SLEEP_S = 1.0
+CONNECTION_CLOSE_GRACE_S = 5.0
 log = logging.getLogger(__name__)
 
 
@@ -769,7 +770,12 @@ def ConnectBLEDevices(Config):
     yield _connect_devices
 
     if connected:
+        close_timeout = timeout + CONNECTION_CLOSE_GRACE_S
         dev_ctrl.bt.connection.close(ctrl_conn)
+        log.info(
+            "Waiting up to %.2fs for connection.closed events after close request",
+            close_timeout,
+        )
 
         bgapi_check_event(
                 dev_ctrl,
@@ -777,7 +783,7 @@ def ConnectBLEDevices(Config):
                 "closed",
                 lambda evt: evt.connection == ctrl_conn,
                 eventTimeout=1,
-                maxTime=timeout,
+                maxTime=close_timeout,
             )
         bgapi_check_event(
                 dev_per,
@@ -785,7 +791,7 @@ def ConnectBLEDevices(Config):
                 "closed",
                 lambda evt: evt.connection == per_conn,
                 eventTimeout=1,
-                maxTime=timeout,
+                maxTime=close_timeout,
             )
         log.info("Connection closed succesfully")
 
