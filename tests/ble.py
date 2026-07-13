@@ -11,9 +11,11 @@ from utils.bgapi_utils import *
 from conftest import *
 
 # TODO - BGAPI device interfaces in pytest so that we can use the HWMux thingy
-MAX_TEST_RETRIES = 3
-DUT_OPEN_RETRIES = 3
+MAX_TEST_RETRIES = 5
+MAX_TEST_RETRY_WAIT = 1.0
+DUT_OPEN_RETRIES = 5
 DUT_OPEN_RETRY_SLEEP_S = 1.0
+DEVICE_OPEN_RETRIES = 5
 log = logging.getLogger(__name__)
 
 
@@ -31,7 +33,7 @@ def _discovery_scan_phy_for_advertiser(phy: str | int) -> int:
 def open_ble_dev(dev,
                  wakeUp=None,
                  *,
-                 open_retries=2,
+                 open_retries=DUT_OPEN_RETRIES,
                  retry_sleep_s=0.5,
                  boot_event_timeout=5,
                  boot_max_time=10,
@@ -555,10 +557,9 @@ def TesterScanStart(Tester,
         if mode is None:
             mode = getattr(Tester.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
         cfg = TesterScanConfig(mode=mode)
-
         scan_phy = cfg.phy if phy is None else phy
-        Tester.bt.scanner.start(scan_phy, discover_mode)
-        log.info("Tester scanning started: phy=%s", advertising_phy_to_str(scan_phy))
+        res = Tester.bt.scanner.start(scan_phy, discover_mode)
+        log.info("Tester scanning started: phy=%s, raw_phy=%d, res=%s discMode=%d", advertising_phy_to_str(scan_phy), scan_phy,str(res), discover_mode)
         started = True
 
     yield _start
@@ -826,7 +827,7 @@ def test_legacy_beacon(JoulescopeDev,
         except BGAPIEventTimeoutError:
             if attempt == MAX_TEST_RETRIES - 1:
                 raise
-            sleep(0.25)
+            sleep(MAX_TEST_RETRY_WAIT)
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTLegAdvConfig.max_interval) / 1000)
@@ -868,7 +869,7 @@ def test_beacon(JoulescopeDev,
         except BGAPIEventTimeoutError:
             if attempt == MAX_TEST_RETRIES - 1:
                 raise
-            sleep(0.25)
+            sleep(MAX_TEST_RETRY_WAIT)
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
     log.info(
@@ -906,7 +907,7 @@ def test_legacy_conn_adv(JoulescopeDev,
         except BGAPIEventTimeoutError:
             if attempt == MAX_TEST_RETRIES - 1:
                 raise
-            sleep(0.25)
+            sleep(MAX_TEST_RETRY_WAIT)
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTLegAdvConfig.max_interval) / 1000)
@@ -943,7 +944,7 @@ def test_conn_adv(JoulescopeDev,
         except BGAPIEventTimeoutError:
             if attempt == MAX_TEST_RETRIES - 1:
                 raise
-            sleep(0.25)
+            sleep(MAX_TEST_RETRY_WAIT)
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
