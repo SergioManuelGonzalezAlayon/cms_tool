@@ -388,6 +388,10 @@ def bgapi_check_event(dev,
     """
     seen = []
 
+    # Avoid Decimal type error when calling this function by converting to float both timeouts
+    eventTimeout = float(eventTimeout)
+    maxTime = float(maxTime)
+
     for evt in dev.get_events(timeout=eventTimeout, max_time=maxTime):
         seen.append(evt)
         if debug:
@@ -413,7 +417,7 @@ def get_device_addr(dev):
 
 
 def is_conn_handle_valid(handle):
-    return (handle != 255 and handle > 0)
+    return handle is not None and handle != 255 and handle >= 0
 
 
 def close_connection(dev, conn_handle):
@@ -493,9 +497,10 @@ def connection_set_preferred_phy(dev,
 def connect_devices(central,
                     peripheral,
                     parameters: ConnectionParameters,
-                    retry_sleep=0.25,
-                    max_retries=3,
-                    connTimeout=5):
+                    retry_sleep=1.0,
+                    max_retries=5,
+                    connTimeout=10.0,
+                    evtTimeout=5.0):
     """
     Connect two BLE devices where the peripheral has started Connectable Advertising,
     with a maximum number of retries
@@ -512,8 +517,22 @@ def connect_devices(central,
     connection_config_params(central, parameters)
     connection_config_params(peripheral, parameters)
 
+    log.info( "connTimeout=%r (%s), evtTimeout=%r (%s)",
+              connTimeout,
+              type(connTimeout),
+              evtTimeout,
+              type(evtTimeout),
+    )
+
     for attempt in range(max_retries):
         log.info("Connection attempt %d/%d", attempt + 1, max_retries)
+        log.info(
+            "Connecting: interval=%s latency=%s timeout=%s phy=%s",
+            parameters.min_interval,
+            parameters.latency,
+            connTimeout,
+            parameters.phy,
+        )
 
         rsp = central.bt.connection.open(
             peripheral_addr,
@@ -528,7 +547,7 @@ def connect_devices(central,
                 "connection",
                 "opened",
                 lambda evt: evt.address == peripheral_addr,
-                eventTimeout=1,
+                eventTimeout=evtTimeout,
                 maxTime=connTimeout,
             )
 
@@ -537,7 +556,7 @@ def connect_devices(central,
                 "connection",
                 "opened",
                 lambda evt: evt.address == central_addr,
-                eventTimeout=1,
+                eventTimeout=evtTimeout,
                 maxTime=connTimeout,
             )
 
@@ -552,8 +571,11 @@ def connect_devices(central,
                 log.info("Devices connected")
                 return central_conn, peripheral_conn
 
-        except BGAPIEventTimeoutError:
-            log.warning("Connection attempt %d/%d failed", attempt + 1, max_retries)
+        except BGAPIEventTimeoutError as e:
+            log.warning("Connection attempt %d/%d failed. Err: %s",
+                        attempt + 1,
+                        max_retries,
+                        e)
 
             close_connection(central, central_conn)
             close_connection(peripheral, peripheral_conn)

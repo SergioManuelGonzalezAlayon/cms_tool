@@ -2,7 +2,7 @@
 import logging
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from time import sleep
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
@@ -14,7 +14,6 @@ from conftest import *
 MAX_TEST_RETRIES = 3
 DUT_OPEN_RETRIES = 3
 DUT_OPEN_RETRY_SLEEP_S = 1.0
-CONNECTION_CLOSE_GRACE_S = 5.0
 log = logging.getLogger(__name__)
 
 
@@ -556,6 +555,7 @@ def TesterScanStart(Tester,
         if mode is None:
             mode = getattr(Tester.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
         cfg = TesterScanConfig(mode=mode)
+
         scan_phy = cfg.phy if phy is None else phy
         Tester.bt.scanner.start(scan_phy, discover_mode)
         log.info("Tester scanning started: phy=%s", advertising_phy_to_str(scan_phy))
@@ -732,33 +732,34 @@ def ConnectBLEDevices(Config):
     dev_ctrl = None
     dev_per = None
     ctrl_conn, per_conn = None, None
-    timeout = None
+    timeout_s = None
     
     def _connect_devices(*,
                     central, 
                     peripheral,
-                    retry_sleep=0.25,
-                    max_retries=3):
+                    retry_sleep=MAX_TEST_RETRY_WAIT,
+                    max_retries=MAX_TEST_RETRIES):
         """
         Connect two BLE devices where the peripheral has started Connectable Advertising,
         with a maximum number of retries
         """
-        nonlocal connected, dev_ctrl, dev_per, ctrl_conn, per_conn, timeout
+        nonlocal connected, dev_ctrl, dev_per, ctrl_conn, per_conn, timeout_s
 
         dev_ctrl = central
         dev_per = peripheral
         params = dataclass_from_dict(ConnectionParameters, Config.get("connection", {}))
         params = normalize_connection_parameters(params)
         sync_connection_config_actuals(Config, params)
-        timeout = max(5.0, params.timeout / 100.0)
-
+        timeout_s = float(connection_ms_from_units(params.max_interval) / 1000)
         central_conn, peripheral_conn = connect_devices(
             central,
             peripheral,
             params,
             retry_sleep=retry_sleep,
             max_retries=max_retries,
-            connTimeout=timeout)
+            connTimeout=5*timeout_s,
+            evtTimeout=timeout_s/5
+        )
         
         log.info("DUT and Tester connected")
         ctrl_conn = central_conn
@@ -770,11 +771,10 @@ def ConnectBLEDevices(Config):
     yield _connect_devices
 
     if connected:
-        close_timeout = timeout + CONNECTION_CLOSE_GRACE_S
         dev_ctrl.bt.connection.close(ctrl_conn)
         log.info(
             "Waiting up to %.2fs for connection.closed events after close request",
-            close_timeout,
+            timeout_s,
         )
 
         bgapi_check_event(
@@ -783,7 +783,7 @@ def ConnectBLEDevices(Config):
                 "closed",
                 lambda evt: evt.connection == ctrl_conn,
                 eventTimeout=1,
-                maxTime=close_timeout,
+                maxTime=timeout_s,
             )
         bgapi_check_event(
                 dev_per,
@@ -791,7 +791,7 @@ def ConnectBLEDevices(Config):
                 "closed",
                 lambda evt: evt.connection == per_conn,
                 eventTimeout=1,
-                maxTime=close_timeout,
+                maxTime=timeout_s,
             )
         log.info("Connection closed succesfully")
 
@@ -962,9 +962,10 @@ def test_conn_central(JoulescopeDev,
     TesterAdvStart(
         connectable_mode=Tester.bt.extended_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
+
     _, _, conn_params = ConnectBLEDevices(
         central=DUT,
-        peripheral=Tester
+        peripheral=Tester,
     )
 
     n_events = 10
@@ -981,9 +982,10 @@ def test_conn_peripheral(JoulescopeDev,
     DUTAdvStart(
         connectable_mode=DUT.bt.extended_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
+    
     _, _, conn_params = ConnectBLEDevices(
         central=Tester,
-        peripheral=DUT
+        peripheral=DUT,
     )
 
     n_events = 10
