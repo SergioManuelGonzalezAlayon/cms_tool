@@ -20,6 +20,10 @@ CONN_INTERVAL_UNIT_MS = Decimal("1.25")
 CONN_TIMEOUT_UNIT_MS = Decimal("10")
 CONN_TIMEOUT_MIN_UNITS = 0x000A
 CONN_TIMEOUT_MAX_UNITS = 0x0C80
+PAWR_PHY_BYTE_TIME_MS = {
+    "1m": 0.008,
+    "2m": 0.004,
+}
 
 
 def load_json(path: Path) -> dict:
@@ -108,6 +112,19 @@ def finalize_config(config: dict) -> None:
         connection["interval"],
         connection.get("latency", 0),
     )
+
+
+def pawr_phy_byte_time_ms(phy) -> float:
+    if isinstance(phy, int):
+        if phy == 1:
+            return PAWR_PHY_BYTE_TIME_MS["1m"]
+        if phy == 2:
+            return PAWR_PHY_BYTE_TIME_MS["2m"]
+    if isinstance(phy, str):
+        normalized = phy.strip().lower().replace(" ", "")
+        if normalized in PAWR_PHY_BYTE_TIME_MS:
+            return PAWR_PHY_BYTE_TIME_MS[normalized]
+    raise ValueError(f"Unsupported PAWR PHY: {phy!r}")
 
 
 def apply_value(config: dict, parameter: dict, raw_value) -> None:
@@ -252,6 +269,71 @@ def discover_parameter_files(root: Path) -> list[Path]:
 def selected_modes(mode: str) -> set[str]:
     return {"one_factor", "full_sweep"} if mode == "both" else {mode}
 
+def is_pawr_config_valid(response_slot_number,
+                         subevent_number,
+                         subevent_interval,
+                         pawr_interval,
+                         response_slot_delay,
+                         response_slot_spacing,
+                         payload_size,
+                         phy,
+                         t_ifs = 0.150):
+    overhead_bytes = (
+        1 + # Preamble
+        4 + # Access Address
+        2 + # LL header
+        3   # CRC
+    )
+
+    byte_time_ms = pawr_phy_byte_time_ms(phy)
+
+    used_airtime_per_payload = (overhead_bytes + payload_size)* byte_time_ms
+    if(used_airtime_per_payload + t_ifs > response_slot_spacing):
+       return False
+
+    used_airtime_per_subevent_interval = response_slot_number * (response_slot_spacing + t_ifs) + (response_slot_delay + t_ifs)
+    if(used_airtime_per_subevent_interval > subevent_interval):
+        return False
+
+    used_airtime_per_pawr_interval = subevent_number * used_airtime_per_subevent_interval
+    if(used_airtime_per_pawr_interval > pawr_interval):
+        return False
+    
+    return True
+
+
+def is_generated_pawr_config_valid(config: dict) -> bool:
+    pawr = config.get("pawr")
+    if not pawr:
+        return True
+
+    advertiser = config.get("advertiser", {})
+    try:
+        payload_size = max(
+            int(advertiser.get("payload", 0)),
+            int(pawr.get("rx_payload_length", 0)),
+        )
+        phy = advertiser.get("secondary_phy", advertiser.get("phy", "1m"))
+        return is_pawr_config_valid(
+            int(pawr["response_slots"]),
+            int(pawr["num_subevents"]),
+            int(pawr["subevent_interval"]),
+            int(pawr["interval"]),
+            int(pawr["response_slot_delay"]),
+            int(pawr["response_slot_spacing"]),
+            payload_size,
+            phy,
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def write_generated_config(config: dict, output_path: Path) -> bool:
+    if not is_generated_pawr_config_valid(config):
+        return False
+    output_path.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
+    return True
+
 
 def generate_config_matrix(config_dir: Path, *, modes: set[str]) -> dict:
     parameter_file = config_dir / "parameters.json"
@@ -278,8 +360,8 @@ def generate_config_matrix(config_dir: Path, *, modes: set[str]) -> dict:
                 stem = one_factor_name(parameter, point)
                 config["test"] = {"name": stem}
                 output_path = output_dir / f"{stem}.json"
-                output_path.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
-                one_factor_count += 1
+                if write_generated_config(config, output_path):
+                    one_factor_count += 1
 
     full_sweep_count = 0
     full_sweep = analyses.get("full_sweep", {})
@@ -311,8 +393,8 @@ def generate_config_matrix(config_dir: Path, *, modes: set[str]) -> dict:
             target_dir = partition_directory(sweep_dir, full_sweep, combination, ordered_parameters)
             target_dir.mkdir(parents=True, exist_ok=True)
             output_path = target_dir / f"{stem}.json"
-            output_path.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
-            full_sweep_count += 1
+            if write_generated_config(config, output_path):
+                full_sweep_count += 1
 
     return {
         "config_dir": str(config_dir),
@@ -398,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"{parameter_file.parent}: "
                 f"one_factor={summary['one_factor_count']} "
-                f"full_sweep={summary['full_sweep_count']}"
+                f"full_sweep={summary['full_sweep_count']} "
             )
 
     print(
