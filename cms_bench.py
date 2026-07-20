@@ -54,6 +54,8 @@ class BenchResources:
     board: str = ""
     board_rev: str = ""
     device: str = ""
+    part_number: str = ""
+    serial_number: str = ""
     result_db: str = ""
     commander_path: str = ""
     xapi_path: str = ""
@@ -456,6 +458,8 @@ def load_bench_runtime_config(path: str | Path = CMS_BENCH_CONFIG) -> tuple[Benc
         board=identity.board,
         board_rev=str(devices.get("board_rev", devices.get("brev", ""))),
         device=identity.device,
+        part_number=str(devices.get("part_number", devices.get("device", ""))),
+        serial_number=str(devices.get("serial_number", "")),
         result_db=str(config.get("result_db", "")),
         commander_path=str(tools.get("commander", config.get("commander", ""))),
         xapi_path=str(ble.get("xapi", tools.get("xapi", config.get("xapi", "")))),
@@ -482,6 +486,8 @@ def resolve_cms_resources_from_dev_config(dev_config: dict[str, Any]) -> BenchRe
         board=str(firmware.get("board", "")),
         board_rev=str(firmware.get("brev", firmware.get("board_rev", ""))),
         device=str(firmware.get("device", "")),
+        part_number=str(firmware.get("part_number", firmware.get("device", ""))),
+        serial_number=str(firmware.get("serial_number", "")),
         commander_path=str(tools.get("commander", dev_config.get("commander", ""))),
         xapi_path=str(ble.get("xapi", tools.get("xapi", dev_config.get("xapi", "")))),
     )
@@ -524,6 +530,13 @@ def resolve_cms_resources_from_hwmux(group_json: dict[str, Any]) -> BenchResourc
         board=str(metadata.get("cms_board", dut.get("part", {}).get("board_no", ""))),
         board_rev=str(metadata.get("cms_board_rev", dut.get("part", {}).get("board_rev", ""))),
         device=str(metadata.get("cms_device", dut.get("part", {}).get("variant", ""))),
+        part_number=str(
+            metadata.get(
+                "cms_part_number",
+                metadata.get("cms_device", dut.get("part", {}).get("variant", "")),
+            )
+        ),
+        serial_number=str(metadata.get("cms_serial_number", dut.get("serial_number", ""))),
     )
 
 
@@ -551,6 +564,10 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
             "provision_state_root": str(Path("artifacts") / "cmsd" / "provision_state"),
             "board": resources.board,
             "brev": resources.board_rev,
+            "board_rev": resources.board_rev,
+            "board_revision": resources.board_rev,
+            "part_number": resources.part_number or resources.device,
+            "serial_number": resources.serial_number,
             "device": resources.device,
             "sisdk": session.manifest.sisdk_version,
             "dut_image": str(session.runtime_dir / session.manifest.dut_img.name),

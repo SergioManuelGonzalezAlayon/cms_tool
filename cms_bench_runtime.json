@@ -25,6 +25,8 @@
   "devices": {
     "board": "REPLACE_WITH_BOARD_ID",
     "board_rev": "REPLACE_WITH_BOARD_REV",
+    "part_number": "REPLACE_WITH_PART_NUMBER",
+    "serial_number": "REPLACE_WITH_RADIO_BOARD_SERIAL_NUMBER",
     "device": "REPLACE_WITH_DEVICE_ID"
   }
 }

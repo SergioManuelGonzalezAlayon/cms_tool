@@ -113,6 +113,10 @@ def Config(request: pytest.FixtureRequest) -> dict:
         if not value:
             pytest.fail(f"Missing firmware metadata. {key}")
         fw[key] = value
+    for key in ("board_rev", "board_revision", "part_number", "serial_number"):
+        value = dev_fw.get(key)
+        if value:
+            fw[key] = value
 
     cfg_data["firmware"] = fw
     return cfg_data
@@ -166,6 +170,7 @@ def ResultGeneratorFixture(request: pytest.FixtureRequest) -> ResultGenerator:
 @pytest.fixture(autouse=True)
 def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixture: ResultGenerator) -> None:
     if "JoulescopeDev" not in request.fixturenames:
+        yield
         return
 
     js = request.getfixturevalue("JoulescopeDev")

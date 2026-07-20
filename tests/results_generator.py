@@ -29,6 +29,47 @@ def _relative_path(path: Path | str | None) -> str | None:
     return Path(path).as_posix()
 
 
+def _config_protocol_and_test_case(config_path: Path) -> tuple[str, str]:
+    parts = config_path.parts
+    if "configs" in parts:
+        index = parts.index("configs")
+        protocol = parts[index + 1] if len(parts) > index + 1 else ""
+        test_case = parts[index + 2] if len(parts) > index + 2 else ""
+        if protocol or test_case:
+            return protocol, test_case
+    return "", config_path.parent.name
+
+
+def _result_storage_metadata(
+    *,
+    test_name: str,
+    config_path: Path,
+    firmware: dict,
+    slcp_meta: dict,
+) -> dict:
+    protocol, test_case = _config_protocol_and_test_case(config_path)
+    board_revision = (
+        firmware.get("board_revision")
+        or firmware.get("board_rev")
+        or firmware.get("brev")
+    )
+    part_number = (
+        firmware.get("part_number")
+        or firmware.get("device")
+        or slcp_meta.get("chip_id")
+    )
+    return {
+        "prefix": "cms",
+        "protocol": protocol,
+        "test_case": test_case or test_name,
+        "part_number": part_number,
+        "board": firmware.get("board"),
+        "board_revision": board_revision,
+        "serial_number": firmware.get("serial_number"),
+        "test_name": test_name,
+    }
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -292,6 +333,12 @@ def write_result_json(
     slcp_meta = _read_slcp_metadata(firmware.get("dut_slcp"))
     mode, partition = _config_mode_and_partition(config_path)
     analyzer = result_paths["analyzer"] if result_paths["note_path"] is None else None
+    storage = _result_storage_metadata(
+        test_name=test_name,
+        config_path=config_path,
+        firmware=firmware,
+        slcp_meta=slcp_meta,
+    )
 
     avg_current_ma = float(sum(profile["current"]["samples"]) / len(profile["current"]["samples"]) * 1e3)
     peak_current_ma = float(max(profile["current"]["samples"]) * 1e3)
@@ -330,12 +377,15 @@ def write_result_json(
             "wireless_stack": "BLE",
             "chip_id": slcp_meta["chip_id"],
             "board_id": firmware.get("board"),
+            "board_revision": storage["board_revision"],
+            "part_number": storage["part_number"],
             "sdk_name": slcp_meta["sdk_name"],
             "sdk_version": slcp_meta["sdk_version"],
             "campaign_id": campaign_id,
             "mode": mode,
             "partition": partition,
         },
+        "storage": storage,
         "test_run": {
             "test_name": test_name,
             "config_name": config_name,
@@ -350,6 +400,11 @@ def write_result_json(
             "dut_slcp": firmware.get("dut_slcp"),
             "tester_slcp": firmware.get("tester_slcp"),
             "board": firmware.get("board"),
+            "board_revision": storage["board_revision"],
+            "brev": firmware.get("brev"),
+            "part_number": storage["part_number"],
+            "device": firmware.get("device"),
+            "serial_number": storage["serial_number"],
             "dut_sdk_name": slcp_meta["sdk_name"],
             "dut_sdk_version": slcp_meta["sdk_version"],
             "dut_chip_id": slcp_meta["chip_id"],

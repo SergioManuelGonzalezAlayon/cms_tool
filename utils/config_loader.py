@@ -16,7 +16,7 @@ RUNTIME_CONFIG_ENV = "CURRENT_MEASUREMENT_CMS_BENCH_RUNTIME_FILE"
 def _read_json_file(path: Path) -> dict:
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    return _load_json(path)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -91,6 +91,16 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
             "bootloader_image_sha256": fw_metadata.get("bootloader_image_sha256"),
             "board": fw_metadata.get("board") or devices.get("board"),
             "brev": fw_metadata.get("brev") or devices.get("board_rev"),
+            "board_rev": fw_metadata.get("board_rev") or fw_metadata.get("brev") or devices.get("board_rev"),
+            "board_revision": (
+                fw_metadata.get("board_revision")
+                or fw_metadata.get("board_rev")
+                or fw_metadata.get("brev")
+                or devices.get("board_revision")
+                or devices.get("board_rev")
+            ),
+            "part_number": fw_metadata.get("part_number") or devices.get("part_number") or devices.get("device"),
+            "serial_number": fw_metadata.get("serial_number") or devices.get("serial_number"),
             "device": fw_metadata.get("device") or devices.get("device"),
             "sisdk": fw_metadata.get("sisdk"),
         },
