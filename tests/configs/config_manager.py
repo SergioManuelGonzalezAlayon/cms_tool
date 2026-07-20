@@ -24,6 +24,28 @@ PAWR_PHY_BYTE_TIME_MS = {
     "1m": 0.008,
     "2m": 0.004,
 }
+ADVERTISING_PHY_PATH = "advertiser.phy"
+SCANNER_PHY_PATH = "scanner.phy"
+ADVERTISING_PHY_EXPANSIONS = {
+    "1m": {
+        ADVERTISING_PHY_PATH: "1m",
+        "advertiser.primary_phy": "1m",
+        "advertiser.secondary_phy": "1m",
+        SCANNER_PHY_PATH: "1m",
+    },
+    "2m": {
+        ADVERTISING_PHY_PATH: "2m",
+        "advertiser.primary_phy": "1m",
+        "advertiser.secondary_phy": "2m",
+        SCANNER_PHY_PATH: "1m",
+    },
+    "coded": {
+        ADVERTISING_PHY_PATH: "coded",
+        "advertiser.primary_phy": "coded",
+        "advertiser.secondary_phy": "coded",
+        SCANNER_PHY_PATH: "coded",
+    },
+}
 
 
 def load_json(path: Path) -> dict:
@@ -81,6 +103,34 @@ def set_path(config: dict, path: str, value) -> None:
     for part in parts[:-1]:
         current = current.setdefault(part, {})
     current[parts[-1]] = value
+
+
+def normalized_phy_value(value) -> str | None:
+    if isinstance(value, str):
+        return value.strip().lower().replace(" ", "")
+    return None
+
+
+def apply_advertising_phy_expansion(config: dict, parameter: dict, raw_value) -> None:
+    paths = parameter.get("config_paths")
+    if paths is None:
+        paths = [parameter.get("config_path")]
+
+    if parameter.get("name") != "phy" or ADVERTISING_PHY_PATH not in paths:
+        return
+
+    path_values = parameter.get("config_path_values", {})
+    if ADVERTISING_PHY_PATH in path_values or SCANNER_PHY_PATH in path_values:
+        return
+
+    expansion = ADVERTISING_PHY_EXPANSIONS.get(normalized_phy_value(raw_value))
+    if expansion is None:
+        return
+
+    for path, value in expansion.items():
+        if path == SCANNER_PHY_PATH and SCANNER_PHY_PATH not in paths:
+            continue
+        set_path(config, path, value)
 
 
 def connection_interval_units(milliseconds) -> int:
@@ -142,6 +192,7 @@ def apply_value(config: dict, parameter: dict, raw_value) -> None:
         path_values = parameter.get("config_path_values", {}).get(path, {})
         path_value = path_values.get(str(value), value)
         set_path(config, path, path_value)
+    apply_advertising_phy_expansion(config, parameter, value)
 
 
 def quantity_to_runtime(value: Decimal, default_unit: str):

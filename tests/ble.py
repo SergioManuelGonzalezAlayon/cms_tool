@@ -24,10 +24,7 @@ def _format_bd_addr(address) -> str:
 
 
 def _discovery_scan_phy_for_advertiser(phy: str | int) -> int:
-    phy = primary_advertising_phy(phy)
-    if phy == PHY_CODED:
-        return PHY_CODED
-    return PHY_1M
+    return discovery_scan_phy_for_advertiser(phy)
 
 
 def open_ble_dev(dev,
@@ -316,8 +313,14 @@ def DUTScanStart(DUT,
             mode = getattr(DUT.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
         cfg = DUTScanConfig(mode=mode)
         scan_phy = cfg.phy if phy is None else phy
-        DUT.bt.scanner.start(scan_phy, discover_mode)
-        log.info("DUT scanning started: phy=%s", advertising_phy_to_str(scan_phy))
+        rsp = DUT.bt.scanner.start(scan_phy, discover_mode)
+        assert rsp.result == 0
+        log.info(
+            "DUT scanning started: phy=%s, raw_phy=%d, discover_mode=%d",
+            advertising_phy_to_str(scan_phy),
+            scan_phy,
+            discover_mode,
+        )
         started = True
 
     yield _start
@@ -558,8 +561,14 @@ def TesterScanStart(Tester,
             mode = getattr(Tester.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
         cfg = TesterScanConfig(mode=mode)
         scan_phy = cfg.phy if phy is None else phy
-        res = Tester.bt.scanner.start(scan_phy, discover_mode)
-        log.info("Tester scanning started: phy=%s, raw_phy=%d, res=%s discMode=%d", advertising_phy_to_str(scan_phy), scan_phy,str(res), discover_mode)
+        rsp = Tester.bt.scanner.start(scan_phy, discover_mode)
+        assert rsp.result == 0
+        log.info(
+            "Tester scanning started: phy=%s, raw_phy=%d, discover_mode=%d",
+            advertising_phy_to_str(scan_phy),
+            scan_phy,
+            discover_mode,
+        )
         started = True
 
     yield _start
@@ -758,8 +767,8 @@ def ConnectBLEDevices(Config):
             params,
             retry_sleep=retry_sleep,
             max_retries=max_retries,
-            connTimeout=5*timeout_s,
-            evtTimeout=timeout_s/5
+            connTimeout=max(5 * timeout_s, 10),
+            evtTimeout=max(timeout_s / 5, 0.2),
         )
         
         log.info("DUT and Tester connected")

@@ -220,6 +220,13 @@ def connection_open_phy(phy: str | int) -> int:
     return phy
 
 
+def discovery_scan_phy_for_advertiser(phy: str | int) -> int:
+    phy = primary_advertising_phy(phy)
+    if phy == PHY_CODED:
+        return PHY_1M_AND_CODED
+    return PHY_1M
+
+
 def random_payload_bytes(payload_length: int) -> bytes:
     if payload_length < 0:
         raise ValueError(f"payload_length must be >= 0, got {payload_length}")
@@ -525,6 +532,9 @@ def connect_devices(central,
     )
 
     for attempt in range(max_retries):
+        central_conn = -1
+        peripheral_conn = -1
+
         log.info("Connection attempt %d/%d", attempt + 1, max_retries)
         log.info(
             "Connecting: interval=%s latency=%s timeout=%s phy=%s",
@@ -550,6 +560,7 @@ def connect_devices(central,
                 eventTimeout=evtTimeout,
                 maxTime=connTimeout,
             )
+            central_conn = central_event.connection
 
             peripheral_event = bgapi_check_event(
                 peripheral,
@@ -559,11 +570,6 @@ def connect_devices(central,
                 eventTimeout=evtTimeout,
                 maxTime=connTimeout,
             )
-
-            # Remember to configure the TX power on the opened connection
-            
-
-            central_conn = central_event.connection
             peripheral_conn = peripheral_event.connection
 
             if is_conn_handle_valid(central_conn) and is_conn_handle_valid(peripheral_conn):
