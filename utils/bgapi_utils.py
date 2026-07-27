@@ -507,7 +507,8 @@ def connect_devices(central,
                     retry_sleep=1.0,
                     max_retries=5,
                     connTimeout=10.0,
-                    evtTimeout=5.0):
+                    evtTimeout=5.0,
+                    restart_advertising=None):
     """
     Connect two BLE devices where the peripheral has started Connectable Advertising,
     with a maximum number of retries
@@ -585,6 +586,10 @@ def connect_devices(central,
 
             close_connection(central, central_conn)
             close_connection(peripheral, peripheral_conn)
+
+            if restart_advertising is not None and attempt < max_retries - 1:
+                log.info("Restarting connectable advertising before next connection attempt")
+                restart_advertising()
 
             sleep(retry_sleep)
             continue

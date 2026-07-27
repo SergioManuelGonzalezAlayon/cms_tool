@@ -263,14 +263,35 @@ def DUTAdvConfig(DUT,
 def DUTAdvStart(DUT,
                 DUTAdvConfig):
     started = False
+    last_connectable_mode = None
+    last_flags = None
 
     def start(*, connectable_mode, flags=0):
-        nonlocal started
+        nonlocal started, last_connectable_mode, last_flags
+        last_connectable_mode = connectable_mode
+        last_flags = flags
 
         rsp = DUT.bt.extended_advertiser.start(DUTAdvConfig.set, connectable_mode, flags)
         assert rsp.result == 0
         log.info("DUT Advertising started")
         started = True
+
+    def restart():
+        if last_connectable_mode is None:
+            raise RuntimeError("DUT Advertising cannot be restarted before it has been started")
+
+        try:
+            rsp = DUT.bt.advertiser.stop(DUTAdvConfig.set)
+            assert rsp.result == 0
+            log.info("DUT Advertising stopped before restart")
+        except Exception as ex:
+            log.debug("DUT Advertising stop before restart skipped: %s", ex)
+
+        rsp = DUT.bt.extended_advertiser.start(DUTAdvConfig.set, last_connectable_mode, last_flags)
+        assert rsp.result == 0
+        log.info("DUT Advertising restarted")
+
+    start.restart = restart
 
     yield start
 
@@ -512,14 +533,35 @@ def TesterAdvConfig(Tester,
 def TesterAdvStart(Tester,
                    TesterAdvConfig):
     started = False
+    last_connectable_mode = None
+    last_flags = None
 
     def start(*, connectable_mode, flags=0):
-        nonlocal started
+        nonlocal started, last_connectable_mode, last_flags
+        last_connectable_mode = connectable_mode
+        last_flags = flags
 
         rsp = Tester.bt.extended_advertiser.start(TesterAdvConfig.set, connectable_mode, flags)
         assert rsp.result == 0
         log.info("Tester Advertising started")
         started = True
+
+    def restart():
+        if last_connectable_mode is None:
+            raise RuntimeError("Tester Advertising cannot be restarted before it has been started")
+
+        try:
+            rsp = Tester.bt.advertiser.stop(TesterAdvConfig.set)
+            assert rsp.result == 0
+            log.info("Tester Advertising stopped before restart")
+        except Exception as ex:
+            log.debug("Tester Advertising stop before restart skipped: %s", ex)
+
+        rsp = Tester.bt.extended_advertiser.start(TesterAdvConfig.set, last_connectable_mode, last_flags)
+        assert rsp.result == 0
+        log.info("Tester Advertising restarted")
+
+    start.restart = restart
 
     yield start
 
@@ -748,7 +790,8 @@ def ConnectBLEDevices(Config):
                     central, 
                     peripheral,
                     retry_sleep=MAX_TEST_RETRY_WAIT,
-                    max_retries=MAX_TEST_RETRIES):
+                    max_retries=MAX_TEST_RETRIES,
+                    restart_advertising=None):
         """
         Connect two BLE devices where the peripheral has started Connectable Advertising,
         with a maximum number of retries
@@ -769,6 +812,7 @@ def ConnectBLEDevices(Config):
             max_retries=max_retries,
             connTimeout=max(5 * timeout_s, 10),
             evtTimeout=max(timeout_s / 5, 0.2),
+            restart_advertising=restart_advertising,
         )
         
         log.info("DUT and Tester connected")
@@ -976,6 +1020,7 @@ def test_conn_central(JoulescopeDev,
     _, _, conn_params = ConnectBLEDevices(
         central=DUT,
         peripheral=Tester,
+        restart_advertising=TesterAdvStart.restart,
     )
 
     n_events = 10
@@ -996,6 +1041,7 @@ def test_conn_peripheral(JoulescopeDev,
     _, _, conn_params = ConnectBLEDevices(
         central=Tester,
         peripheral=DUT,
+        restart_advertising=DUTAdvStart.restart,
     )
 
     n_events = 10
