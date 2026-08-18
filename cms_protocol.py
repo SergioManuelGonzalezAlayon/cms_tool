@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+import re
+import secrets
 from typing import Any
+
 
 class DeviceState(str, Enum):
     READY = "ready"
@@ -50,6 +53,91 @@ class MeasurementMode(str, Enum):
     DEFAULT = "default"
     FULL_SWEEP = "full_sweep"
     DIFF = "diff"
+
+
+class TestCaseState(str, Enum):
+    """Lifecycle states for one planned test case."""
+    PENDING = "pending"
+    RUNNING = "running"
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    CANCELLED = "cancelled"
+
+
+class ResultType(str, Enum):
+    """Distinct result layers produced by one CMS campaign."""
+    PYTEST_JUNIT = "pytest_junit"
+    CURRENT_MEASUREMENT = "current_measurement"
+    CAMPAIGN = "campaign"
+    DIAGNOSTIC = "diagnostic"
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementIdentity:
+    """Stable identity shared by every record belonging to one execution."""
+    measurement_id: str
+    run_name: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class TestCaseIdentity:
+    """Stable identity and ordering metadata for one planned test case."""
+    job_id: str
+    ordinal: int
+    total_jobs: int
+    feature: str
+    config: str
+    config_hash: str = ""
+    mode: str = ""
+    partition: str = ""
+
+    def __post_init__(self) -> None:
+        if self.ordinal < 1:
+            raise ValueError("test case ordinal must be at least 1")
+        if self.total_jobs < 1:
+            raise ValueError("total jobs must be at least 1")
+        if self.ordinal > self.total_jobs:
+            raise ValueError("test case ordinal cannot exceed total jobs")
+
+
+@dataclass(frozen=True, slots=True)
+class TestCounts:
+    """Campaign counters; cancelled jobs are included in ``completed``."""
+    total: int = 0
+    completed: int = 0
+    passed: int = 0
+    failed: int = 0
+    skipped: int = 0
+
+    def __post_init__(self) -> None:
+        values = (self.total, self.completed, self.passed, self.failed, self.skipped)
+        if any(value < 0 for value in values):
+            raise ValueError("test counts cannot be negative")
+        if self.completed > self.total:
+            raise ValueError("completed test count cannot exceed total")
+        if self.passed + self.failed + self.skipped > self.completed:
+            raise ValueError("terminal outcome counts cannot exceed completed")
+
+    @property
+    def remaining(self) -> int:
+        """Number of planned test cases without a terminal record."""
+        return self.total - self.completed
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class EventCursor:
+    """Non-negative position in a per-measurement append-only event stream."""
+    value: int = 0
+
+    def __post_init__(self) -> None:
+        if self.value < 0:
+            raise ValueError("event cursor cannot be negative")
+
+    def next(self) -> "EventCursor":
+        """Return the next monotonically increasing cursor."""
+        return EventCursor(self.value + 1)
 
 
 @dataclass(slots=True)
@@ -105,6 +193,7 @@ class MeasurementRequest:
     mode: MeasurementMode = MeasurementMode.DEFAULT
     requested_by: str = ""
     upload_results_to_database: bool = False
+    identity: MeasurementIdentity | None = None
 
 
 @dataclass(slots=True)
@@ -113,6 +202,7 @@ class Artifacts:
     name: str
     path: Path | None = None
     url: str = ""
+    result_type: ResultType = ResultType.DIAGNOSTIC
 
 
 @dataclass(slots=True)
@@ -126,6 +216,7 @@ class MeasurementResult:
     progress_percent: int = 0
     current_step: str = ""
     message: str = ""
+    identity: MeasurementIdentity | None = None
 
 
 @dataclass(slots=True)
@@ -157,6 +248,110 @@ class BenchCheckResult:
     status: BenchCheckStatus
     summary: str
     detail: str = ""
+
+
+def create_measurement_identity(
+    run_name: str,
+    *,
+    created_at: datetime | None = None,
+    suffix: str | None = None,
+) -> MeasurementIdentity:
+    """Create a readable, filesystem-safe, collision-resistant run identity."""
+    readable_name = run_name.strip() or "measurement"
+    timestamp = created_at or datetime.now(timezone.utc)
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("measurement identity timestamp must include a timezone")
+    timestamp = timestamp.astimezone(timezone.utc)
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", readable_name).strip("-").lower()
+    slug = slug[:80].rstrip("-") or "measurement"
+    collision_suffix = suffix or secrets.token_hex(6)
+    if not re.fullmatch(r"[A-Za-z0-9]+", collision_suffix):
+        raise ValueError("measurement identity suffix must be alphanumeric")
+
+    timestamp_text = timestamp.strftime("%Y%m%dT%H%M%S%fZ")
+    return MeasurementIdentity(
+        measurement_id=f"{slug}-{timestamp_text}-{collision_suffix.lower()}",
+        run_name=readable_name,
+        created_at=timestamp,
+    )
+
+
+def measurement_identity_to_dict(identity: MeasurementIdentity) -> dict[str, str]:
+    return {
+        "measurement_id": identity.measurement_id,
+        "run_name": identity.run_name,
+        "created_at": identity.created_at.isoformat(),
+    }
+
+
+def measurement_identity_from_dict(data: dict[str, Any]) -> MeasurementIdentity:
+    created_at = _datetime_from_optional_string(data.get("created_at"))
+    if created_at is None:
+        raise ValueError("measurement identity requires a valid created_at timestamp")
+    return MeasurementIdentity(
+        measurement_id=str(data.get("measurement_id", "")),
+        run_name=str(data.get("run_name", "")),
+        created_at=created_at,
+    )
+
+
+def test_case_identity_to_dict(identity: TestCaseIdentity) -> dict[str, Any]:
+    return {
+        "job_id": identity.job_id,
+        "ordinal": identity.ordinal,
+        "total_jobs": identity.total_jobs,
+        "feature": identity.feature,
+        "config": identity.config,
+        "config_hash": identity.config_hash,
+        "mode": identity.mode,
+        "partition": identity.partition,
+    }
+
+
+def test_case_identity_from_dict(data: dict[str, Any]) -> TestCaseIdentity:
+    return TestCaseIdentity(
+        job_id=str(data.get("job_id", "")),
+        ordinal=int(data.get("ordinal", 0)),
+        total_jobs=int(data.get("total_jobs", 0)),
+        feature=str(data.get("feature", "")),
+        config=str(data.get("config", "")),
+        config_hash=str(data.get("config_hash", "")),
+        mode=str(data.get("mode", "")),
+        partition=str(data.get("partition", "")),
+    )
+
+
+def test_counts_to_dict(counts: TestCounts) -> dict[str, int]:
+    return {
+        "total": counts.total,
+        "completed": counts.completed,
+        "passed": counts.passed,
+        "failed": counts.failed,
+        "skipped": counts.skipped,
+        "remaining": counts.remaining,
+    }
+
+
+def test_counts_from_dict(data: dict[str, Any]) -> TestCounts:
+    counts = TestCounts(
+        total=int(data.get("total", 0)),
+        completed=int(data.get("completed", 0)),
+        passed=int(data.get("passed", 0)),
+        failed=int(data.get("failed", 0)),
+        skipped=int(data.get("skipped", 0)),
+    )
+    if "remaining" in data and int(data["remaining"]) != counts.remaining:
+        raise ValueError("remaining test count must equal total minus completed")
+    return counts
+
+
+def event_cursor_to_int(cursor: EventCursor) -> int:
+    return cursor.value
+
+
+def event_cursor_from_int(value: Any) -> EventCursor:
+    return EventCursor(int(value))
 
 
 def bench_identity_to_dict(identity: BenchIdentity) -> dict[str, str]:
@@ -299,6 +494,7 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
 def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
     return {
         "request_id": request.request_id,
+        "identity": measurement_identity_to_dict(request.identity) if request.identity else None,
         "selector": {
             "mode": request.selector.mode,
             "feature": request.selector.feature,
@@ -313,6 +509,7 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
 
 def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
     selector = data.get("selector", {})
+    identity_data = data.get("identity")
     return MeasurementRequest(
         request_id=str(data.get("request_id", "")),
         selector=SuiteSelector(
@@ -324,6 +521,7 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
         mode=MeasurementMode(str(data.get("mode", MeasurementMode.DEFAULT.value))),
         requested_by=str(data.get("requested_by", "")),
         upload_results_to_database=bool(data.get("upload_results_to_database", False)),
+        identity=measurement_identity_from_dict(identity_data) if identity_data else None,
     )
 
 
@@ -332,6 +530,7 @@ def artifact_to_dict(artifact: Artifacts) -> dict[str, str]:
         "name": artifact.name,
         "path": str(artifact.path) if artifact.path is not None else "",
         "url": artifact.url,
+        "result_type": artifact.result_type.value,
     }
 
 
@@ -341,12 +540,15 @@ def artifact_from_dict(data: dict[str, Any]) -> Artifacts:
         name=str(data.get("name", "")),
         path=Path(path) if path else None,
         url=str(data.get("url", "")),
+        result_type=ResultType(str(data.get("result_type", ResultType.DIAGNOSTIC.value))),
     )
 
 
 def measurement_result_to_dict(result: MeasurementResult) -> dict[str, Any]:
     return {
+        "result_type": ResultType.CAMPAIGN.value,
         "measurement_id": result.measurement_id,
+        "identity": measurement_identity_to_dict(result.identity) if result.identity else None,
         "state": result.state.value,
         "started_at": result.started_at.isoformat() if result.started_at else "",
         "finished_at": result.finished_at.isoformat() if result.finished_at else "",
@@ -358,6 +560,7 @@ def measurement_result_to_dict(result: MeasurementResult) -> dict[str, Any]:
 
 
 def measurement_result_from_dict(data: dict[str, Any]) -> MeasurementResult:
+    identity_data = data.get("identity")
     return MeasurementResult(
         measurement_id=str(data.get("measurement_id", "")),
         state=MeasurementState(str(data.get("state", MeasurementState.FAILED.value))),
@@ -367,6 +570,7 @@ def measurement_result_from_dict(data: dict[str, Any]) -> MeasurementResult:
         progress_percent=int(data.get("progress_percent", 0)),
         current_step=str(data.get("current_step", "")),
         message=str(data.get("message", "")),
+        identity=measurement_identity_from_dict(identity_data) if identity_data else None,
     )
 
 

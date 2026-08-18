@@ -111,8 +111,8 @@ class CMSClient:
         mode: MeasurementMode,
         feature: str,
         config: str = "default",
-        request_id: str = "",
-        upload_results_to_database: bool = False
+        upload_results_to_database: bool = False,
+        run_name: str = "",
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
         payload = self._request_json(
@@ -122,7 +122,7 @@ class CMSClient:
                 "mode": mode.value,
                 "feature": feature,
                 "config": config,
-                "request_id": request_id,
+                "run_name": run_name,
                 "upload_results_to_database": upload_results_to_database,
             },
         )
@@ -293,7 +293,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
     test.add_argument("mode", choices=[mode.value for mode in MeasurementMode])
     test.add_argument("feature")
     test.add_argument("--config-name", default="default", help="test config")
-    test.add_argument("--request-id", default="", help="test run id")
+    test.add_argument(
+        "--run-name",
+        dest="run_name",
+        default="",
+        help="human-readable test run name",
+    )
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
     test.add_argument(
         "--send-to-database",
@@ -362,8 +367,8 @@ def main(argv: list[str] | None = None) -> int:
             MeasurementMode(args.mode),
             args.feature,
             config=args.config_name,
-            request_id=args.request_id,
-            upload_results_to_database=args.upload_results_to_database
+            run_name=args.run_name,
+            upload_results_to_database=args.upload_results_to_database,
         )
         if result.measurement_id:
             result = _poll_test_progress(client, result.measurement_id)
@@ -524,6 +529,9 @@ def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
 
 def _print_measurement_result(result: MeasurementResult) -> None:
     print(f"{result.measurement_id}: {result.state.value} {result.progress_percent}%")
+    if result.identity is not None:
+        print(f"run_name: {result.identity.run_name}")
+        print(f"created_at: {result.identity.created_at.isoformat()}")
     if result.message:
         print(result.message)
     for artifact in result.artifacts:

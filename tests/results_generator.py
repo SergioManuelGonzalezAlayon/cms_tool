@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 
+from cms_protocol import ResultType
+
 
 log = logging.getLogger(__name__)
 
@@ -370,6 +372,7 @@ def write_result_json(
         )
 
     record = {
+        "result_type": ResultType.CURRENT_MEASUREMENT.value,
         "schema_version": 1,
         "dataset": {
             "dataset_id": f"ble_{firmware.get('board', 'unknown')}_{campaign_id}",

@@ -28,8 +28,10 @@ from cms_protocol import (
     MeasurementState,
     MeasurementRequest,
     MeasurementResult,
+    ResultType,
     bench_health_report_to_dict,
     bench_identity_to_dict,
+    create_measurement_identity,
     measurement_request_from_dict,
     measurement_request_to_dict,
     measurement_result_to_dict,
@@ -205,10 +207,11 @@ class CMSDaemon:
         self.measurements[request.request_id] = MeasurementResult(
             measurement_id=request.request_id,
             state=MeasurementState.ACCEPTED,
-            started_at=datetime.utcnow(),
+            started_at=request.identity.created_at if request.identity else datetime.utcnow(),
             progress_percent=5,
             current_step=MeasurementState.ACCEPTED.value,
             message="measurement accepted",
+            identity=request.identity,
         )
         self.files.measurement_request.write_text(
             json.dumps(measurement_request_to_dict(request), indent=2) + "\n",
@@ -281,14 +284,14 @@ class CMSDaemon:
         mode: str,
         feature: str,
         config: str = "default",
-        request_id: str = "",
+        run_name: str = "",
         upload_results_to_database: bool = False,
     ) -> MeasurementResult:
         """Run a test using the most recently staged firmware request."""
 
         if self.last_firmware_request is None:
             return MeasurementResult(
-                measurement_id=request_id,
+                measurement_id="",
                 state=MeasurementState.FAILED,
                 finished_at=datetime.utcnow(),
                 progress_percent=100,
@@ -296,13 +299,15 @@ class CMSDaemon:
                 message="no firmware has been staged; run SEND_FW first",
             )
         request = measurement_request_from_dict(measurement_request_to_dict(self.last_firmware_request))
-        request.request_id = request_id or f"{request.request_id}-test"
         request.mode = request.mode.__class__(mode)
         request.selector.mode = "ble"
         request.selector.feature = feature
         request.selector.config = config
         request.upload_results_to_database = upload_results_to_database
-        result = self.execute_measurement(request)
+        request.identity = None
+        request.request_id = ""
+        self._assign_execution_identity(request, run_name)
+        result = self.execute_measurement(request, identity_assigned=True)
         self.last_measurement_id = result.measurement_id
         return result
 
@@ -312,14 +317,14 @@ class CMSDaemon:
         mode: str,
         feature: str,
         config: str = "default",
-        request_id: str = "",
+        run_name: str = "",
         upload_results_to_database: bool = False,
     ) -> MeasurementResult:
         """Start a test in the background using the most recently staged firmware."""
 
         if self.last_firmware_request is None:
             return MeasurementResult(
-                measurement_id=request_id,
+                measurement_id="",
                 state=MeasurementState.FAILED,
                 finished_at=datetime.utcnow(),
                 progress_percent=100,
@@ -328,27 +333,33 @@ class CMSDaemon:
             )
 
         request = measurement_request_from_dict(measurement_request_to_dict(self.last_firmware_request))
-        request.request_id = request_id or f"{request.request_id}-test"
         request.mode = request.mode.__class__(mode)
         request.selector.mode = "ble"
         request.selector.feature = feature
         request.selector.config = config
         request.upload_results_to_database = upload_results_to_database
+        request.identity = None
+        request.request_id = ""
+        identity = self._assign_execution_identity(request, run_name)
 
         started = MeasurementResult(
             measurement_id=request.request_id,
             state=MeasurementState.ACCEPTED,
-            started_at=datetime.utcnow(),
+            started_at=identity.created_at,
             progress_percent=1,
             current_step=MeasurementState.ACCEPTED.value,
             message="test accepted",
+            identity=identity,
         )
         self.measurements[request.request_id] = started
         self.active_measurement_id = request.request_id
         thread = threading.Thread(
             target=self.execute_measurement,
             args=(request,),
-            kwargs={"staged_runtime_dir": self.last_firmware_runtime_dir},
+            kwargs={
+                "staged_runtime_dir": self.last_firmware_runtime_dir,
+                "identity_assigned": True,
+            },
             daemon=True,
         )
         thread.start()
@@ -365,6 +376,9 @@ class CMSDaemon:
 
     def publish_results(self, result: MeasurementResult) -> MeasurementResult:
         """Persist metadata and expose final artifacts to remote clients."""
+        tracked_result = self.measurements.get(result.measurement_id)
+        if result.identity is None and tracked_result is not None:
+            result.identity = tracked_result.identity
         published_dir = self.config.artifacts_root / "measurements" / result.measurement_id
         published_dir.mkdir(parents=True, exist_ok=True)
 
@@ -404,6 +418,7 @@ class CMSDaemon:
                         f"/measurement/{result.measurement_id}/artifacts/"
                         f"{urllib.parse.quote(result_artifact_name, safe='/')}"
                     ),
+                    result_type=ResultType.CAMPAIGN,
                 )
             )
         self.measurements[result.measurement_id] = result
@@ -432,9 +447,17 @@ class CMSDaemon:
         self,
         request: MeasurementRequest,
         staged_runtime_dir: Path | None = None,
+        identity_assigned: bool = False,
     ) -> MeasurementResult:
         """Run one V1 synchronous measurement path."""
 
+        if not identity_assigned:
+            requested_run_name = request.request_id
+            request.identity = None
+            request.request_id = ""
+            self._assign_execution_identity(request, requested_run_name)
+        else:
+            self._assign_execution_identity(request)
         self.measurement_accept(request)
         runtime_dir = self.create_runtime_workspace(request.request_id)
         try:
@@ -491,6 +514,7 @@ class CMSDaemon:
                 progress_percent=100,
                 current_step=state.value,
                 message=str(exc),
+                identity=request.identity,
             )
         return self.publish_results(result)
 
@@ -547,7 +571,7 @@ class CMSDaemon:
                 mode=str(request.get("mode", "default")),
                 feature=str(request.get("feature", "")),
                 config=str(request.get("config", "default")),
-                request_id=str(request.get("request_id", "")),
+                run_name=str(request.get("run_name", "")),
                 upload_results_to_database=bool(request.get("upload_results_to_database", False)),
             )
             return measurement_result_to_dict(result)
@@ -647,6 +671,25 @@ class CMSDaemon:
         result.progress_percent = progress_percent
         result.current_step = state.value
         result.message = message
+
+    def _assign_execution_identity(
+        self,
+        request: MeasurementRequest,
+        requested_run_name: str = "",
+    ):
+        """Attach the daemon-authoritative identity for one test execution."""
+        if request.identity is not None:
+            request.request_id = request.identity.measurement_id
+            return request.identity
+
+        run_name = requested_run_name.strip() or request.request_id.strip()
+        if not run_name:
+            selector = request.selector
+            parts = [selector.feature, selector.config, request.mode.value]
+            run_name = "-".join(part for part in parts if part) or "measurement"
+        request.identity = create_measurement_identity(run_name)
+        request.request_id = request.identity.measurement_id
+        return request.identity
 
     def _raise_if_cancelled(self, measurement_id: str) -> None:
         if measurement_id in self.cancelled_measurements:

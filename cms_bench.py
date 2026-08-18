@@ -34,8 +34,10 @@ from cms_protocol import (
     MeasurementRequest,
     MeasurementResult,
     MeasurementState,
+    ResultType,
     measurement_request_to_dict,
     measurement_result_to_dict,
+    measurement_identity_to_dict,
 )
 
 CMS_BENCH_CONFIG = "cms_bench_runtime.json"
@@ -317,6 +319,7 @@ class CMSBench:
                 progress_percent=90,
                 current_step=MeasurementState.COLLECTING_ARTIFACTS.value,
                 message="test execution completed" if completed.returncode == 0 else "test execution failed",
+                identity=session.request.identity,
             )
             run_summary_path = session.runtime_dir / "cms_test_run.json"
             run_summary_path.write_text(
@@ -343,6 +346,7 @@ class CMSBench:
                 progress_percent=100,
                 current_step=MeasurementState.FAILED.value,
                 message=str(exc),
+                identity=session.request.identity,
             )
         finally:
             self.state = BenchState.IDLE
@@ -356,14 +360,27 @@ class CMSBench:
     ) -> MeasurementResult:
         """Attach local artifact metadata after the execution step finishes."""
         for path in _run_diagnostic_artifacts(session):
+            relative_path = path.relative_to(session.runtime_dir)
+            result_type = (
+                ResultType.PYTEST_JUNIT
+                if relative_path.parts and relative_path.parts[0] == "junit"
+                else ResultType.DIAGNOSTIC
+            )
             result.artifacts.append(
                 Artifacts(
-                    name=(Path("cmsd") / session.measurement_id / path.name).as_posix(),
+                    name=(Path("cmsd") / session.measurement_id / relative_path).as_posix(),
                     path=path,
+                    result_type=result_type,
                 )
             )
         for path in _real_test_artifacts(session, since=artifact_since):
-            result.artifacts.append(Artifacts(name=_artifact_name(Path("artifacts"), path), path=path))
+            result.artifacts.append(
+                Artifacts(
+                    name=_artifact_name(Path("artifacts"), path),
+                    path=path,
+                    result_type=ResultType.CURRENT_MEASUREMENT,
+                )
+            )
         result.progress_percent = 100
         if result.state is MeasurementState.PASSED:
             result.current_step = MeasurementState.PASSED.value
@@ -559,6 +576,15 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
     xapi_path = _staged_xapi_path(session)
 
     metadata = {
+        "identity": (
+            measurement_identity_to_dict(session.request.identity)
+            if session.request.identity is not None
+            else {
+                "measurement_id": session.measurement_id,
+                "run_name": session.measurement_id,
+                "created_at": "",
+            }
+        ),
         "firmware": {
             "build_root": str(build_root),
             "provision_state_root": str(Path("artifacts") / "cmsd" / "provision_state"),
@@ -683,12 +709,17 @@ def _run_diagnostic_artifacts(session: BenchSession) -> list[Path]:
     names = [
         "cms_fw_metadata.json",
         "cms_test_run.json",
+        "orchestrator_plan.json",
         "orchestrator_results.jsonl",
         "pytest.log",
         "test_stdout.log",
         "test_stderr.log",
     ]
-    return [path for name in names if (path := session.runtime_dir / name).exists()]
+    artifacts = [path for name in names if (path := session.runtime_dir / name).exists()]
+    junit_dir = session.runtime_dir / "junit"
+    if junit_dir.exists():
+        artifacts.extend(sorted(junit_dir.glob("*.xml")))
+    return artifacts
 
 
 def _load_requested_test_config(session: BenchSession) -> dict[str, Any]:
