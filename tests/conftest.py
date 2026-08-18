@@ -8,7 +8,6 @@ import shutil
 from pathlib import Path
 from dataclasses import fields
 import pytest
-from apps.app_manager import read_dev_config as _read_dev_config
 from joulescope_interface import write_joulescope_artifacts
 from results_generator import ResultGenerator
 from serial import Serial, SerialException

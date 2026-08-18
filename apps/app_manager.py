@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 import sys
 
@@ -13,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from utils.config_loader import load_effective_config
+from utils.config_loader import BUILD_CONFIG_ENV, _load_json
 
 
 APPS_DIR = REPO_ROOT / "apps"
@@ -35,6 +36,20 @@ FIRMWARE_IMAGE_SUFFIXES = (".s37", ".hex", ".bin")
 FIRMWARE_ARTIFACT_SUFFIXES = FIRMWARE_IMAGE_SUFFIXES + (".map", ".out")
 
 
+@dataclass(frozen=True, slots=True)
+class SDKSelection:
+    path: Path
+    version: str
+    source: str
+    commit: str = ""
+    sdk_hash: str = ""
+    xapi_path: Path | None = None
+    xapi_hash: str = ""
+
+
+_TOOL_OVERRIDES: dict[str, str] = {}
+
+
 def _resolve_executable_candidate(value: str | None) -> str | None:
     if not value:
         return None
@@ -51,8 +66,7 @@ def resolve_tool(tool_name: str, *, role: str = "build") -> str:
     if resolved:
         return resolved
 
-    dev_cfg = load_effective_config(role=role)
-    configured = dev_cfg.get("tools", {}).get(tool_name)
+    configured = _TOOL_OVERRIDES.get(tool_name) or read_client_config().get("tools", {}).get(tool_name)
     resolved = _resolve_executable_candidate(configured)
     if resolved:
         return resolved
@@ -63,7 +77,7 @@ def resolve_tool(tool_name: str, *, role: str = "build") -> str:
 
     raise RuntimeError(
         f"Required tool '{tool_name}' not found on PATH. "
-        f"Configure dev_config.json tools.{tool_name}, set {env_name}, "
+        f"Configure cms_client_config.json tools.{tool_name}, set {env_name}, "
         "or ensure the Simplicity Studio CLI tools and CMake are installed and available."
     )
 
@@ -89,24 +103,60 @@ def run(
     return result
 
 
-def read_dev_config(path: Path = REPO_ROOT / "dev_config.json") -> dict:
-    if path != REPO_ROOT / "dev_config.json":
-        if not path.exists():
-            return {}
-        return json.loads(path.read_text(encoding="utf-8-sig"))
-    return load_effective_config(role="build")
+def read_client_config(path: Path | None = None) -> dict:
+    if path is None:
+        configured = os.getenv(BUILD_CONFIG_ENV)
+        path = Path(configured) if configured else REPO_ROOT / "cms_client_config.json"
+    if not path.is_absolute():
+        path = (REPO_ROOT / path).resolve()
+    if not path.exists():
+        return {}
+    return _load_json(path)
+
+
+def effective_build_config(config: dict, overrides: argparse.Namespace | None = None) -> dict:
+    """Normalize persistent client configuration and optional CLI overrides."""
+    target = config.get("target", {}) if isinstance(config.get("target"), dict) else {}
+    build = config.get("build", {}) if isinstance(config.get("build"), dict) else {}
+    tools = dict(config.get("tools", {})) if isinstance(config.get("tools"), dict) else {}
+
+    def override(name: str, fallback=None):
+        value = getattr(overrides, name, None) if overrides is not None else None
+        return value if value not in (None, "") else fallback
+
+    for tool_name in TOOL_ENV_VARS:
+        value = override(tool_name, tools.get(tool_name))
+        if value:
+            tools[tool_name] = str(value)
+
+    firmware = {
+        "board": str(override("board", target.get("board", ""))),
+        "brev": str(override("board_rev", target.get("board_rev", target.get("brev", "")))),
+        "device": str(override("device", target.get("device", ""))),
+        "sisdk": str(override("sisdk_version", target.get("sisdk", target.get("sisdk_version", "")))),
+        "sisdk_package_path": str(
+            override("sdk_package_path", target.get("sisdk_package_path", target.get("sdk_package_path", "")))
+        ),
+        "build_root": str(override("build_root", build.get("root", config.get("build_root", DEFAULT_BUILD_ROOT)))),
+        "bootloader_slcp": str(
+            override("bootloader_slcp", build.get("bootloader_slcp", config.get("bootloader_slcp", DEFAULT_BOOTLOADER_SLCP)))
+        ),
+    }
+    return {"target": dict(target), "build": dict(build), "tools": tools, "firmware": firmware}
 
 
 def resolve_build_root(cli_value: str | None) -> Path:
-    dev_cfg = read_dev_config()
-    build_root = dev_cfg.get("firmware", {}).get("build_root")
+    if cli_value:
+        return Path(cli_value)
+    effective_config = effective_build_config(read_client_config())
+    build_root = effective_config.get("firmware", {}).get("build_root")
     if build_root:
         return Path(build_root)
     return DEFAULT_BUILD_ROOT
 
 
-def validate_firmware_config(dev_cfg: dict) -> dict[str, str]:
-    firmware = dev_cfg.get("firmware", {})
+def validate_firmware_config(effective_config: dict) -> dict[str, str]:
+    firmware = effective_config.get("firmware", {})
     if not isinstance(firmware, dict):
         firmware = {}
 
@@ -117,18 +167,18 @@ def validate_firmware_config(dev_cfg: dict) -> dict[str, str]:
 
     missing: list[str] = []
     if not resolved_board:
-        missing.append("firmware.board")
+        missing.append("target.board")
     if not device:
-        missing.append("firmware.device")
+        missing.append("target.device")
     if not sisdk:
-        missing.append("firmware.sisdk")
+        missing.append("target.sisdk")
 
     if missing:
         missing_fields = ", ".join(missing)
         raise RuntimeError(
-            "Missing required firmware settings in dev_config.json: "
+            "Missing required build settings in cms_client_config.json: "
             f"{missing_fields}. "
-            "Set these values under the 'firmware' section."
+            "Set these values under the 'target' section."
         )
 
     return {
@@ -180,7 +230,7 @@ def resolve_sisdk_path(version: str) -> Path:
         raise RuntimeError(
             f"Requested Simplicity SDK version '{version}' is not installed. "
             "Install it with `slt install simplicity-sdk --version <version>` "
-            "or update dev_config.json firmware.sisdk."
+            "or update cms_client_config.json target.sisdk."
         )
     if len(matches) > 1:
         paths = ", ".join(record["path"] for record in matches)
@@ -203,13 +253,69 @@ def resolve_sisdk_path(version: str) -> Path:
     return sdk_path
 
 
+def _validate_sdk_path(path: Path, version: str) -> Path:
+    path = path.expanduser().resolve()
+    if not path.exists() or not path.is_dir():
+        raise RuntimeError(f"SiSDK package path does not exist or is not a directory: {path}")
+    xapi_path = path / SL_BT_XAPI_PATH
+    if not xapi_path.is_file():
+        raise RuntimeError(f"Resolved SiSDK '{version}' cannot find `sl_bt.xapi`: {xapi_path}")
+    return path
+
+
+def _sdk_git_commit(sdk_path: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(sdk_path), "rev-parse", "HEAD"],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except OSError:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def resolve_sdk_selection(
+    *,
+    version: str,
+    cli_package_path: str | None = None,
+    config_package_path: str | None = None,
+) -> SDKSelection:
+    if cli_package_path:
+        source = "cli_package_path"
+        sdk_path = _validate_sdk_path(Path(cli_package_path), version)
+    elif config_package_path:
+        source = "client_config_package_path"
+        sdk_path = _validate_sdk_path(Path(config_package_path), version)
+    else:
+        source = "slt"
+        sdk_path = _validate_sdk_path(resolve_sisdk_path(version), version)
+    xapi_path = sdk_path / SL_BT_XAPI_PATH
+    commit = _sdk_git_commit(sdk_path)
+    return SDKSelection(
+        path=sdk_path,
+        version=version,
+        source=source,
+        commit=commit,
+        sdk_hash=commit,
+        xapi_path=xapi_path,
+        xapi_hash=_sha256(xapi_path),
+    )
+
+
 def trust_sisdk(sdk_path: Path) -> None:
     run(["slc", "signature", "trust", "-s", str(sdk_path)], cwd=REPO_ROOT)
 
 
-def resolve_bootloader_slcp() -> Path:
-    dev_cfg = read_dev_config()
-    configured = dev_cfg.get("firmware", {}).get("bootloader_slcp")
+def resolve_bootloader_slcp(config: dict | None = None) -> Path:
+    if config is None:
+        effective_config = effective_build_config(read_client_config())
+    elif "firmware" in config:
+        effective_config = config
+    else:
+        effective_config = effective_build_config(config)
+    configured = effective_config.get("firmware", {}).get("bootloader_slcp")
     path = Path(configured) if configured else DEFAULT_BOOTLOADER_SLCP
     if not path.is_absolute():
         path = (REPO_ROOT / path).resolve()
@@ -354,6 +460,10 @@ def write_build_metadata(
     slcp: Path,
     out_dir: Path,
     image: Path,
+    firmware_cfg: dict[str, str],
+    sdk_path: Path,
+    runtime_xapi_path: Path | None,
+    sdk_selection: SDKSelection | None = None,
 ) -> Path:
     artifacts = [
         {
@@ -370,6 +480,25 @@ def write_build_metadata(
         "project_name": slcp.stem,
         "slcp": _relative_to_repo(slcp),
         "generated_slcp": _relative_to_repo(out_dir / slcp.name),
+        "firmware": {
+            "board": firmware_cfg["board"],
+            "brev": firmware_cfg.get("brev", ""),
+            "device": firmware_cfg["device"],
+            "sisdk": firmware_cfg["sisdk"],
+            "sdk_path": str(sdk_path.resolve()),
+        },
+        "sdk": {
+            "source": sdk_selection.source if sdk_selection else "",
+            "version": firmware_cfg["sisdk"],
+            "package_path": str(sdk_path.resolve()),
+            "commit": sdk_selection.commit if sdk_selection else "",
+            "hash": sdk_selection.sdk_hash if sdk_selection else "",
+            "xapi_sha256": (
+                sdk_selection.xapi_hash
+                if sdk_selection
+                else (_sha256(runtime_xapi_path) if runtime_xapi_path and runtime_xapi_path.is_file() else "")
+            ),
+        },
         "selected_image": {
             "name": image.name,
             "path": _relative_to_repo(image),
@@ -391,6 +520,7 @@ def write_fw_data(
     sdk_path: Path,
     runtime_xapi_path: Path,
     summaries: list[dict],
+    sdk_selection: SDKSelection | None = None,
 ) -> Path:
     hash_by_role = {
         "dut_app_hash": "",
@@ -419,6 +549,18 @@ def write_fw_data(
             "sisdk": firmware_cfg["sisdk"],
             **hash_by_role,
         },
+        "build": {
+            "root": str(build_root.resolve()),
+            "xapi": str(runtime_xapi_path.resolve()),
+        },
+        "sdk": {
+            "source": sdk_selection.source if sdk_selection else "",
+            "version": firmware_cfg["sisdk"],
+            "package_path": str(sdk_path.resolve()),
+            "commit": sdk_selection.commit if sdk_selection else "",
+            "hash": sdk_selection.sdk_hash if sdk_selection else "",
+            "xapi_sha256": sdk_selection.xapi_hash if sdk_selection else _sha256(runtime_xapi_path),
+        },
     }
     fw_data_path = build_root / FW_DATA_FILENAME
     fw_data_path.write_text(json.dumps(fw_data, indent=2) + "\n", encoding="utf-8")
@@ -440,6 +582,7 @@ def process_slcp(
     sdk_path: Path,
     runtime_xapi_path: Path | None,
     action: str,
+    sdk_selection: SDKSelection | None = None,
 ) -> dict:
     out_dir = output_dir_for(slcp, build_root)
     started_at = time.perf_counter()
@@ -465,7 +608,11 @@ def process_slcp(
         metadata_path = write_build_metadata(
             slcp=slcp,
             out_dir=out_dir,
-            image=image
+            image=image,
+            firmware_cfg=firmware_cfg,
+            sdk_path=sdk_path,
+            runtime_xapi_path=runtime_xapi_path,
+            sdk_selection=sdk_selection,
         )
 
     return {
@@ -494,11 +641,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         nargs="*",
         help="Optional .slcp files or directories. Defaults to all .slcp files under apps.",
     )
+    parser.add_argument("--config", default="", help="cms_client_config.json path")
+    parser.add_argument("--sdk-package-path", default="", help="explicit unpacked SiSDK package path")
+    parser.add_argument("--sisdk-version", default="", help="override selected SiSDK version")
+    parser.add_argument("--build-root", default="", help="override firmware build root")
+    parser.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
+    parser.add_argument("--board", default="", help="override target board")
+    parser.add_argument("--board-rev", default="", help="override target board revision")
+    parser.add_argument("--device", default="", help="override target device")
+    for tool_name in TOOL_ENV_VARS:
+        parser.add_argument(f"--{tool_name}", default="", help=f"override {tool_name} executable")
     return parser.parse_args(argv)
 
 def main(argv: list[str] | None = None) -> int:
     parsed = parse_args(list(argv if argv is not None else sys.argv[1:]))
-    build_root = resolve_build_root(None)
+    config_path = Path(parsed.config) if parsed.config else None
+    effective_config = effective_build_config(read_client_config(config_path), parsed)
+    global _TOOL_OVERRIDES
+    _TOOL_OVERRIDES = effective_config["tools"]
+    build_root = Path(effective_config["firmware"]["build_root"])
     if not build_root.is_absolute():
         build_root = (REPO_ROOT / build_root).resolve()
     total_start = time.perf_counter()
@@ -513,9 +674,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    dev_cfg = read_dev_config()
-    firmware_cfg = validate_firmware_config(dev_cfg)
-    sdk_path = resolve_sisdk_path(firmware_cfg["sisdk"])
+    firmware_cfg = validate_firmware_config(effective_config)
+    sdk_selection = resolve_sdk_selection(
+        version=firmware_cfg["sisdk"],
+        cli_package_path=parsed.sdk_package_path,
+        config_package_path=effective_config["firmware"].get("sisdk_package_path"),
+    )
+    sdk_path = sdk_selection.path
     trust_sisdk(sdk_path)
     runtime_xapi_path = None
     if parsed.action in {"build", "rebuild"}:
@@ -535,6 +700,7 @@ def main(argv: list[str] | None = None) -> int:
             sdk_path=sdk_path,
             runtime_xapi_path=runtime_xapi_path,
             action=parsed.action,
+            sdk_selection=sdk_selection,
         )
         summaries.append(summary)
         print(
@@ -555,6 +721,7 @@ def main(argv: list[str] | None = None) -> int:
             sdk_path=sdk_path,
             runtime_xapi_path=runtime_xapi_path,
             summaries=summaries,
+            sdk_selection=sdk_selection,
         )
 
     print(
