@@ -74,6 +74,12 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     build_root = tmp_path / "fw"
     runtime = build_root / "runtime"
     runtime.mkdir(parents=True)
+    dut_image = tmp_path / "dut.s37"
+    tester_image = tmp_path / "tester.s37"
+    dut_image.write_bytes(b"exact-dut-s37")
+    tester_image.write_bytes(b"exact-tester-s37")
+    dut_hash = hashlib.sha256(dut_image.read_bytes()).hexdigest()
+    tester_hash = hashlib.sha256(tester_image.read_bytes()).hexdigest()
     xapi = runtime / "sl_bt.xapi"
     xapi.write_bytes(b"exact-sdk-xapi")
     xapi_hash = hashlib.sha256(xapi.read_bytes()).hexdigest()
@@ -99,7 +105,10 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     )
     monkeypatch.setattr(
         "cms_client._discover_built_firmware",
-        lambda role, firmware_cfg: tmp_path / f"{role}.s37",
+        lambda role, firmware_cfg: {
+            "dut": dut_image,
+            "tester": tester_image,
+        }[role],
     )
     args = argparse.Namespace(
         request_json="", request_id="request", dut_image="", tester_image="",
@@ -118,8 +127,8 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     assert request.firmware.sisdk_commit == "sdk-commit"
     assert request.firmware.sisdk_hash == "sdk-hash"
     assert request.firmware.xapi_file_hash == xapi_hash
-    assert request.firmware.dut_img.sha256 == "dut-hash"
-    assert request.firmware.tester_img.sha256 == "tester-hash"
+    assert request.firmware.dut_img.sha256 == dut_hash
+    assert request.firmware.tester_img.sha256 == tester_hash
 
     args.sisdk_version = "2025.12.3"
     with pytest.raises(RuntimeError, match="does not match the firmware build provenance"):

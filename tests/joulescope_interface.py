@@ -12,6 +12,7 @@ from utils.config_loader import effective_dev_config
 
 log = logging.getLogger(__name__)
 DUT_WAKE_GPIO = 0
+USB_RESET_TIMEOUT_S = 15.0
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
@@ -330,21 +331,46 @@ def JoulescopeUsbReset(request: pytest.FixtureRequest):
     usb_id = cfg.get("js",{}).get("usb_id")
 
     if not usb_id:
-        log.warning("No js.usb_id configured; skipping Joulescope USB reset")
+        log.warning("SETUP SKIP: Joulescope USB reset; no js.usb_id configured")
         return
 
+    _reset_joulescope_usb(usb_id)
+
+
+def _reset_joulescope_usb(usb_id: str) -> None:
     # Reset the JS USB to avoid the USB driver deaklocking the whole test run
     attempts = 3
     for attempt in range(1, attempts + 1):
         try:
+            log.info(
+                "SETUP START: Joulescope USB reset id=%s attempt=%d/%d",
+                usb_id,
+                attempt,
+                attempts,
+            )
             result = subprocess.run(
-                ["sudo", "usbreset", usb_id],
+                ["sudo", "-n", "usbreset", usb_id],
                 capture_output=True,
                 text=True,
-                check=True)
-            log.info("usbreset: %s", result.stdout.strip())
+                check=True,
+                timeout=USB_RESET_TIMEOUT_S,
+            )
+            log.info(
+                "SETUP COMPLETE: Joulescope USB reset id=%s output=%s",
+                usb_id,
+                result.stdout.strip(),
+            )
             break
 
+        except subprocess.TimeoutExpired as e:
+            log.error(
+                "SETUP TIMEOUT: Joulescope USB reset id=%s timeout_s=%s",
+                usb_id,
+                USB_RESET_TIMEOUT_S,
+            )
+            raise RuntimeError(
+                f"Joulescope USB reset timed out after {USB_RESET_TIMEOUT_S:g} seconds"
+            ) from e
         except subprocess.CalledProcessError as e:
             log.error(
                 "usbreset failed: rc=%d stdout=%r stderr=%r",
@@ -358,12 +384,15 @@ def JoulescopeUsbReset(request: pytest.FixtureRequest):
 
 @pytest.fixture(scope="session")
 def JoulescopeDev(JoulescopeUsbReset):
-    log.info("Enabling Joulescope")
+    log.info("SETUP START: Joulescope driver creation")
     cfg = JoulescopeConfig(open_mode="defaults")
     js = WakePinJoulescope(**asdict(cfg))
 
     js.create_driver()
+    log.info("SETUP COMPLETE: Joulescope driver creation")
+    log.info("SETUP START: Joulescope device open")
     js.open_devices()
+    log.info("SETUP COMPLETE: Joulescope device open")
 
     yield js
 

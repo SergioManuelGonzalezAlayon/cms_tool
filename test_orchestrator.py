@@ -12,6 +12,10 @@ from pathlib import Path
 from cms_protocol import ResultType, TestCaseIdentity, TestCaseState, test_case_identity_to_dict
 
 
+# This is an executable application module, not a pytest test module.
+__test__ = False
+
+
 REPO_ROOT = Path(__file__).resolve().parent
 CONFIG_ROOT = REPO_ROOT / "tests" / "configs"
 RESULTS_DIR = REPO_ROOT / "artifacts" / "orchestrator"

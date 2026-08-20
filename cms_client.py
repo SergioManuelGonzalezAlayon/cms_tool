@@ -454,6 +454,27 @@ def _request_from_send_fw_args(
         "bootloader",
         firmware_cfg,
     ) if bootloader_image_arg or firmware_cfg.get("bootloader_app_hash") else None
+    dut_sha256 = _selected_firmware_sha256(
+        dut_image,
+        requested=args.dut_sha256,
+        fallback=str(target_cfg.get("dut_sha256", firmware_cfg.get("dut_app_hash", ""))),
+    )
+    tester_sha256 = _selected_firmware_sha256(
+        tester_image,
+        requested=args.tester_sha256,
+        fallback=str(target_cfg.get("tester_sha256", firmware_cfg.get("tester_app_hash", ""))),
+    )
+    bootloader_sha256 = (
+        _selected_firmware_sha256(
+            bootloader_image,
+            requested=args.bootloader_sha256,
+            fallback=str(
+                target_cfg.get("bootloader_sha256", firmware_cfg.get("bootloader_app_hash", ""))
+            ),
+        )
+        if bootloader_image is not None
+        else ""
+    )
     xapi_file = Path(str(fw_data.get("build", {}).get("xapi", build_root / "runtime" / "sl_bt.xapi")))
     if not xapi_file.is_file():
         raise RuntimeError(f"Staged sl_bt.xapi from the selected build does not exist: {xapi_file}")
@@ -469,23 +490,19 @@ def _request_from_send_fw_args(
             dut_img=FirmwareImage(
                 name=dut_image["name"],
                 url=dut_image["url"],
-                sha256=args.dut_sha256 or str(target_cfg.get("dut_sha256", firmware_cfg.get("dut_app_hash", ""))),
+                sha256=dut_sha256,
             ),
             tester_img=FirmwareImage(
                 name=tester_image["name"],
                 url=tester_image["url"],
-                sha256=args.tester_sha256 or str(target_cfg.get("tester_sha256", firmware_cfg.get("tester_app_hash", ""))),
+                sha256=tester_sha256,
             ),
             bootloader_img=FirmwareImage(
                 name=bootloader_image["name"],
                 url=bootloader_image["url"],
-                sha256=args.bootloader_sha256 or str(
-                    target_cfg.get("bootloader_sha256", firmware_cfg.get("bootloader_app_hash", ""))
-                ),
+                sha256=bootloader_sha256,
             ) if bootloader_image is not None else None,
-            bootloader_img_hash=args.bootloader_sha256 or str(
-                target_cfg.get("bootloader_sha256", firmware_cfg.get("bootloader_app_hash", ""))
-            ),
+            bootloader_img_hash=bootloader_sha256,
             board=args.board or str(target_cfg.get("board", firmware_cfg.get("board", ""))),
             device=args.device or str(target_cfg.get("device", firmware_cfg.get("device", ""))),
             xapi_file=FirmwareImage(
@@ -557,6 +574,22 @@ def _firmware_image_from_arg(value: str, role: str, firmware_cfg: dict[str, Any]
         return {"name": value.rstrip("/").rsplit("/", 1)[-1], "url": value}
     path = Path(value) if value else _discover_built_firmware(role, firmware_cfg)
     return {"name": path.name, "url": str(path)}
+
+
+def _selected_firmware_sha256(
+    image: dict[str, str],
+    *,
+    requested: str,
+    fallback: str,
+) -> str:
+    """Hash the exact local image that will be uploaded to the Bench."""
+
+    if requested:
+        return requested
+    source = image["url"]
+    if source.startswith("http://") or source.startswith("https://"):
+        return fallback
+    return _sha256_file(Path(source))
 
 
 def _sha256_file(path: Path) -> str:

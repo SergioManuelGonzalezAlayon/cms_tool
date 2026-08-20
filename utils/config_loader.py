@@ -44,8 +44,8 @@ def _resolve_explicit_path(env_name: str) -> Path | None:
 def _default_path(filename: str) -> Path:
     return REPO_ROOT / filename
 
-def _load_json(path: Path) -> dict:
-    raw = path.read_text(encoding="utf-8-sig")
+def _load_json(path: str | Path) -> dict:
+    raw = Path(path).read_text(encoding="utf-8-sig")
     try:
         return json.loads(raw)
     except json.JSONDecodeError:

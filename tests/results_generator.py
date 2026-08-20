@@ -306,6 +306,39 @@ def _build_window_rows(analyzer) -> list[dict]:
     return rows
 
 
+def _select_plot_window(
+    window_rows: list[dict],
+    plot_metadata: dict | None = None,
+) -> dict | None:
+    """Select the outlier or reference result row used for a representative plot."""
+
+    if not window_rows:
+        return None
+
+    selected = next((row for row in window_rows if row.get("is_outlier")), None)
+    selection_reason = "outlier_window"
+
+    if selected is None and plot_metadata is not None:
+        reference_index = plot_metadata.get("reference_window_index")
+        if reference_index is not None:
+            reference_window_number = int(reference_index) + 1
+            selected = next(
+                (
+                    row
+                    for row in window_rows
+                    if int(row.get("window_index", -1)) == reference_window_number
+                ),
+                None,
+            )
+            selection_reason = "reference_window"
+
+    if selected is None:
+        selected = window_rows[0]
+        selection_reason = "first_window"
+
+    return {"selection_reason": selection_reason, **selected}
+
+
 def write_result_json(
     *,
     profile,

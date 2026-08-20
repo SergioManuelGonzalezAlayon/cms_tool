@@ -220,7 +220,9 @@ def _flash(image: Path, probe_sn: str, *, commander: str | None = None):
             "Required tool 'commander' not found on PATH. "
             "Ensure Simplicity Studio CLI tools are installed or configured."
         )
+    log.info("SETUP START: firmware flash image=%s probe=%s", image, probe_sn)
     subprocess.run([exe, "flash", str(image), "--serialno", probe_sn], check=True, text=True)
+    log.info("SETUP COMPLETE: firmware flash image=%s probe=%s", image, probe_sn)
 
 
 def _file_sha256(path: Path) -> str:
@@ -353,13 +355,14 @@ def _wait_for_serial_port(serial_port):
     if not serial_port:
         raise RuntimeError("Missing serial port")
 
+    log.info("SETUP START: serial-port readiness port=%s", serial_port)
     deadline = time.monotonic() + 15
 
     while time.monotonic() < deadline:
         if Path(serial_port).exists():
             try:
                 with Serial(serial_port, timeout=0.2):
-                    log.info("Waiting for serial port %s", serial_port)
+                    log.info("SETUP COMPLETE: serial-port readiness port=%s", serial_port)
                     return
             except SerialException:
                 pass
