@@ -4,18 +4,21 @@
     },
     "advertiser": {
         "interval": 20,
-        "payload": 10
+        "payload": 10,
+        "phy": "1m"
     },
     "scanner": {
         "interval": 100,
-        "window": 50
+        "window": 50,
+        "phy": "1m"
     },
     "connection": {
         "interval": 15,
         "latency": 0,
+        "timeout": 10,
         "tx_payload_length": 10,
         "rx_payload_length": 23,
-        "phy": "1mbps",
+        "phy": "1m",
         "tx_power": 0
     },
     "firmware": {

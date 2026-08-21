@@ -16,6 +16,36 @@ UNIT_SCALE = {
     "s": Decimal("1000"),
     "bytes": Decimal("1"),
 }
+CONN_INTERVAL_UNIT_MS = Decimal("1.25")
+CONN_TIMEOUT_UNIT_MS = Decimal("10")
+CONN_TIMEOUT_MIN_UNITS = 0x000A
+CONN_TIMEOUT_MAX_UNITS = 0x0C80
+PAWR_PHY_BYTE_TIME_MS = {
+    "1m": 0.008,
+    "2m": 0.004,
+}
+ADVERTISING_PHY_PATH = "advertiser.phy"
+SCANNER_PHY_PATH = "scanner.phy"
+ADVERTISING_PHY_EXPANSIONS = {
+    "1m": {
+        ADVERTISING_PHY_PATH: "1m",
+        "advertiser.primary_phy": "1m",
+        "advertiser.secondary_phy": "1m",
+        SCANNER_PHY_PATH: "1m",
+    },
+    "2m": {
+        ADVERTISING_PHY_PATH: "2m",
+        "advertiser.primary_phy": "1m",
+        "advertiser.secondary_phy": "2m",
+        SCANNER_PHY_PATH: "1m",
+    },
+    "coded": {
+        ADVERTISING_PHY_PATH: "coded",
+        "advertiser.primary_phy": "coded",
+        "advertiser.secondary_phy": "coded",
+        SCANNER_PHY_PATH: "coded",
+    },
+}
 
 
 def load_json(path: Path) -> dict:
@@ -75,12 +105,94 @@ def set_path(config: dict, path: str, value) -> None:
     current[parts[-1]] = value
 
 
-def apply_value(config: dict, parameter: dict, raw_value) -> None:
-    config_path = parameter["config_path"]
-    if parameter["name"] == "dcdc":
-        set_path(config, config_path, parameter["options"][raw_value])
+def normalized_phy_value(value) -> str | None:
+    if isinstance(value, str):
+        return value.strip().lower().replace(" ", "")
+    return None
+
+
+def apply_advertising_phy_expansion(config: dict, parameter: dict, raw_value) -> None:
+    paths = parameter.get("config_paths")
+    if paths is None:
+        paths = [parameter.get("config_path")]
+
+    if parameter.get("name") != "phy" or ADVERTISING_PHY_PATH not in paths:
         return
-    set_path(config, config_path, raw_value)
+
+    path_values = parameter.get("config_path_values", {})
+    if ADVERTISING_PHY_PATH in path_values or SCANNER_PHY_PATH in path_values:
+        return
+
+    expansion = ADVERTISING_PHY_EXPANSIONS.get(normalized_phy_value(raw_value))
+    if expansion is None:
+        return
+
+    for path, value in expansion.items():
+        if path == SCANNER_PHY_PATH and SCANNER_PHY_PATH not in paths:
+            continue
+        set_path(config, path, value)
+
+
+def connection_interval_units(milliseconds) -> int:
+    return int((Decimal(str(milliseconds)) / CONN_INTERVAL_UNIT_MS).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def connection_ms_from_units(units: int) -> Decimal:
+    return Decimal(units) * CONN_INTERVAL_UNIT_MS
+
+
+def supervision_timeout_units(interval_ms, latency=0) -> int:
+    interval_units = connection_interval_units(interval_ms)
+    rounded_interval_ms = connection_ms_from_units(interval_units)
+    minimum_ms = Decimal(1 + int(latency)) * rounded_interval_ms * Decimal("2")
+    timeout_units = max(CONN_TIMEOUT_MIN_UNITS, int(minimum_ms / CONN_TIMEOUT_UNIT_MS) + 1)
+    if timeout_units > CONN_TIMEOUT_MAX_UNITS:
+        raise ValueError(
+            "Connection interval/latency require supervision timeout "
+            f"{timeout_units} (10 ms units), above BLE maximum {CONN_TIMEOUT_MAX_UNITS}"
+        )
+    return timeout_units
+
+
+def finalize_config(config: dict) -> None:
+    connection = config.get("connection")
+    if not connection or "interval" not in connection:
+        return
+    connection["timeout"] = supervision_timeout_units(
+        connection["interval"],
+        connection.get("latency", 0),
+    )
+
+
+def pawr_phy_byte_time_ms(phy) -> float:
+    if isinstance(phy, int):
+        if phy == 1:
+            return PAWR_PHY_BYTE_TIME_MS["1m"]
+        if phy == 2:
+            return PAWR_PHY_BYTE_TIME_MS["2m"]
+    if isinstance(phy, str):
+        normalized = phy.strip().lower().replace(" ", "")
+        if normalized in PAWR_PHY_BYTE_TIME_MS:
+            return PAWR_PHY_BYTE_TIME_MS[normalized]
+    raise ValueError(f"Unsupported PAWR PHY: {phy!r}")
+
+
+def apply_value(config: dict, parameter: dict, raw_value) -> None:
+    paths = parameter.get("config_paths")
+
+    if paths is None:
+        paths = [parameter["config_path"]]
+
+    if parameter["name"] == "dcdc":
+        value = parameter["options"][raw_value]
+    else:
+        value = raw_value
+
+    for path in paths:
+        path_values = parameter.get("config_path_values", {}).get(path, {})
+        path_value = path_values.get(str(value), value)
+        set_path(config, path, path_value)
+    apply_advertising_phy_expansion(config, parameter, value)
 
 
 def quantity_to_runtime(value: Decimal, default_unit: str):
@@ -208,6 +320,71 @@ def discover_parameter_files(root: Path) -> list[Path]:
 def selected_modes(mode: str) -> set[str]:
     return {"one_factor", "full_sweep"} if mode == "both" else {mode}
 
+def is_pawr_config_valid(response_slot_number,
+                         subevent_number,
+                         subevent_interval,
+                         pawr_interval,
+                         response_slot_delay,
+                         response_slot_spacing,
+                         payload_size,
+                         phy,
+                         t_ifs = 0.150):
+    overhead_bytes = (
+        1 + # Preamble
+        4 + # Access Address
+        2 + # LL header
+        3   # CRC
+    )
+
+    byte_time_ms = pawr_phy_byte_time_ms(phy)
+
+    used_airtime_per_payload = (overhead_bytes + payload_size)* byte_time_ms
+    if(used_airtime_per_payload + t_ifs > response_slot_spacing):
+       return False
+
+    used_airtime_per_subevent_interval = response_slot_number * (response_slot_spacing + t_ifs) + (response_slot_delay + t_ifs)
+    if(used_airtime_per_subevent_interval > subevent_interval):
+        return False
+
+    used_airtime_per_pawr_interval = subevent_number * used_airtime_per_subevent_interval
+    if(used_airtime_per_pawr_interval > pawr_interval):
+        return False
+    
+    return True
+
+
+def is_generated_pawr_config_valid(config: dict) -> bool:
+    pawr = config.get("pawr")
+    if not pawr:
+        return True
+
+    advertiser = config.get("advertiser", {})
+    try:
+        payload_size = max(
+            int(advertiser.get("payload", 0)),
+            int(pawr.get("rx_payload_length", 0)),
+        )
+        phy = advertiser.get("secondary_phy", advertiser.get("phy", "1m"))
+        return is_pawr_config_valid(
+            int(pawr["response_slots"]),
+            int(pawr["num_subevents"]),
+            int(pawr["subevent_interval"]),
+            int(pawr["interval"]),
+            int(pawr["response_slot_delay"]),
+            int(pawr["response_slot_spacing"]),
+            payload_size,
+            phy,
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def write_generated_config(config: dict, output_path: Path) -> bool:
+    if not is_generated_pawr_config_valid(config):
+        return False
+    output_path.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
+    return True
+
 
 def generate_config_matrix(config_dir: Path, *, modes: set[str]) -> dict:
     parameter_file = config_dir / "parameters.json"
@@ -230,11 +407,12 @@ def generate_config_matrix(config_dir: Path, *, modes: set[str]) -> dict:
             for point in points:
                 config = deepcopy(default_config)
                 apply_value(config, parameter, point["runtime"])
+                finalize_config(config)
                 stem = one_factor_name(parameter, point)
                 config["test"] = {"name": stem}
                 output_path = output_dir / f"{stem}.json"
-                output_path.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
-                one_factor_count += 1
+                if write_generated_config(config, output_path):
+                    one_factor_count += 1
 
     full_sweep_count = 0
     full_sweep = analyses.get("full_sweep", {})
@@ -260,13 +438,14 @@ def generate_config_matrix(config_dir: Path, *, modes: set[str]) -> dict:
                 segment = full_sweep_segment(parameter, point)
                 if segment:
                     segments.append(segment)
+            finalize_config(config)
             stem = schema["generator"]["name_separator"].join(segments)
             config["test"] = {"name": stem}
             target_dir = partition_directory(sweep_dir, full_sweep, combination, ordered_parameters)
             target_dir.mkdir(parents=True, exist_ok=True)
             output_path = target_dir / f"{stem}.json"
-            output_path.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
-            full_sweep_count += 1
+            if write_generated_config(config, output_path):
+                full_sweep_count += 1
 
     return {
         "config_dir": str(config_dir),
@@ -352,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"{parameter_file.parent}: "
                 f"one_factor={summary['one_factor_count']} "
-                f"full_sweep={summary['full_sweep_count']}"
+                f"full_sweep={summary['full_sweep_count']} "
             )
 
     print(

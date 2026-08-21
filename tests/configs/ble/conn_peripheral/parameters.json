@@ -85,14 +85,29 @@
             "name": "phy",
             "label": "Phy",
             "control": "bgapi",
-            "default": "1mbps",
+            "default": "1m",
             "file_token": "phy",
-            "config_path": "connection.phy",
+            "config_paths": [
+                "advertiser.phy",
+                "scanner.phy",
+                "connection.phy"
+            ],
+            "config_path_values": {
+                "advertiser.phy": {
+                    "coded": "coded",
+                    "1m": "1m",
+                    "2m": "1m"
+                },
+                "scanner.phy": {
+                    "coded": "coded",
+                    "1m": "1m",
+                    "2m": "1m"
+                }
+            },
             "values": [
-                "125kbps",
-                "500kbps",
-                "1000kbps",
-                "2000kbps"
+                "coded",
+                "1m",
+                "2m"
             ]
         },
         {

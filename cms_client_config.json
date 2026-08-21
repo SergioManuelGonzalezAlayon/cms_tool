@@ -7,13 +7,20 @@
         "timeout_s": 30.0
     },
     "tools": {
+        "slt": "C:\\\\path\\\\to\\\\slt.exe",
         "slc": "C:\\\\path\\\\to\\\\slc.exe",
-        "cmake": "C:\\\\path\\\\to\\\\cmake.exe"
+        "cmake": "C:\\\\path\\\\to\\\\cmake.exe",
+        "commander": "C:\\\\path\\\\to\\\\commander.exe"
+    },
+    "build": {
+        "root": ".fw_build",
+        "bootloader_slcp": "apps/bootloader-uart-bgapi.slcp"
     },
     "target": {
         "board": "brd4182a",
         "board_rev": "a06",
         "device": "EFR32MG22C224F512IM40",
-        "sisdk": "2025.12.0"
+        "sisdk": "2025.12.3",
+        "sisdk_package_path": ""
     }
 }

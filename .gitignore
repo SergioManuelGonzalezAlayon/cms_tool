@@ -9,3 +9,5 @@ artifacts/
 __pycache__/
 *.egg-info/
 dev_config.json
+tests/configs/*/*/full_sweep/**
+tools/**

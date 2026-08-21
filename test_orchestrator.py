@@ -1,10 +1,19 @@
 import argparse
+import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+
+from cms_protocol import ResultType, TestCaseIdentity, TestCaseState, test_case_identity_to_dict
+
+
+# This is an executable application module, not a pytest test module.
+__test__ = False
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -31,6 +40,10 @@ class Job:
     dut_image_sha256: str = ""
     tester_image_sha256: str = ""
     cms_fw_metadata: str = ""
+    config_hash: str = ""
+    measurement_id: str = ""
+    run_name: str = ""
+    measurement_created_at: str = ""
 
     @property
     def job_id(self) -> str:
@@ -102,13 +115,21 @@ def discover_config_files(config_dir: Path, mode: str) -> list[Path]:
     return config_files
 
 
-def cms_firmware_metadata(path: str) -> dict:
+def cms_execution_metadata(path: str) -> dict:
     if not path:
         return {}
     metadata_path = Path(path)
     if not metadata_path.exists():
         raise FileNotFoundError(f"CMS firmware metadata does not exist: {metadata_path}")
-    return load_json(metadata_path).get("firmware", {})
+    return load_json(metadata_path)
+
+
+def cms_firmware_metadata(path: str) -> dict:
+    return cms_execution_metadata(path).get("firmware", {})
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def build_jobs(
@@ -119,7 +140,9 @@ def build_jobs(
     partition_filters: set[str],
     cms_metadata_path: str = "",
 ) -> list[Job]:
-    cms_firmware = cms_firmware_metadata(cms_metadata_path)
+    cms_metadata = cms_execution_metadata(cms_metadata_path)
+    cms_firmware = cms_metadata.get("firmware", {})
+    measurement_identity = cms_metadata.get("identity", {})
     jobs: list[Job] = []
     for parameter_file in discover_parameter_files(targets):
         config_dir = parameter_file.parent
@@ -156,6 +179,10 @@ def build_jobs(
                     dut_image_sha256=str(cms_firmware.get("dut_image_sha256", "")),
                     tester_image_sha256=str(cms_firmware.get("tester_image_sha256", "")),
                     cms_fw_metadata=cms_metadata_path,
+                    config_hash=sha256_file(config_path),
+                    measurement_id=str(measurement_identity.get("measurement_id", "")),
+                    run_name=str(measurement_identity.get("run_name", "")),
+                    measurement_created_at=str(measurement_identity.get("created_at", "")),
                 )
             )
     return sorted(jobs, key=job_sort_key)
@@ -183,23 +210,152 @@ def job_sort_key(job: Job):
     )
 
 
-def completed_job_ids(results_log: Path) -> set[str]:
+def completed_job_records(results_log: Path) -> list[dict]:
     if not results_log.exists():
-        return set()
-    completed: set[str] = set()
+        return []
+    completed: list[dict] = []
     for line in results_log.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         record = json.loads(line)
-        if record.get("status") == "passed":
-            completed.add(record["job_id"])
+        record_type = record.get("record_type")
+        if record_type == "job_completed" or (
+            record_type is None and record.get("status") in {"passed", "failed"}
+        ):
+            completed.append(record)
     return completed
+
+
+def completed_job_ids(results_log: Path) -> set[str]:
+    """Return passed job IDs for resume, including legacy completion records."""
+    return {
+        str(record["job_id"])
+        for record in completed_job_records(results_log)
+        if record.get("status") == TestCaseState.PASSED.value and record.get("job_id")
+    }
 
 
 def append_result(results_log: Path, record: dict) -> None:
     results_log.parent.mkdir(parents=True, exist_ok=True)
     with results_log.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
+
+
+def plan_path_for_results(results_log: Path) -> Path:
+    return results_log.with_name("orchestrator_plan.json")
+
+
+def sanitized_config_identity(config: str) -> str:
+    config_without_suffix = Path(config).with_suffix("").as_posix()
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "-", config_without_suffix).strip("-").lower()
+    return sanitized[:100].rstrip("-") or "config"
+
+
+def junit_path_for_job(results_log: Path, job: Job, ordinal: int) -> Path:
+    filename = f"{ordinal:04d}-{sanitized_config_identity(job.cfg_arg)}.xml"
+    return results_log.parent / "junit" / filename
+
+
+def job_record(
+    job: Job,
+    ordinal: int,
+    total_jobs: int,
+    junit_path: Path | None = None,
+) -> dict:
+    record = asdict(job)
+    record["config_path"] = str(job.config_path)
+    record["cfg_path"] = str(job.config_path)
+    if junit_path is not None:
+        record["junit_path"] = str(junit_path)
+    record.update(
+        test_case_identity_to_dict(
+            TestCaseIdentity(
+                job_id=job.job_id,
+                ordinal=ordinal,
+                total_jobs=total_jobs,
+                feature=job.feature,
+                config=job.cfg_arg,
+                config_hash=job.config_hash,
+                mode=job.mode,
+                partition=job.partition,
+            )
+        )
+    )
+    return record
+
+
+def build_job_plan(jobs: list[Job], results_log: Path | None = None) -> dict:
+    total_jobs = len(jobs)
+    return {
+        "record_type": "job_plan",
+        "schema_version": 1,
+        "total_jobs": total_jobs,
+        "jobs": [
+            {
+                **job_record(
+                    job,
+                    ordinal,
+                    total_jobs,
+                    junit_path_for_job(results_log, job, ordinal) if results_log is not None else None,
+                ),
+                "status": TestCaseState.PENDING.value,
+            }
+            for ordinal, job in enumerate(jobs, start=1)
+        ],
+    }
+
+
+def write_job_plan(results_log: Path, jobs: list[Job]) -> Path:
+    plan_path = plan_path_for_results(results_log)
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(json.dumps(build_job_plan(jobs, results_log), indent=2) + "\n", encoding="utf-8")
+    return plan_path
+
+
+def job_started_record(
+    job: Job,
+    ordinal: int,
+    total_jobs: int,
+    started_at: str,
+    junit_path: Path,
+) -> dict:
+    record = job_record(job, ordinal, total_jobs, junit_path)
+    record.update(
+        {
+            "record_type": "job_started",
+            "timestamp": started_at,
+            "started_at": started_at,
+            "status": TestCaseState.RUNNING.value,
+        }
+    )
+    return record
+
+
+def job_completed_record(
+    job: Job,
+    ordinal: int,
+    total_jobs: int,
+    returncode: int,
+    duration_s: float,
+    started_at: str,
+    finished_at: str,
+    junit_path: Path,
+) -> dict:
+    status = TestCaseState.PASSED if returncode == 0 else TestCaseState.FAILED
+    record = job_record(job, ordinal, total_jobs, junit_path)
+    record.update(
+        {
+            "record_type": "job_completed",
+            "timestamp": finished_at,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "exit_code": returncode,
+            "duration_s": round(duration_s, 3),
+            "status": status.value,
+            "result_type": ResultType.PYTEST_JUNIT.value,
+        }
+    )
+    return record
 
 
 def print_plan(jobs: list[Job]) -> None:
@@ -240,11 +396,13 @@ def run_config_manager(mode: str, targets: list[Path]) -> None:
     subprocess.run(cmd, cwd=REPO_ROOT, check=True, text=True)
 
 
-def run_job(job: Job, pytest_args: list[str]) -> tuple[int, float]:
+def run_job(job: Job, pytest_args: list[str], junit_path: Path) -> tuple[int, float]:
     cmd = [
         sys.executable,
         "-m",
         "pytest",
+        "-o",
+        "addopts=",
         job.nodeid,
         "--cfg",
         job.cfg_arg,
@@ -253,9 +411,35 @@ def run_job(job: Job, pytest_args: list[str]) -> tuple[int, float]:
         "--log-cli-level=INFO",
     ]
     cmd.extend(pytest_args)
+    junit_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd.extend(["--junitxml", str(junit_path)])
     started = time.perf_counter()
     result = subprocess.run(cmd, cwd=REPO_ROOT, check=False, text=True)
     return result.returncode, time.perf_counter() - started
+
+
+def strip_forwarded_cfg_args(pytest_args: list[str]) -> tuple[list[str], list[str]]:
+    """Drop forwarded pytest --cfg values so orchestrated jobs keep their own config."""
+    stripped: list[str] = []
+    removed: list[str] = []
+    index = 0
+    while index < len(pytest_args):
+        arg = pytest_args[index]
+        if arg == "--cfg":
+            if index + 1 < len(pytest_args):
+                removed.append(pytest_args[index + 1])
+                index += 2
+            else:
+                removed.append("")
+                index += 1
+            continue
+        if arg.startswith("--cfg="):
+            removed.append(arg.split("=", 1)[1])
+            index += 1
+            continue
+        stripped.append(arg)
+        index += 1
+    return stripped, removed
 
 
 def parse_args_with_pytest(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -320,6 +504,13 @@ def parse_args_with_pytest(argv: list[str]) -> tuple[argparse.Namespace, list[st
         default="",
         help="Firmware metadata generated by the CMS daemon for a remote pytest run.",
     )
+    parser.add_argument(
+        "--upload-results-to-database",
+        action="store_true",
+        default=False,
+        help="Upload generated results JSON files to the configured database/data lake.",
+    )
+
     parsed, pytest_args = parser.parse_known_args(argv)
     return parsed, pytest_args
 
@@ -330,6 +521,8 @@ def cms_pytest_args(parsed: argparse.Namespace) -> list[str]:
         args.extend(["--cms-runtime-config", parsed.cms_runtime_config])
     if parsed.cms_fw_metadata:
         args.extend(["--cms-fw-metadata", parsed.cms_fw_metadata])
+    if parsed.upload_results_to_database:
+        args.append("--upload-results-to-database")
     return args
 
 
@@ -337,6 +530,12 @@ def main(argv: list[str] | None = None) -> int:
     parsed, pytest_args = parse_args_with_pytest(list(argv if argv is not None else sys.argv[1:]))
     targets = [Path(target) for target in parsed.targets]
     results_log = Path(parsed.results_log)
+    pytest_args, ignored_cfg_args = strip_forwarded_cfg_args(pytest_args)
+    if ignored_cfg_args:
+        print(
+            "Ignoring forwarded --cfg argument(s); "
+            "test_orchestrator selects configs from discovered jobs."
+        )
     pytest_args = [*cms_pytest_args(parsed), *pytest_args]
 
     if parsed.generate:
@@ -353,6 +552,14 @@ def main(argv: list[str] | None = None) -> int:
         print("No orchestrated jobs found.")
         return 1
 
+    plan_path = write_job_plan(results_log, jobs)
+    print(f"Wrote complete job plan: {plan_path}")
+    planned_positions = {job.job_id: (ordinal, len(jobs)) for ordinal, job in enumerate(jobs, start=1)}
+    junit_paths = {
+        job.job_id: junit_path_for_job(results_log, job, ordinal)
+        for ordinal, job in enumerate(jobs, start=1)
+    }
+
     if parsed.resume:
         done = completed_job_ids(results_log)
         jobs = [job for job in jobs if job.job_id not in done]
@@ -365,33 +572,29 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     failures = 0
-    for index, job in enumerate(jobs, start=1):
-        print(f"\nRunning {index}/{len(jobs)}: {job.nodeid} --cfg {job.cfg_arg}")
-        returncode, duration_s = run_job(job, pytest_args)
-        status = "passed" if returncode == 0 else "failed"
+    for job in jobs:
+        ordinal, total_jobs = planned_positions[job.job_id]
+        junit_path = junit_paths[job.job_id]
+        print(f"\nRunning {ordinal}/{total_jobs}: {job.nodeid} --cfg {job.cfg_arg}")
+        started_at = datetime.now(timezone.utc).isoformat()
         append_result(
             results_log,
-            {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "job_id": job.job_id,
-                "nodeid": job.nodeid,
-                "cfg_path": str(job.config_path),
-                "cfg_arg": job.cfg_arg,
-                "mode": job.mode,
-                "partition": job.partition,
-                "dut_slcp": job.dut_slcp,
-                "tester_slcp": job.tester_slcp,
-                "board": job.board,
-                "supply_v": job.supply_v,
-                "dut_image": job.dut_image,
-                "tester_image": job.tester_image,
-                "dut_image_sha256": job.dut_image_sha256,
-                "tester_image_sha256": job.tester_image_sha256,
-                "cms_fw_metadata": job.cms_fw_metadata,
-                "exit_code": returncode,
-                "duration_s": round(duration_s, 3),
-                "status": status,
-            },
+            job_started_record(job, ordinal, total_jobs, started_at, junit_path),
+        )
+        returncode, duration_s = run_job(job, pytest_args, junit_path)
+        finished_at = datetime.now(timezone.utc).isoformat()
+        append_result(
+            results_log,
+            job_completed_record(
+                job,
+                ordinal,
+                total_jobs,
+                returncode,
+                duration_s,
+                started_at,
+                finished_at,
+                junit_path,
+            ),
         )
         if returncode != 0:
             failures += 1

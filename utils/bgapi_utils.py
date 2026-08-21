@@ -14,11 +14,19 @@ log = logging.getLogger(__name__)
 
 ADV_INTERVAL_UNIT_MS = Decimal("0.625")
 CONN_INTERVAL_UNIT_MS = Decimal("1.25")
+CONN_SUPERVISION_TIMEOUT_UNIT_MS = Decimal("10")
 ADV_DURATION_UNIT_MS = Decimal("10")
 ADV_INTERVAL_MIN_UNITS = 0x20
 ADV_INTERVAL_MAX_UNITS = 0xFFFFFF
 CONN_INTERVAL_MIN_UNITS = 0x0006
 CONN_INTERVAL_MAX_UNITS = 0x0C80
+CONN_TIMEOUT_MIN_UNITS = 0x000A
+CONN_TIMEOUT_MAX_UNITS = 0x0C80
+PHY_1M = 0x1
+PHY_2M = 0x2
+PHY_CODED = 0x4
+PHY_1M_AND_CODED = PHY_1M | PHY_CODED
+PHY_ANY = 0xFF
 
 
 class BGAPIEventTimeoutError(RuntimeError):
@@ -57,7 +65,9 @@ class AdvertiserConfig:
     max_interval: int = 200
     interval: int | None = None
     payload: int = 20
-    phy: str | int = "1mbps"
+    phy: str | int = "1m"
+    primary_phy: str | int | None = None
+    secondary_phy: str | int | None = None
     tx_power: int | float = 0
     duration: int = 0
     max_events: int = 0
@@ -67,7 +77,7 @@ class AdvertiserConfig:
 class ScannerConfig:
     window: int = 50
     interval: int = 100
-    phy: str | int = "1mbps"
+    phy: str | int = "1m"
 
 
 @dataclass
@@ -118,6 +128,12 @@ def ms_from_bgapi_units(units: int, unit_ms: Decimal) -> Decimal:
     return Decimal(units) * unit_ms
 
 
+def _json_number_from_decimal(value: Decimal) -> int | float:
+    if value == value.to_integral_value():
+        return int(value)
+    return float(value)
+
+
 def advertising_units_from_ms(milliseconds) -> int:
     return bgapi_units_from_ms(milliseconds, ADV_INTERVAL_UNIT_MS)
 
@@ -142,28 +158,73 @@ def advertising_tx_power_from_dbm(value: int | float | Decimal) -> int:
     return int((Decimal(str(value)) * Decimal("10")).to_integral_value(rounding=ROUND_HALF_UP))
 
 
+def connection_tx_power_from_dbm(value: int | float | Decimal) -> int:
+    return int(Decimal(str(value)).to_integral_value(rounding=ROUND_HALF_UP))
+
+
 def advertising_phy_from_str(value: str | int) -> int:
     if isinstance(value, int):
         return value
 
     normalized = value.strip().lower().replace(" ", "")
     phy_map = {
-        "1mbps": 0x1,
-        "1000kbps": 0x1,
-        "1m": 0x1,
-        "2mbps": 0x2,
-        "2000kbps": 0x2,
-        "2m": 0x2,
-        "125kbps": 0x4,
-        "500kbps": 0x4,
-        "coded": 0x4,
-        "longrange": 0x4,
-        "any": 0xFF,
+        "1m": PHY_1M,
+        "2m": PHY_2M,
+        "coded": PHY_CODED,
     }
     try:
         return phy_map[normalized]
     except KeyError as exc:
         raise ValueError(f"Unsupported advertiser phy: {value!r}") from exc
+
+
+def advertising_phy_to_str(phy: str | int) -> str:
+    phy = advertising_phy_from_str(phy)
+    phy_map = {
+        PHY_1M: "1M",
+        PHY_2M: "2M",
+        PHY_CODED: "Coded",
+        PHY_1M_AND_CODED: "1M+Coded",
+    }
+    return phy_map.get(phy, str(phy))
+
+
+def scanner_phy_from_str(value: str | int) -> int:
+    if isinstance(value, str) and value.strip().lower().replace(" ", "") == "any":
+        return PHY_1M_AND_CODED
+
+    phy = advertising_phy_from_str(value)
+    if phy == PHY_2M:
+        raise ValueError(
+            "Scanning is not supported on the 2M PHY. "
+            "Regenerate the test configuration so scanner.phy uses a valid discovery PHY."
+        )
+    return phy
+
+
+def primary_advertising_phy(phy: str | int) -> int:
+    phy = advertising_phy_from_str(phy)
+    if phy == PHY_2M:
+        raise ValueError("2M is not valid as an advertising primary PHY")
+    return phy
+
+
+def secondary_advertising_phy(phy: str | int) -> int:
+    return advertising_phy_from_str(phy)
+
+
+def connection_open_phy(phy: str | int) -> int:
+    phy = advertising_phy_from_str(phy)
+    if phy == PHY_2M:
+        return PHY_1M
+    return phy
+
+
+def discovery_scan_phy_for_advertiser(phy: str | int) -> int:
+    phy = primary_advertising_phy(phy)
+    if phy == PHY_CODED:
+        return PHY_1M_AND_CODED
+    return PHY_1M
 
 
 def random_payload_bytes(payload_length: int) -> bytes:
@@ -188,7 +249,15 @@ def normalize_advertiser_config(config: AdvertiserConfig) -> AdvertiserConfig:
         raise ValueError(
             f"Advertising max_interval must be >= min_interval, got {max_interval_ms!r} ms < {min_interval_ms!r} ms"
         )
-    config.phy = advertising_phy_from_str(config.phy)
+    legacy_phy = advertising_phy_from_str(config.phy)
+    config.secondary_phy = secondary_advertising_phy(
+        config.secondary_phy if config.secondary_phy is not None else legacy_phy
+    )
+    default_primary_phy = PHY_1M if config.secondary_phy == PHY_2M else config.secondary_phy
+    config.primary_phy = primary_advertising_phy(
+        config.primary_phy if config.primary_phy is not None else default_primary_phy
+    )
+    config.phy = config.secondary_phy
     config.tx_power = advertising_tx_power_from_dbm(config.tx_power)
     if config.duration < 0:
         raise ValueError(f"Advertising duration must be >= 0, got {config.duration}")
@@ -201,7 +270,7 @@ def normalize_advertiser_config(config: AdvertiserConfig) -> AdvertiserConfig:
 def normalize_scanner_config(config: ScannerConfig) -> ScannerConfig:
     config.interval = advertising_units_from_ms(config.interval)
     config.window = advertising_units_from_ms(config.window)
-    config.phy = advertising_phy_from_str(config.phy)
+    config.phy = scanner_phy_from_str(config.phy)
     return config
 
 
@@ -224,25 +293,44 @@ def normalize_connection_parameters(params: ConnectionParameters) -> ConnectionP
     if params.timeout <= 0:
         log.warning("Connection supervision timeout %s is invalid. Using 100 (1.0 s).", params.timeout)
         params.timeout = 100
-    # BLE stack constraint for supervision timeout:
-    # timeout_ms must be > (1 + latency) * max_interval_ms * 2
-    # and timeout units must be in [0x000a, 0x0c80] (10 ms units).
-    if params.timeout < 0x000A or params.timeout > 0x0C80:
+    if params.timeout < CONN_TIMEOUT_MIN_UNITS or params.timeout > CONN_TIMEOUT_MAX_UNITS:
         raise ValueError(
-            f"Connection supervision timeout must be between 10 and 3200 (10 ms units), got {params.timeout}"
+            "Connection supervision timeout must be between "
+            f"{CONN_TIMEOUT_MIN_UNITS} and {CONN_TIMEOUT_MAX_UNITS} (10 ms units), got {params.timeout}"
         )
+    # BLE stack constraint for supervision timeout:
+    # timeout_ms must be > (1 + latency) * max_interval_ms * 2.
     max_interval_ms = connection_ms_from_units(params.max_interval)
-    timeout_ms = Decimal(params.timeout) * Decimal("10")
+    timeout_ms = Decimal(params.timeout) * CONN_SUPERVISION_TIMEOUT_UNIT_MS
     min_timeout_ms_exclusive = Decimal(1 + params.latency) * max_interval_ms * Decimal("2")
     if timeout_ms <= min_timeout_ms_exclusive:
+        required_timeout = int(min_timeout_ms_exclusive / CONN_SUPERVISION_TIMEOUT_UNIT_MS) + 1
         raise ValueError(
             "Connection supervision timeout is too small: "
-            f"timeout={timeout_ms} ms must be > {(1 + params.latency)} * {max_interval_ms} ms * 2 "
-            f"(minimum strictly greater than {min_timeout_ms_exclusive} ms)"
+            f"timeout={params.timeout} ({timeout_ms} ms) must be > "
+            f"{(1 + params.latency)} * {max_interval_ms} ms * 2 "
+            f"(minimum valid value is {required_timeout} in 10 ms units). "
+            "Regenerate the test configuration so connection.timeout is derived from connection.interval."
         )
-    params.tx_power = advertising_tx_power_from_dbm(params.tx_power)
+    params.tx_power = connection_tx_power_from_dbm(params.tx_power)
     params.phy = advertising_phy_from_str(params.phy)
     return params
+
+
+def sync_connection_config_actuals(config: dict, params: ConnectionParameters) -> None:
+    connection = config.get("connection")
+    if not isinstance(connection, dict):
+        return
+
+    actual_min_interval = _json_number_from_decimal(connection_ms_from_units(params.min_interval))
+    actual_max_interval = _json_number_from_decimal(connection_ms_from_units(params.max_interval))
+
+    if "interval" in connection:
+        connection["interval"] = actual_max_interval
+    if "min_interval" in connection:
+        connection["min_interval"] = actual_min_interval
+    if "max_interval" in connection:
+        connection["max_interval"] = actual_max_interval
 
 
 def read_dev_config(section, key=None, default=None, *, path="dev_config.json"):
@@ -307,6 +395,10 @@ def bgapi_check_event(dev,
     """
     seen = []
 
+    # Avoid Decimal type error when calling this function by converting to float both timeouts
+    eventTimeout = float(eventTimeout)
+    maxTime = float(maxTime)
+
     for evt in dev.get_events(timeout=eventTimeout, max_time=maxTime):
         seen.append(evt)
         if debug:
@@ -332,7 +424,7 @@ def get_device_addr(dev):
 
 
 def is_conn_handle_valid(handle):
-    return (handle != 255 and handle > 0)
+    return handle is not None and handle != 255 and handle >= 0
 
 
 def close_connection(dev, conn_handle):
@@ -354,7 +446,7 @@ def connection_config_params(dev, params: ConnectionParameters):
         params.min_ce_lenght,
         params.max_ce_lenght)
     
-    dev.bt.connection.set_default_preferred_phy(params.phy, params.phy)
+    dev.bt.connection.set_default_preferred_phy(connection_open_phy(params.phy), PHY_ANY)
     # ATT MTU must be at least 23. Treat rx_payload_length as payload sizing,
     # not a request to force an invalid MTU during default connection setup.
     if params.rx_payload_length >= 23:
@@ -367,9 +459,10 @@ def connection_set_live_params(dev,
     """
         Set connection parameters that cannot be set as a default value:w
     """
+    connection_set_preferred_phy(dev, conn_handle, params)
+
     dev.bt.connection.set_tx_power(
         conn_handle,
-        params.tx_power,
         params.tx_power
     )
     # TX payload length
@@ -388,12 +481,34 @@ def connection_set_live_params(dev,
     )
 
 
+def connection_set_preferred_phy(dev,
+                                 conn_handle,
+                                 params: ConnectionParameters):
+    dev.bt.connection.set_preferred_phy(
+        conn_handle,
+        params.phy,
+        PHY_ANY,
+    )
+    if params.phy != connection_open_phy(params.phy):
+        bgapi_check_event(
+                    dev,
+                    "connection",
+                    "phy_status",
+                    lambda evt: evt.connection == conn_handle and evt.phy == params.phy,
+                    eventTimeout=1,
+                    maxTime=5,
+        )
+
+
 
 def connect_devices(central,
                     peripheral,
                     parameters: ConnectionParameters,
-                    retry_sleep=0.25,
-                    max_retries=3):
+                    retry_sleep=1.0,
+                    max_retries=5,
+                    connTimeout=10.0,
+                    evtTimeout=5.0,
+                    restart_advertising=None):
     """
     Connect two BLE devices where the peripheral has started Connectable Advertising,
     with a maximum number of retries
@@ -410,13 +525,30 @@ def connect_devices(central,
     connection_config_params(central, parameters)
     connection_config_params(peripheral, parameters)
 
+    log.info( "connTimeout=%r (%s), evtTimeout=%r (%s)",
+              connTimeout,
+              type(connTimeout),
+              evtTimeout,
+              type(evtTimeout),
+    )
+
     for attempt in range(max_retries):
+        central_conn = -1
+        peripheral_conn = -1
+
         log.info("Connection attempt %d/%d", attempt + 1, max_retries)
+        log.info(
+            "Connecting: interval=%s latency=%s timeout=%s phy=%s",
+            parameters.min_interval,
+            parameters.latency,
+            connTimeout,
+            parameters.phy,
+        )
 
         rsp = central.bt.connection.open(
             peripheral_addr,
             peripheral_addr_type,
-            parameters.phy,
+            connection_open_phy(parameters.phy),
         )
         assert rsp.result == 0
 
@@ -426,34 +558,38 @@ def connect_devices(central,
                 "connection",
                 "opened",
                 lambda evt: evt.address == peripheral_addr,
-                eventTimeout=1,
-                maxTime=5,
+                eventTimeout=evtTimeout,
+                maxTime=connTimeout,
             )
+            central_conn = central_event.connection
 
             peripheral_event = bgapi_check_event(
                 peripheral,
                 "connection",
                 "opened",
                 lambda evt: evt.address == central_addr,
-                eventTimeout=1,
-                maxTime=5,
+                eventTimeout=evtTimeout,
+                maxTime=connTimeout,
             )
-
-            # Remember to configure the TX power on the opened connection
-            
-
-            central_conn = central_event.connection
             peripheral_conn = peripheral_event.connection
 
             if is_conn_handle_valid(central_conn) and is_conn_handle_valid(peripheral_conn):
+                connection_set_preferred_phy(central, central_conn, parameters)
                 log.info("Devices connected")
                 return central_conn, peripheral_conn
 
-        except BGAPIEventTimeoutError:
-            log.warning("Connection attempt %d/%d failed", attempt + 1, max_retries)
+        except BGAPIEventTimeoutError as e:
+            log.warning("Connection attempt %d/%d failed. Err: %s",
+                        attempt + 1,
+                        max_retries,
+                        e)
 
             close_connection(central, central_conn)
             close_connection(peripheral, peripheral_conn)
+
+            if restart_advertising is not None and attempt < max_retries - 1:
+                log.info("Restarting connectable advertising before next connection attempt")
+                restart_advertising()
 
             sleep(retry_sleep)
             continue

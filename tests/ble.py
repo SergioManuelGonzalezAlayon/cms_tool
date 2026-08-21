@@ -2,18 +2,20 @@
 import logging
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from time import sleep
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
-from joulescope_interface import JoulescopeDev
+from joulescope_interface import JoulescopeDev, JoulescopeUsbReset
 from utils.bgapi_utils import *
 from conftest import *
 
 # TODO - BGAPI device interfaces in pytest so that we can use the HWMux thingy
-MAX_TEST_RETRIES = 3
-DUT_OPEN_RETRIES = 3
+MAX_TEST_RETRIES = 5
+MAX_TEST_RETRY_WAIT = 1.0
+DUT_OPEN_RETRIES = 5
 DUT_OPEN_RETRY_SLEEP_S = 1.0
+DEVICE_OPEN_RETRIES = 5
 log = logging.getLogger(__name__)
 
 
@@ -21,10 +23,14 @@ def _format_bd_addr(address) -> str:
     return str(address)
 
 
+def _discovery_scan_phy_for_advertiser(phy: str | int) -> int:
+    return discovery_scan_phy_for_advertiser(phy)
+
+
 def open_ble_dev(dev,
                  wakeUp=None,
                  *,
-                 open_retries=2,
+                 open_retries=DUT_OPEN_RETRIES,
                  retry_sleep_s=0.5,
                  boot_event_timeout=5,
                  boot_max_time=10,
@@ -182,7 +188,11 @@ def DUTLegAdvConfig(DUT,
     log.info("DUT Advertiser configured")
 
     DUT.bt.advertiser.set_tx_power(config.set,config.tx_power)
-    DUT.bt.advertiser.set_phy(config.set, config.phy, config.phy)
+    DUT.bt.advertiser.set_phy(config.set, config.primary_phy, config.primary_phy)
+    log.info(
+        "DUT legacy advertiser PHY configured: primary=%s",
+        advertising_phy_to_str(config.primary_phy),
+    )
     DUT.bt.legacy_advertiser.set_data(config.set,
                                       0, # Advertising data packet
                                       config.payload)
@@ -197,7 +207,7 @@ def DUTLegAdvStart(DUT,
     def start(*, connectable_mode, flags=0):
         nonlocal started
 
-        DUT.bt.legacy_advertiser.start(DUTAdvConfig.set, connectable_mode)
+        DUT.bt.legacy_advertiser.start(DUTLegAdvConfig.set, connectable_mode)
         log.info("DUT Advertising started")
         started = True
 
@@ -205,14 +215,14 @@ def DUTLegAdvStart(DUT,
 
     if started:
         try:
-            DUT.bt.advertiser.stop(DUTAdvConfig.set)
+            DUT.bt.advertiser.stop(DUTLegAdvConfig.set)
             log.info("DUT Advertising stopped")
         finally:
-            DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
+            DUT.bt.advertiser.delete_set(DUTLegAdvConfig.set)
             log.info("DUT Advertising set deleted")
     else:
         # even if never started, still delete the set
-        DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
+        DUT.bt.advertiser.delete_set(DUTLegAdvConfig.set)
 
 @pytest.fixture
 def DUTAdvConfig(DUT,
@@ -234,7 +244,17 @@ def DUTAdvConfig(DUT,
     log.info("DUT Advertiser configured")
 
     DUT.bt.advertiser.set_tx_power(config.set, config.tx_power)
-    DUT.bt.extended_advertiser.set_phy(config.set, config.phy, config.phy)
+    
+    DUT.bt.extended_advertiser.set_phy(
+        config.set,
+        config.primary_phy,
+        config.secondary_phy,
+    )
+    log.info(
+        "DUT extended advertiser PHY configured: primary=%s secondary=%s",
+        advertising_phy_to_str(config.primary_phy),
+        advertising_phy_to_str(config.secondary_phy),
+    )
     DUT.bt.extended_advertiser.set_data(config.set, config.payload)
 
     return config
@@ -243,14 +263,35 @@ def DUTAdvConfig(DUT,
 def DUTAdvStart(DUT,
                 DUTAdvConfig):
     started = False
+    last_connectable_mode = None
+    last_flags = None
 
     def start(*, connectable_mode, flags=0):
-        nonlocal started
+        nonlocal started, last_connectable_mode, last_flags
+        last_connectable_mode = connectable_mode
+        last_flags = flags
 
         rsp = DUT.bt.extended_advertiser.start(DUTAdvConfig.set, connectable_mode, flags)
         assert rsp.result == 0
         log.info("DUT Advertising started")
         started = True
+
+    def restart():
+        if last_connectable_mode is None:
+            raise RuntimeError("DUT Advertising cannot be restarted before it has been started")
+
+        try:
+            rsp = DUT.bt.advertiser.stop(DUTAdvConfig.set)
+            assert rsp.result == 0
+            log.info("DUT Advertising stopped before restart")
+        except Exception as ex:
+            log.debug("DUT Advertising stop before restart skipped: %s", ex)
+
+        rsp = DUT.bt.extended_advertiser.start(DUTAdvConfig.set, last_connectable_mode, last_flags)
+        assert rsp.result == 0
+        log.info("DUT Advertising restarted")
+
+    start.restart = restart
 
     yield start
 
@@ -287,13 +328,20 @@ def DUTScanConfig(DUT,
 def DUTScanStart(DUT,
                  DUTScanConfig):
     started = False
-    def _start(*, discover_mode, mode=None):
+    def _start(*, discover_mode, mode=None, phy=None):
         nonlocal started
         if mode is None:
             mode = getattr(DUT.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
         cfg = DUTScanConfig(mode=mode)
-        DUT.bt.scanner.start(cfg.phy, discover_mode)
-        log.info("DUT scanning started")
+        scan_phy = cfg.phy if phy is None else phy
+        rsp = DUT.bt.scanner.start(scan_phy, discover_mode)
+        assert rsp.result == 0
+        log.info(
+            "DUT scanning started: phy=%s, raw_phy=%d, discover_mode=%d",
+            advertising_phy_to_str(scan_phy),
+            scan_phy,
+            discover_mode,
+        )
         started = True
 
     yield _start
@@ -314,10 +362,17 @@ def DUTPAwRStart(DUT,
         nonlocal started
         pawr_payload = DUTAdvConfig.payload
 
-        rsp = DUT.bt.extended_advertiser.set_phy(DUTAdvConfig.set,
-                                                 DUTAdvConfig.phy,
-                                                 DUTAdvConfig.phy)
+        rsp = DUT.bt.extended_advertiser.set_phy(
+            DUTAdvConfig.set,
+            DUTAdvConfig.primary_phy,
+            DUTAdvConfig.secondary_phy,
+        )
         assert rsp.result == 0
+        log.info(
+            "DUT PAwR advertiser PHY configured: primary=%s secondary=%s",
+            advertising_phy_to_str(DUTAdvConfig.primary_phy),
+            advertising_phy_to_str(DUTAdvConfig.secondary_phy),
+        )
 
         rsp = DUT.bt.pawr_advertiser.start(
             DUTAdvConfig.set,
@@ -460,7 +515,16 @@ def TesterAdvConfig(Tester,
     log.info("Tester Advertiser configured")
 
     Tester.bt.advertiser.set_tx_power(config.set, config.tx_power)
-    Tester.bt.extended_advertiser.set_phy(config.set, config.phy, config.phy)
+    Tester.bt.extended_advertiser.set_phy(
+        config.set,
+        config.primary_phy,
+        config.secondary_phy,
+    )
+    log.info(
+        "Tester extended advertiser PHY configured: primary=%s secondary=%s",
+        advertising_phy_to_str(config.primary_phy),
+        advertising_phy_to_str(config.secondary_phy),
+    )
     Tester.bt.extended_advertiser.set_data(config.set, config.payload)
 
     return config
@@ -469,14 +533,35 @@ def TesterAdvConfig(Tester,
 def TesterAdvStart(Tester,
                    TesterAdvConfig):
     started = False
+    last_connectable_mode = None
+    last_flags = None
 
     def start(*, connectable_mode, flags=0):
-        nonlocal started
+        nonlocal started, last_connectable_mode, last_flags
+        last_connectable_mode = connectable_mode
+        last_flags = flags
 
         rsp = Tester.bt.extended_advertiser.start(TesterAdvConfig.set, connectable_mode, flags)
         assert rsp.result == 0
         log.info("Tester Advertising started")
         started = True
+
+    def restart():
+        if last_connectable_mode is None:
+            raise RuntimeError("Tester Advertising cannot be restarted before it has been started")
+
+        try:
+            rsp = Tester.bt.advertiser.stop(TesterAdvConfig.set)
+            assert rsp.result == 0
+            log.info("Tester Advertising stopped before restart")
+        except Exception as ex:
+            log.debug("Tester Advertising stop before restart skipped: %s", ex)
+
+        rsp = Tester.bt.extended_advertiser.start(TesterAdvConfig.set, last_connectable_mode, last_flags)
+        assert rsp.result == 0
+        log.info("Tester Advertising restarted")
+
+    start.restart = restart
 
     yield start
 
@@ -512,13 +597,20 @@ def TesterScanConfig(Tester,
 def TesterScanStart(Tester,
                     TesterScanConfig):
     started = False
-    def _start(*, discover_mode, mode=None):
+    def _start(*, discover_mode, mode=None, phy=None):
         nonlocal started
         if mode is None:
             mode = getattr(Tester.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
         cfg = TesterScanConfig(mode=mode)
-        Tester.bt.scanner.start(cfg.phy, discover_mode)
-        log.info("Tester scanning started")
+        scan_phy = cfg.phy if phy is None else phy
+        rsp = Tester.bt.scanner.start(scan_phy, discover_mode)
+        assert rsp.result == 0
+        log.info(
+            "Tester scanning started: phy=%s, raw_phy=%d, discover_mode=%d",
+            advertising_phy_to_str(scan_phy),
+            scan_phy,
+            discover_mode,
+        )
         started = True
 
     yield _start
@@ -625,10 +717,17 @@ def TesterPAwRStart(Tester,
         nonlocal started
         pawr_payload = TesterAdvConfig.payload
 
-        rsp = Tester.bt.extended_advertiser.set_phy(TesterAdvConfig.set,
-                                                    TesterAdvConfig.phy,
-                                                    TesterAdvConfig.phy)
+        rsp = Tester.bt.extended_advertiser.set_phy(
+            TesterAdvConfig.set,
+            TesterAdvConfig.primary_phy,
+            TesterAdvConfig.secondary_phy,
+        )
         assert rsp.result == 0
+        log.info(
+            "Tester PAwR advertiser PHY configured: primary=%s secondary=%s",
+            advertising_phy_to_str(TesterAdvConfig.primary_phy),
+            advertising_phy_to_str(TesterAdvConfig.secondary_phy),
+        )
 
         rsp = Tester.bt.pawr_advertiser.start(
             TesterAdvConfig.set,
@@ -685,29 +784,36 @@ def ConnectBLEDevices(Config):
     dev_ctrl = None
     dev_per = None
     ctrl_conn, per_conn = None, None
-
+    timeout_s = None
+    
     def _connect_devices(*,
                     central, 
                     peripheral,
-                    retry_sleep=0.25,
-                    max_retries=3):
+                    retry_sleep=MAX_TEST_RETRY_WAIT,
+                    max_retries=MAX_TEST_RETRIES,
+                    restart_advertising=None):
         """
         Connect two BLE devices where the peripheral has started Connectable Advertising,
         with a maximum number of retries
         """
-        nonlocal connected, dev_ctrl, dev_per, ctrl_conn, per_conn
+        nonlocal connected, dev_ctrl, dev_per, ctrl_conn, per_conn, timeout_s
 
         dev_ctrl = central
         dev_per = peripheral
         params = dataclass_from_dict(ConnectionParameters, Config.get("connection", {}))
         params = normalize_connection_parameters(params)
-
+        sync_connection_config_actuals(Config, params)
+        timeout_s = float(connection_ms_from_units(params.max_interval) / 1000)
         central_conn, peripheral_conn = connect_devices(
             central,
             peripheral,
             params,
             retry_sleep=retry_sleep,
-            max_retries=max_retries)
+            max_retries=max_retries,
+            connTimeout=max(5 * timeout_s, 10),
+            evtTimeout=max(timeout_s / 5, 0.2),
+            restart_advertising=restart_advertising,
+        )
         
         log.info("DUT and Tester connected")
         ctrl_conn = central_conn
@@ -720,6 +826,10 @@ def ConnectBLEDevices(Config):
 
     if connected:
         dev_ctrl.bt.connection.close(ctrl_conn)
+        log.info(
+            "Waiting up to %.2fs for connection.closed events after close request",
+            timeout_s,
+        )
 
         bgapi_check_event(
                 dev_ctrl,
@@ -727,7 +837,7 @@ def ConnectBLEDevices(Config):
                 "closed",
                 lambda evt: evt.connection == ctrl_conn,
                 eventTimeout=1,
-                maxTime=5,
+                maxTime=timeout_s,
             )
         bgapi_check_event(
                 dev_per,
@@ -735,7 +845,7 @@ def ConnectBLEDevices(Config):
                 "closed",
                 lambda evt: evt.connection == per_conn,
                 eventTimeout=1,
-                maxTime=5,
+                maxTime=timeout_s,
             )
         log.info("Connection closed succesfully")
 
@@ -749,10 +859,12 @@ def test_legacy_beacon(JoulescopeDev,
         connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
     )
     TesterScanStart(
-        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
+        phy=_discovery_scan_phy_for_advertiser(DUTLegAdvConfig.phy),
     )
 
     dut_addr = get_device_addr(DUT)
+    timeout_s = float(advertising_ms_from_units(DUTLegAdvConfig.max_interval) / 1000)
     for attempt in range(MAX_TEST_RETRIES):
         log.info("Beacon detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
         try:
@@ -761,14 +873,22 @@ def test_legacy_beacon(JoulescopeDev,
                 "scanner",
                 "legacy_advertisement_report",
                 lambda evt: evt.address == dut_addr,
+                eventTimeout=timeout_s / 5,
+                maxTime=timeout_s*5
             )
             break
         except BGAPIEventTimeoutError:
             if attempt == MAX_TEST_RETRIES - 1:
                 raise
-            sleep(0.25)
+            sleep(MAX_TEST_RETRY_WAIT)
 
-    capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
+    n_events = 10
+    capture_s = float(advertising_ms_from_units(n_events * DUTLegAdvConfig.max_interval) / 1000)
+    log.info(
+        "Capturing Joulescope profile: %.3f s (%d non-connectable legacy advertising events)",
+        capture_s,
+        n_events,
+    )
     JoulescopeDev.capture(capture_s)
 
 def test_beacon(JoulescopeDev,
@@ -781,10 +901,12 @@ def test_beacon(JoulescopeDev,
         connectable_mode=DUT.bt.extended_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
     )
     TesterScanStart(
-        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
+        phy=_discovery_scan_phy_for_advertiser(DUTAdvConfig.primary_phy),
     )
 
     dut_addr = get_device_addr(DUT)
+    timeout_s = float(advertising_ms_from_units(DUTAdvConfig.max_interval) / 1000)
     for attempt in range(MAX_TEST_RETRIES):
         log.info("Beacon detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
         try:
@@ -793,14 +915,21 @@ def test_beacon(JoulescopeDev,
                 "scanner",
                 "extended_advertisement_report",
                 lambda evt: evt.address == dut_addr,
+                eventTimeout=timeout_s / 5,
+                maxTime=timeout_s*5
             )
             break
         except BGAPIEventTimeoutError:
             if attempt == MAX_TEST_RETRIES - 1:
                 raise
-            sleep(0.25)
-
-    capture_s = float(advertising_ms_from_units(10 * DUTAdvConfig.max_interval) / 1000)
+            sleep(MAX_TEST_RETRY_WAIT)
+    n_events = 10
+    capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
+    log.info(
+        "Capturing Joulescope profile: %.3f s (%d non-connectable extended advertising events)",
+        capture_s,
+        n_events,
+    )
     JoulescopeDev.capture(capture_s)
 
 def test_legacy_conn_adv(JoulescopeDev,
@@ -809,11 +938,12 @@ def test_legacy_conn_adv(JoulescopeDev,
                   DUTLegAdvConfig,
                   DUTLegAdvStart,
                   TesterScanStart):
-    DUTAdvStart(
+    DUTLegAdvStart(
         connectable_mode=DUT.bt.legacy_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
     TesterScanStart(
-        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
+        phy=_discovery_scan_phy_for_advertiser(DUTLegAdvConfig.phy),
     )
 
     dut_addr = get_device_addr(DUT)
@@ -830,12 +960,11 @@ def test_legacy_conn_adv(JoulescopeDev,
         except BGAPIEventTimeoutError:
             if attempt == MAX_TEST_RETRIES - 1:
                 raise
-            sleep(0.25)
+            sleep(MAX_TEST_RETRY_WAIT)
 
     n_events = 10
-    capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
+    capture_s = float(advertising_ms_from_units(n_events * DUTLegAdvConfig.max_interval) / 1000)
     JoulescopeDev.capture(capture_s)
-
 
 def test_conn_adv(JoulescopeDev,
                   DUT,
@@ -847,10 +976,12 @@ def test_conn_adv(JoulescopeDev,
         connectable_mode=DUT.bt.extended_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
     TesterScanStart(
-        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
+        phy=_discovery_scan_phy_for_advertiser(DUTAdvConfig.primary_phy),
     )
 
     dut_addr = get_device_addr(DUT)
+    timeout_s = float(advertising_ms_from_units(DUTAdvConfig.max_interval) / 1000)
     for attempt in range(MAX_TEST_RETRIES):
         log.info("Connectable advertiser detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
         try:
@@ -859,15 +990,22 @@ def test_conn_adv(JoulescopeDev,
                 "scanner",
                 "extended_advertisement_report",
                 lambda evt: evt.address == dut_addr,
+                eventTimeout=timeout_s / 5,
+                maxTime=timeout_s*5
             )
             break
         except BGAPIEventTimeoutError:
             if attempt == MAX_TEST_RETRIES - 1:
                 raise
-            sleep(0.25)
+            sleep(MAX_TEST_RETRY_WAIT)
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
+    log.info(
+        "Capturing Joulescope profile: %.3f s (%d connectable extended advertising events)",
+        capture_s,
+        n_events,
+    )
     JoulescopeDev.capture(capture_s)
 
 def test_conn_central(JoulescopeDev,
@@ -878,9 +1016,11 @@ def test_conn_central(JoulescopeDev,
     TesterAdvStart(
         connectable_mode=Tester.bt.extended_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
+
     _, _, conn_params = ConnectBLEDevices(
         central=DUT,
-        peripheral=Tester
+        peripheral=Tester,
+        restart_advertising=TesterAdvStart.restart,
     )
 
     n_events = 10
@@ -897,9 +1037,11 @@ def test_conn_peripheral(JoulescopeDev,
     DUTAdvStart(
         connectable_mode=DUT.bt.extended_advertiser.CONNECTION_MODE_CONNECTABLE,
     )
+    
     _, _, conn_params = ConnectBLEDevices(
         central=Tester,
-        peripheral=DUT
+        peripheral=DUT,
+        restart_advertising=DUTAdvStart.restart,
     )
 
     n_events = 10
@@ -911,6 +1053,7 @@ def test_conn_peripheral(JoulescopeDev,
 def test_scanner(JoulescopeDev,
                  DUT,
                  Tester,
+                 TesterAdvConfig,
                  TesterAdvStart,
                  DUTScanConfig,
                  DUTScanStart):
@@ -922,7 +1065,50 @@ def test_scanner(JoulescopeDev,
     DUTScanStart(
         discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
         mode=scan_mode,
+        phy=scan_config.phy,
     )
+
+    tester_identity = Tester.bt.system.get_identity_address()
+    assert tester_identity.result == 0
+    expected_address = tester_identity.address
+    expected_address_type = tester_identity.type
+    log.info(
+        "Scanner test discovery config: advertiser_primary_phy=%s advertiser_secondary_phy=%s scanner_phy=%s",
+        advertising_phy_to_str(TesterAdvConfig.primary_phy),
+        advertising_phy_to_str(TesterAdvConfig.secondary_phy),
+        advertising_phy_to_str(scan_config.phy),
+    )
+    log.info(
+        "Scanner test expected advertiser: address=%s address_type=%s",
+        _format_bd_addr(expected_address),
+        expected_address_type,
+    )
+
+    def _match_tester_advertisement(evt) -> bool:
+        received_address = getattr(evt, "address", None)
+        received_address_type = getattr(evt, "address_type", None)
+        log.info(
+            "Scanner test received advertisement: address=%s address_type=%s expected_address=%s expected_address_type=%s",
+            _format_bd_addr(received_address),
+            received_address_type,
+            _format_bd_addr(expected_address),
+            expected_address_type,
+        )
+        return (
+            received_address == expected_address
+            and received_address_type == expected_address_type
+        )
+
+    timeout_s = float(advertising_ms_from_units(TesterAdvConfig.max_interval) / 1000)
+    bgapi_check_event(
+        DUT,
+        "scanner",
+        "extended_advertisement_report",
+        _match_tester_advertisement,
+        eventTimeout=max(timeout_s / 5, 0.2),
+        maxTime=max(timeout_s * 5, 5),
+    )
+    log.info("Scanner test expected advertisement received")
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * scan_config.interval) / 1000)
@@ -938,7 +1124,8 @@ def test_PAwR_per(JoulescopeDev,
     dut_address = get_device_addr(DUT)
 
     TesterScanStart(
-        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+        discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
+        phy=_discovery_scan_phy_for_advertiser(DUTAdvConfig.primary_phy),
     )
 
     DUTPAwRStart(flags=DUT.bt.periodic_advertiser.FLAGS_AUTO_START_EXTENDED_ADVERTISING)
@@ -1012,7 +1199,8 @@ def test_PAwR_obs(JoulescopeDev,
     tester_address = get_device_addr(Tester)
 
     DUTScanStart(
-        discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION
+        discover_mode=DUT.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
+        phy=_discovery_scan_phy_for_advertiser(TesterAdvConfig.primary_phy),
     )
 
     TesterPAwRStart(flags=Tester.bt.periodic_advertiser.FLAGS_AUTO_START_EXTENDED_ADVERTISING)

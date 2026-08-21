@@ -1,15 +1,19 @@
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 
+from cms_protocol import ResultType
+
+
+log = logging.getLogger(__name__)
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
 
 @dataclass
 class ResultContext:
@@ -25,6 +29,47 @@ def _relative_path(path: Path | str | None) -> str | None:
     if path is None:
         return None
     return Path(path).as_posix()
+
+
+def _config_protocol_and_test_case(config_path: Path) -> tuple[str, str]:
+    parts = config_path.parts
+    if "configs" in parts:
+        index = parts.index("configs")
+        protocol = parts[index + 1] if len(parts) > index + 1 else ""
+        test_case = parts[index + 2] if len(parts) > index + 2 else ""
+        if protocol or test_case:
+            return protocol, test_case
+    return "", config_path.parent.name
+
+
+def _result_storage_metadata(
+    *,
+    test_name: str,
+    config_path: Path,
+    firmware: dict,
+    slcp_meta: dict,
+) -> dict:
+    protocol, test_case = _config_protocol_and_test_case(config_path)
+    board_revision = (
+        firmware.get("board_revision")
+        or firmware.get("board_rev")
+        or firmware.get("brev")
+    )
+    part_number = (
+        firmware.get("part_number")
+        or firmware.get("device")
+        or slcp_meta.get("chip_id")
+    )
+    return {
+        "prefix": "cms",
+        "protocol": protocol,
+        "test_case": test_case or test_name,
+        "part_number": part_number,
+        "board": firmware.get("board"),
+        "board_revision": board_revision,
+        "serial_number": firmware.get("serial_number"),
+        "test_name": test_name,
+    }
 
 
 def _file_sha256(path: Path) -> str:
@@ -95,6 +140,26 @@ def _json_ready(value):
             pass
     return value
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+def _upload_results_to_database_from_env() -> bool:
+    return (
+        _env_flag("CURRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE")
+        or _env_flag("CURRRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE")
+    )
+
+def _result_phy(test_name: str, advertiser: dict, scanner: dict, connection: dict):
+    if test_name == "scanner":
+        return scanner.get("phy")
+    if test_name in {"conn_central", "conn_peripheral"}:
+        return connection.get("phy")
+    return advertiser.get("phy") or connection.get("phy") or scanner.get("phy")
+
+
+def upload_result_json_to_database(result_json_path: Path | str):
+    from s3_upload import upload_json_to_data_lake
+    return upload_json_to_data_lake(result_json_path)
 
 def _representative_indices(total: int, count: int) -> list[int]:
     if total <= 0 or count <= 0:
@@ -241,6 +306,39 @@ def _build_window_rows(analyzer) -> list[dict]:
     return rows
 
 
+def _select_plot_window(
+    window_rows: list[dict],
+    plot_metadata: dict | None = None,
+) -> dict | None:
+    """Select the outlier or reference result row used for a representative plot."""
+
+    if not window_rows:
+        return None
+
+    selected = next((row for row in window_rows if row.get("is_outlier")), None)
+    selection_reason = "outlier_window"
+
+    if selected is None and plot_metadata is not None:
+        reference_index = plot_metadata.get("reference_window_index")
+        if reference_index is not None:
+            reference_window_number = int(reference_index) + 1
+            selected = next(
+                (
+                    row
+                    for row in window_rows
+                    if int(row.get("window_index", -1)) == reference_window_number
+                ),
+                None,
+            )
+            selection_reason = "reference_window"
+
+    if selected is None:
+        selected = window_rows[0]
+        selection_reason = "first_window"
+
+    return {"selection_reason": selection_reason, **selected}
+
+
 def write_result_json(
     *,
     profile,
@@ -264,11 +362,18 @@ def write_result_json(
     capture_path = _save_capture_npz(profile, out_dir, artifact_stem) if capture_policy["retained"] else None
     firmware = config_data.get("firmware", {})
     advertiser = config_data.get("advertiser", {})
+    scanner = config_data.get("scanner", {})
     connection = config_data.get("connection", {})
     pawr = config_data.get("pawr", {})
     slcp_meta = _read_slcp_metadata(firmware.get("dut_slcp"))
     mode, partition = _config_mode_and_partition(config_path)
     analyzer = result_paths["analyzer"] if result_paths["note_path"] is None else None
+    storage = _result_storage_metadata(
+        test_name=test_name,
+        config_path=config_path,
+        firmware=firmware,
+        slcp_meta=slcp_meta,
+    )
 
     avg_current_ma = float(sum(profile["current"]["samples"]) / len(profile["current"]["samples"]) * 1e3)
     peak_current_ma = float(max(profile["current"]["samples"]) * 1e3)
@@ -300,6 +405,7 @@ def write_result_json(
         )
 
     record = {
+        "result_type": ResultType.CURRENT_MEASUREMENT.value,
         "schema_version": 1,
         "dataset": {
             "dataset_id": f"ble_{firmware.get('board', 'unknown')}_{campaign_id}",
@@ -307,12 +413,15 @@ def write_result_json(
             "wireless_stack": "BLE",
             "chip_id": slcp_meta["chip_id"],
             "board_id": firmware.get("board"),
+            "board_revision": storage["board_revision"],
+            "part_number": storage["part_number"],
             "sdk_name": slcp_meta["sdk_name"],
             "sdk_version": slcp_meta["sdk_version"],
             "campaign_id": campaign_id,
             "mode": mode,
             "partition": partition,
         },
+        "storage": storage,
         "test_run": {
             "test_name": test_name,
             "config_name": config_name,
@@ -327,6 +436,11 @@ def write_result_json(
             "dut_slcp": firmware.get("dut_slcp"),
             "tester_slcp": firmware.get("tester_slcp"),
             "board": firmware.get("board"),
+            "board_revision": storage["board_revision"],
+            "brev": firmware.get("brev"),
+            "part_number": storage["part_number"],
+            "device": firmware.get("device"),
+            "serial_number": storage["serial_number"],
             "dut_sdk_name": slcp_meta["sdk_name"],
             "dut_sdk_version": slcp_meta["sdk_version"],
             "dut_chip_id": slcp_meta["chip_id"],
@@ -336,7 +450,7 @@ def write_result_json(
         },
         "parameters": {
             "supply_voltage_v": supply_v,
-            "phy": advertiser.get("phy") or connection.get("phy"),
+            "phy": _result_phy(test_name, advertiser, scanner, connection),
             "tx_power_dbm": advertiser.get("tx_power") or connection.get("tx_power"),
             "advertising_interval_ms": advertiser.get("interval"),
             "tx_payload_length_bytes": advertiser.get("payload") or connection.get("tx_payload_length"),
@@ -365,11 +479,16 @@ def write_result_json(
 
 
 class ResultGenerator:
-    def __init__(self, *, campaign_id: str | None = None):
+    def __init__(self, *, campaign_id: str | None = None, upload_results_to_database: bool | None = None):
         self.context = ResultContext(
             campaign_id=campaign_id
             or os.environ.get("CURRENT_MEASUREMENT_CAMPAIGN_ID")
             or utc_now().replace(":", "").replace("-", "")
+        )
+        self.upload_results_to_database = (
+            _upload_results_to_database_from_env()
+            if upload_results_to_database is None
+            else upload_results_to_database
         )
 
     def set_context(
@@ -395,8 +514,8 @@ class ResultGenerator:
         artifact_stem: str,
         result_paths: dict,
         measured_at: str | None = None,
-    ) -> Path:
-        return write_result_json(
+    ) -> Path:    
+        result_json_path = write_result_json(
             profile=profile,
             out_dir=out_dir,
             artifact_stem=artifact_stem,
@@ -409,3 +528,7 @@ class ResultGenerator:
             campaign_id=self.context.campaign_id,
             supply_v=self.context.supply_v,
         )
+        if self.upload_results_to_database:
+            response = upload_result_json_to_database(result_json_path)
+            log.info("Result JSON uploaded to database: %s", response)
+        return result_json_path

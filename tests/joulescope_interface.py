@@ -1,15 +1,18 @@
 import pytest, logging
 from dataclasses import dataclass, asdict
 import json
+import subprocess
 from instruments.joulescope.read_pyjoulescope_driver import Joulescope, get_profile
 from algorithms.single_pattern_analysis import SinglePatternCurrentProfileAnalyzer
 from presentation.html_report import generate_report
 from presentation.outlier_plots import OutlierPlotsGenerator
 from pathlib import Path
 from time import sleep
+from utils.config_loader import effective_dev_config
 
 log = logging.getLogger(__name__)
 DUT_WAKE_GPIO = 0
+USB_RESET_TIMEOUT_S = 15.0
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
@@ -309,7 +312,6 @@ class JoulescopeConfig:
     signals: str = "i,r,0,1"
     duration: str | float = 1
     frequency: int = 1_000_000
-    serial_number: str | None = None
     open_mode: str = "defaults"
     vref: str = "3v3"
     post_process: str = "profile"
@@ -321,13 +323,76 @@ class JoulescopeConfig:
     verbose: bool = False
 
 @pytest.fixture(scope="session")
-def JoulescopeDev():
-    log.info("Enabling Joulescope")
-    cfg = JoulescopeConfig(open_mode="restore")
+def JoulescopeUsbReset(request: pytest.FixtureRequest):
+    cfg = effective_dev_config(
+        runtime_path=request.config.getoption("--cms-runtime-config"),
+        metadata_path=request.config.getoption("--cms-fw-metadata"),
+    )
+    usb_id = cfg.get("js",{}).get("usb_id")
+
+    if not usb_id:
+        log.warning("SETUP SKIP: Joulescope USB reset; no js.usb_id configured")
+        return
+
+    _reset_joulescope_usb(usb_id)
+
+
+def _reset_joulescope_usb(usb_id: str) -> None:
+    # Reset the JS USB to avoid the USB driver deaklocking the whole test run
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            log.info(
+                "SETUP START: Joulescope USB reset id=%s attempt=%d/%d",
+                usb_id,
+                attempt,
+                attempts,
+            )
+            result = subprocess.run(
+                ["usbreset", usb_id],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=USB_RESET_TIMEOUT_S,
+            )
+            log.info(
+                "SETUP COMPLETE: Joulescope USB reset id=%s output=%s",
+                usb_id,
+                result.stdout.strip(),
+            )
+            break
+
+        except subprocess.TimeoutExpired as e:
+            log.error(
+                "SETUP TIMEOUT: Joulescope USB reset id=%s timeout_s=%s",
+                usb_id,
+                USB_RESET_TIMEOUT_S,
+            )
+            raise RuntimeError(
+                f"Joulescope USB reset timed out after {USB_RESET_TIMEOUT_S:g} seconds"
+            ) from e
+        except subprocess.CalledProcessError as e:
+            log.error(
+                "usbreset failed: rc=%d stdout=%r stderr=%r",
+                e.returncode,
+                e.stdout,
+                e.stderr,
+            )
+            if attempts == attempt:
+                raise
+        sleep(0.5)
+
+@pytest.fixture(scope="session")
+def JoulescopeDev(JoulescopeUsbReset):
+    log.info("SETUP START: Joulescope driver creation")
+    cfg = JoulescopeConfig(open_mode="defaults")
     js = WakePinJoulescope(**asdict(cfg))
 
     js.create_driver()
+    log.info("SETUP COMPLETE: Joulescope driver creation")
+    log.info("SETUP START: Joulescope device open")
     js.open_devices()
+    log.info("SETUP COMPLETE: Joulescope device open")
 
     yield js
 

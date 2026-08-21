@@ -9,16 +9,28 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import platform
+import re
 import shutil
+import tempfile
 import threading
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from cms_bench import BenchSession, CMSBench, CMS_BENCH_CONFIG, load_bench_runtime_config
+from cms_bench import (
+    DEFAULT_CONSOLE_EVENT_MAX_BYTES,
+    DEFAULT_CONSOLE_LOG_MAX_BYTES,
+    DEFAULT_EXECUTION_TIMEOUT_S,
+    BenchSession,
+    CMSBench,
+    CMS_BENCH_CONFIG,
+    load_bench_runtime_config,
+)
 from cms_protocol import (
     Artifacts,
     BenchCheckResult,
@@ -28,12 +40,37 @@ from cms_protocol import (
     MeasurementState,
     MeasurementRequest,
     MeasurementResult,
+    ResultType,
     bench_health_report_to_dict,
     bench_identity_to_dict,
+    create_measurement_identity,
     measurement_request_from_dict,
     measurement_request_to_dict,
     measurement_result_to_dict,
 )
+
+
+PUBLISHABLE_DIAGNOSTIC_NAMES = frozenset(
+    {
+        "cms_fw_metadata.json",
+        "cms_test_run.json",
+        "orchestrator_plan.json",
+        "orchestrator_results.jsonl",
+        "pytest.log",
+        "test_stdout.log",
+        "test_stderr.log",
+    }
+)
+
+
+def _default_runtime_root() -> Path:
+    if platform.system() == "Linux":
+        return Path("/dev/shm/cmsd")
+    return Path(tempfile.gettempdir()) / "cmsd"
+
+
+def _default_execution_timeout_s() -> float:
+    return float(os.getenv("CMSD_EXECUTION_TIMEOUT_S", str(DEFAULT_EXECUTION_TIMEOUT_S)))
 
 
 @dataclass(slots=True)
@@ -42,10 +79,30 @@ class DaemonConfig:
 
     host: str = "0.0.0.0"
     port: int = 8000
-    runtime_root: Path = Path("artifacts/cmsd/runtime")
+    runtime_root: Path = field(default_factory=_default_runtime_root)
     artifacts_root: Path = Path("artifacts/cmsd")
     bench_config: Path = Path(CMS_BENCH_CONFIG)
     api_token: str = ""
+    expected_runtime_filesystems: tuple[str, ...] = ("tmpfs", "ramfs")
+    max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
+    max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
+    execution_timeout_s: float = field(default_factory=_default_execution_timeout_s)
+
+    def __post_init__(self) -> None:
+        runtime_root = self.runtime_root.resolve()
+        artifacts_root = self.artifacts_root.resolve()
+        if (
+            runtime_root == artifacts_root
+            or runtime_root.is_relative_to(artifacts_root)
+            or artifacts_root.is_relative_to(runtime_root)
+        ):
+            raise ValueError("runtime_root and artifacts_root must not overlap")
+        if self.max_console_log_bytes < 1:
+            raise ValueError("max_console_log_bytes must be positive")
+        if self.max_console_event_bytes < 512:
+            raise ValueError("max_console_event_bytes must be at least 512")
+        if self.execution_timeout_s <= 0:
+            raise ValueError("execution_timeout_s must be positive")
 
 
 @dataclass(slots=True)
@@ -87,6 +144,7 @@ class CMSDaemon:
         self.last_firmware_runtime_dir: Path | None = None
         self.last_measurement_id: str | None = None
         self.cancelled_measurements: set[str] = set()
+        self.cancellation_events: dict[str, threading.Event] = {}
 
     def initialize(self) -> None:
         """Prepare daemon runtime directories, staging files, and local bench."""
@@ -116,7 +174,7 @@ class CMSDaemon:
     def create_runtime_workspace(self, measurement_id: str) -> Path:
         """Create the runtime workspace where incoming firmware is staged."""
 
-        workspace = self.config.runtime_root / "measurements" / measurement_id
+        workspace = self._runtime_workspace_path(measurement_id)
         workspace.mkdir(parents=True, exist_ok=True)
         return workspace
 
@@ -202,13 +260,15 @@ class CMSDaemon:
         """Stage the current measurement request without launching execution."""
 
         self.active_measurement_id = request.request_id
+        self.cancellation_events.setdefault(request.request_id, threading.Event())
         self.measurements[request.request_id] = MeasurementResult(
             measurement_id=request.request_id,
             state=MeasurementState.ACCEPTED,
-            started_at=datetime.utcnow(),
+            started_at=request.identity.created_at if request.identity else datetime.utcnow(),
             progress_percent=5,
             current_step=MeasurementState.ACCEPTED.value,
             message="measurement accepted",
+            identity=request.identity,
         )
         self.files.measurement_request.write_text(
             json.dumps(measurement_request_to_dict(request), indent=2) + "\n",
@@ -273,6 +333,7 @@ class CMSDaemon:
         self.measurements[request.request_id] = result
         if self.active_measurement_id == request.request_id:
             self.active_measurement_id = None
+        self.cancellation_events.pop(request.request_id, None)
         return result
 
     def run_staged_test(
@@ -281,13 +342,14 @@ class CMSDaemon:
         mode: str,
         feature: str,
         config: str = "default",
-        request_id: str = "",
+        run_name: str = "",
+        upload_results_to_database: bool = False,
     ) -> MeasurementResult:
         """Run a test using the most recently staged firmware request."""
 
         if self.last_firmware_request is None:
             return MeasurementResult(
-                measurement_id=request_id,
+                measurement_id="",
                 state=MeasurementState.FAILED,
                 finished_at=datetime.utcnow(),
                 progress_percent=100,
@@ -295,12 +357,15 @@ class CMSDaemon:
                 message="no firmware has been staged; run SEND_FW first",
             )
         request = measurement_request_from_dict(measurement_request_to_dict(self.last_firmware_request))
-        request.request_id = request_id or f"{request.request_id}-test"
         request.mode = request.mode.__class__(mode)
         request.selector.mode = "ble"
         request.selector.feature = feature
         request.selector.config = config
-        result = self.execute_measurement(request)
+        request.upload_results_to_database = upload_results_to_database
+        request.identity = None
+        request.request_id = ""
+        self._assign_execution_identity(request, run_name)
+        result = self.execute_measurement(request, identity_assigned=True)
         self.last_measurement_id = result.measurement_id
         return result
 
@@ -310,13 +375,14 @@ class CMSDaemon:
         mode: str,
         feature: str,
         config: str = "default",
-        request_id: str = "",
+        run_name: str = "",
+        upload_results_to_database: bool = False,
     ) -> MeasurementResult:
         """Start a test in the background using the most recently staged firmware."""
 
         if self.last_firmware_request is None:
             return MeasurementResult(
-                measurement_id=request_id,
+                measurement_id="",
                 state=MeasurementState.FAILED,
                 finished_at=datetime.utcnow(),
                 progress_percent=100,
@@ -325,26 +391,34 @@ class CMSDaemon:
             )
 
         request = measurement_request_from_dict(measurement_request_to_dict(self.last_firmware_request))
-        request.request_id = request_id or f"{request.request_id}-test"
         request.mode = request.mode.__class__(mode)
         request.selector.mode = "ble"
         request.selector.feature = feature
         request.selector.config = config
+        request.upload_results_to_database = upload_results_to_database
+        request.identity = None
+        request.request_id = ""
+        identity = self._assign_execution_identity(request, run_name)
 
         started = MeasurementResult(
             measurement_id=request.request_id,
             state=MeasurementState.ACCEPTED,
-            started_at=datetime.utcnow(),
+            started_at=identity.created_at,
             progress_percent=1,
             current_step=MeasurementState.ACCEPTED.value,
             message="test accepted",
+            identity=identity,
         )
         self.measurements[request.request_id] = started
         self.active_measurement_id = request.request_id
+        self.cancellation_events[request.request_id] = threading.Event()
         thread = threading.Thread(
             target=self.execute_measurement,
             args=(request,),
-            kwargs={"staged_runtime_dir": self.last_firmware_runtime_dir},
+            kwargs={
+                "staged_runtime_dir": self.last_firmware_runtime_dir,
+                "identity_assigned": True,
+            },
             daemon=True,
         )
         thread.start()
@@ -352,21 +426,39 @@ class CMSDaemon:
 
     def build_session(self, request: MeasurementRequest, runtime_dir: Path) -> BenchSession:
         """Assemble the bench execution context after the bench is launched."""
+        expected_runtime_dir = self._runtime_workspace_path(request.request_id)
+        if runtime_dir.resolve() != expected_runtime_dir.resolve():
+            raise ValueError(
+                "bench session must use the authoritative runtime workspace: "
+                f"{expected_runtime_dir}"
+            )
         return BenchSession(
             measurement_id=request.request_id,
             runtime_dir=runtime_dir,
             manifest=request.firmware,
             request=request,
+            max_console_log_bytes=self.config.max_console_log_bytes,
+            max_console_event_bytes=self.config.max_console_event_bytes,
+            execution_timeout_s=self.config.execution_timeout_s,
+            cancel_event=self.cancellation_events.setdefault(
+                request.request_id,
+                threading.Event(),
+            ),
         )
 
     def publish_results(self, result: MeasurementResult) -> MeasurementResult:
         """Persist metadata and expose final artifacts to remote clients."""
+        tracked_result = self.measurements.get(result.measurement_id)
+        if result.identity is None and tracked_result is not None:
+            result.identity = tracked_result.identity
         published_dir = self.config.artifacts_root / "measurements" / result.measurement_id
         published_dir.mkdir(parents=True, exist_ok=True)
 
         published_artifacts = []
         for artifact in result.artifacts:
             if artifact.path is None or not artifact.path.exists():
+                continue
+            if not _is_publishable_final_artifact(artifact):
                 continue
             artifact_name = _safe_artifact_name(artifact.name or artifact.path.name)
             destination = published_dir / artifact_name
@@ -400,37 +492,53 @@ class CMSDaemon:
                         f"/measurement/{result.measurement_id}/artifacts/"
                         f"{urllib.parse.quote(result_artifact_name, safe='/')}"
                     ),
+                    result_type=ResultType.CAMPAIGN,
                 )
             )
         self.measurements[result.measurement_id] = result
         self.last_measurement_id = result.measurement_id
         if self.active_measurement_id == result.measurement_id:
             self.active_measurement_id = None
+        self.cancellation_events.pop(result.measurement_id, None)
+        self.cancelled_measurements.discard(result.measurement_id)
         return result
 
     def measurement_abort(self, measurement_id: str) -> MeasurementResult:
-        """Attempt to stop the active measurement and release the bench cleanly."""
+        """Signal the active worker; it publishes cancelled only after cleanup."""
         result = self.measurements.get(measurement_id)
         if result is None:
-            result = MeasurementResult(measurement_id=measurement_id, state=MeasurementState.CANCELLED)
-        result.state = MeasurementState.CANCELLED
-        result.finished_at = datetime.utcnow()
-        result.progress_percent = 100
-        result.current_step = MeasurementState.CANCELLED.value
-        result.message = "measurement cancelled"
+            return MeasurementResult(
+                measurement_id=measurement_id,
+                state=MeasurementState.FAILED,
+                finished_at=datetime.utcnow(),
+                progress_percent=100,
+                current_step=MeasurementState.FAILED.value,
+                message="measurement id is unknown",
+            )
+        cancel_event = self.cancellation_events.get(measurement_id)
+        if self.active_measurement_id != measurement_id or cancel_event is None:
+            return result
+        cancel_event.set()
+        result.message = "cancellation requested"
         self.measurements[measurement_id] = result
         self.cancelled_measurements.add(measurement_id)
-        if self.active_measurement_id == measurement_id:
-            self.active_measurement_id = None
         return result
 
     def execute_measurement(
         self,
         request: MeasurementRequest,
         staged_runtime_dir: Path | None = None,
+        identity_assigned: bool = False,
     ) -> MeasurementResult:
         """Run one V1 synchronous measurement path."""
 
+        if not identity_assigned:
+            requested_run_name = request.request_id
+            request.identity = None
+            request.request_id = ""
+            self._assign_execution_identity(request, requested_run_name)
+        else:
+            self._assign_execution_identity(request)
         self.measurement_accept(request)
         runtime_dir = self.create_runtime_workspace(request.request_id)
         try:
@@ -476,6 +584,9 @@ class CMSDaemon:
             result = self.bench.measurement_run(session)
             if request.request_id in self.cancelled_measurements:
                 result.state = MeasurementState.CANCELLED
+                result.finished_at = datetime.utcnow()
+                result.progress_percent = 100
+                result.current_step = MeasurementState.CANCELLED.value
                 result.message = "measurement cancelled"
         except (OSError, RuntimeError, ValueError) as exc:
             state = MeasurementState.CANCELLED if request.request_id in self.cancelled_measurements else MeasurementState.FAILED
@@ -487,6 +598,7 @@ class CMSDaemon:
                 progress_percent=100,
                 current_step=state.value,
                 message=str(exc),
+                identity=request.identity,
             )
         return self.publish_results(result)
 
@@ -543,7 +655,8 @@ class CMSDaemon:
                 mode=str(request.get("mode", "default")),
                 feature=str(request.get("feature", "")),
                 config=str(request.get("config", "default")),
-                request_id=str(request.get("request_id", "")),
+                run_name=str(request.get("run_name", "")),
+                upload_results_to_database=bool(request.get("upload_results_to_database", False)),
             )
             return measurement_result_to_dict(result)
 
@@ -626,6 +739,10 @@ class CMSDaemon:
     def _daemon_checks(self) -> list[BenchCheckResult]:
         return [
             _path_writable_check("runtime_storage", self.config.runtime_root),
+            _runtime_filesystem_check(
+                self.config.runtime_root,
+                self.config.expected_runtime_filesystems,
+            ),
             _path_writable_check("artifact_storage", self.config.artifacts_root),
             _file_check("bench_config", self.config.bench_config),
         ]
@@ -643,6 +760,25 @@ class CMSDaemon:
         result.current_step = state.value
         result.message = message
 
+    def _assign_execution_identity(
+        self,
+        request: MeasurementRequest,
+        requested_run_name: str = "",
+    ):
+        """Attach the daemon-authoritative identity for one test execution."""
+        if request.identity is not None:
+            request.request_id = request.identity.measurement_id
+            return request.identity
+
+        run_name = requested_run_name.strip() or request.request_id.strip()
+        if not run_name:
+            selector = request.selector
+            parts = [selector.feature, selector.config, request.mode.value]
+            run_name = "-".join(part for part in parts if part) or "measurement"
+        request.identity = create_measurement_identity(run_name)
+        request.request_id = request.identity.measurement_id
+        return request.identity
+
     def _raise_if_cancelled(self, measurement_id: str) -> None:
         if measurement_id in self.cancelled_measurements:
             raise RuntimeError("measurement cancelled")
@@ -657,6 +793,19 @@ class CMSDaemon:
             tester_image_hash=self.config.runtime_root / "tester.s37.sha256",
             measurement_request=self.config.runtime_root / "measurement_request.json",
         )
+
+    def _runtime_workspace_path(self, measurement_id: str) -> Path:
+        # The measurement ID becomes one directory name below runtime_root.
+        # Path.name handles platform-specific separators; comparing it with the
+        # original value rejects absolute or multi-component paths, while the
+        # explicit dot names prevent traversal outside the measurement root.
+        if (
+            not measurement_id
+            or measurement_id in {".", ".."}
+            or Path(measurement_id).name != measurement_id
+        ):
+            raise ValueError("measurement_id must be a single non-empty path component")
+        return self.config.runtime_root / "measurements" / measurement_id
 
     def _touch_staging_files(self) -> None:
         for path in self.files.as_dict().values():
@@ -683,6 +832,105 @@ def _path_writable_check(name: str, path: Path) -> BenchCheckResult:
         status=BenchCheckStatus.PASS,
         summary=f"{name} is writable",
         detail=str(path),
+    )
+
+
+def _runtime_filesystem_check(
+    path: Path,
+    expected_filesystems: tuple[str, ...],
+) -> BenchCheckResult:
+    """Verify RAM backing on Linux and report runtime storage capacity."""
+
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError as exc:
+        return BenchCheckResult(
+            name="runtime_filesystem",
+            status=BenchCheckStatus.FAIL,
+            summary="runtime filesystem capacity is unavailable",
+            detail=f"path={path}; error={exc}",
+        )
+
+    system_name = platform.system()
+    capacity_detail = (
+        f"path={path}; available_bytes={usage.free}; total_bytes={usage.total}"
+    )
+    if system_name != "Linux":
+        return BenchCheckResult(
+            name="runtime_filesystem",
+            status=BenchCheckStatus.WARN,
+            summary=f"runtime filesystem verification is unsupported on {system_name}",
+            detail=capacity_detail,
+        )
+
+    try:
+        filesystem_type = _linux_filesystem_type(path)
+    except OSError as exc:
+        return BenchCheckResult(
+            name="runtime_filesystem",
+            status=BenchCheckStatus.FAIL,
+            summary="runtime filesystem type could not be determined",
+            detail=f"{capacity_detail}; error={exc}",
+        )
+
+    expected = tuple(item.lower() for item in expected_filesystems)
+    expected_detail = ",".join(expected)
+    detail = (
+        f"{capacity_detail}; filesystem={filesystem_type or 'unknown'}; "
+        f"expected={expected_detail}"
+    )
+    if filesystem_type is None:
+        return BenchCheckResult(
+            name="runtime_filesystem",
+            status=BenchCheckStatus.FAIL,
+            summary="runtime filesystem type could not be determined",
+            detail=detail,
+        )
+    if filesystem_type.lower() not in expected:
+        return BenchCheckResult(
+            name="runtime_filesystem",
+            status=BenchCheckStatus.FAIL,
+            summary=f"runtime filesystem {filesystem_type} is not RAM-backed",
+            detail=detail,
+        )
+    return BenchCheckResult(
+        name="runtime_filesystem",
+        status=BenchCheckStatus.PASS,
+        summary=f"runtime filesystem is {filesystem_type}",
+        detail=detail,
+    )
+
+
+def _linux_filesystem_type(path: Path) -> str | None:
+    mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    return _filesystem_type_from_mountinfo(path.resolve().as_posix(), mountinfo)
+
+
+def _filesystem_type_from_mountinfo(path: str, mountinfo: str) -> str | None:
+    """Return the filesystem type of the most specific Linux mount for path."""
+
+    resolved_path = PurePosixPath(path)
+    best_match: tuple[int, str] | None = None
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+            mount_point = PurePosixPath(_decode_mountinfo_path(fields[4]))
+            filesystem_type = fields[separator + 1]
+            resolved_path.relative_to(mount_point)
+        except (IndexError, ValueError):
+            continue
+        specificity = len(mount_point.parts)
+        if best_match is None or specificity > best_match[0]:
+            best_match = (specificity, filesystem_type)
+    return best_match[1] if best_match is not None else None
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    return re.sub(
+        r"\\([0-7]{3})",
+        lambda match: chr(int(match.group(1), 8)),
+        value,
     )
 
 
@@ -725,6 +973,19 @@ def _safe_artifact_name(name: str) -> str:
     if normalized.is_absolute() or any(part in {"", ".", ".."} for part in normalized.parts):
         raise RuntimeError(f"invalid artifact name: {name}")
     return normalized.as_posix()
+
+
+def _is_publishable_final_artifact(artifact: Artifacts) -> bool:
+    """Allow only selected completed-run evidence onto persistent storage."""
+
+    artifact_name = Path((artifact.name or "").replace("\\", "/")).name
+    if artifact.result_type is ResultType.CURRENT_MEASUREMENT:
+        return True
+    if artifact.result_type is ResultType.PYTEST_JUNIT:
+        return artifact_name.lower().endswith(".xml")
+    if artifact.result_type is ResultType.DIAGNOSTIC:
+        return artifact_name in PUBLISHABLE_DIAGNOSTIC_NAMES
+    return False
 
 
 def _copy_staged_firmware(

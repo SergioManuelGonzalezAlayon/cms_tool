@@ -1,0 +1,134 @@
+{
+    "test": "legacy_conn_adv",
+    "source": {
+        "workbook": "CurrentMeasApp.xlsx",
+        "sheet": "Sheet1"
+    },
+    "generator": {
+        "base_config": "default.json",
+        "output_dir": ".",
+        "name_rule": "concise_parameter_value",
+        "name_separator": "_",
+        "steps": 4,
+        "analyses": {
+            "one_factor": {
+                "enabled": true
+            },
+            "full_sweep": {
+                "enabled": true,
+                "output_dir": "full_sweep",
+                "partition_by": "dcdc",
+                "partition_dirs": {
+                    "On": "dcdc",
+                    "Off": "no_dcdc"
+                },
+                "name_order": [
+                    "advertising_interval",
+                    "tx_payload_length",
+                    "phy",
+                    "tx_power",
+                    "supply_voltage",
+                    "dcdc"
+                ]
+            }
+        }
+    },
+    "parameters": [
+        {
+            "name": "supply_voltage",
+            "label": "Supply voltage",
+            "control": "hardware",
+            "default": "3.0 V",
+            "file_token": "vdd",
+            "values": [
+                "1.8 V",
+                "2.1 V",
+                "2.4 V",
+                "2.7 V",
+                "3.0 V",
+                "3.3 V",
+                "3.6 V"
+            ],
+            "full_sweep_values": {
+                "dcdc": [
+                    "2.4 V",
+                    "3.3 V"
+                ],
+                "no_dcdc": [
+                    "1.8 V",
+                    "2.4 V"
+                ]
+            },
+            "config_path": "hw.supply_v"
+        },
+        {
+            "name": "dcdc",
+            "label": "DCDC",
+            "control": "compile",
+            "default": "On",
+            "file_token": "dcdc",
+            "omit_value_in_name": [
+                "Off"
+            ],
+            "values": [
+                "On",
+                "Off"
+            ],
+            "config_path": "firmware.dut_slcp",
+            "options": {
+                "On": "apps/ncp_ble_dut_dcdc.slcp",
+                "Off": "apps/ncp_ble_dut.slcp"
+            }
+        },
+        {
+            "name": "phy",
+            "label": "Phy",
+            "control": "bgapi",
+            "default": "1m",
+            "file_token": "phy",
+            "config_paths": [
+                "advertiser.phy",
+                "scanner.phy"
+            ],
+            "values": [
+                "1m"
+            ]
+        },
+        {
+            "name": "tx_power",
+            "label": "TX Power",
+            "control": "bgapi",
+            "default": "0 dBm",
+            "file_token": "txp",
+            "range": {
+                "min": "0 dBm",
+                "max": "20 dBm"
+            },
+            "config_path": "advertiser.tx_power"
+        },
+        {
+            "name": "advertising_interval",
+            "label": "Advertising Interval",
+            "control": "bgapi",
+            "default": "20 ms",
+            "file_token": "adv",
+            "range": {
+                "min": "20 ms",
+                "max": "10 s"
+            },
+            "config_path": "advertiser.interval"
+        },
+        {
+            "name": "tx_payload_length",
+            "label": "TX Payload Length",
+            "control": "bgapi",
+            "default": "10 bytes",
+            "file_token": "payload",
+            "range": {
+                "min": "0 bytes",
+                "max": "31 bytes"
+            },
+            "config_path": "advertiser.payload"
+        }
+    ]
+}

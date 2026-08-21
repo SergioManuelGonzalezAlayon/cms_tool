@@ -21,6 +21,7 @@ dependencies = [
   "power-profiling-tools-val",
   "fastapi>=0.115",
   "uvicorn>=0.30",
+  "silabs-datalake-client",
 ]
 
 [tool.setuptools]
@@ -38,3 +39,11 @@ filterwarnings = [
 
 [tool.uv.sources]
 power-profiling-tools-val = { git = "https://stash.silabs.com/scm/mcuw_val_sw/power_profiling_tools_val.git" }
+
+silabs-datalake-client = { index = "silabs-artifactory" }
+
+
+[[tool.uv.index]]
+name = "silabs-artifactory"
+url = "https://artifactory.silabs.net/artifactory/api/pypi/infrasw-python-local/simple"
+explicit = true

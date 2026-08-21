@@ -9,15 +9,18 @@ bench hardware and execute one measurement run at a time when asked by
 from __future__ import annotations
 
 import json
+import os
 import platform
+import signal
 import shutil
 import hashlib
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
@@ -29,16 +32,24 @@ from cms_protocol import (
     BenchIdentity,
     BenchState,
     DeviceState,
+    EventCursor,
     Artifacts,
     FirmwareData,
     MeasurementRequest,
     MeasurementResult,
     MeasurementState,
+    ResultType,
     measurement_request_to_dict,
     measurement_result_to_dict,
+    measurement_identity_to_dict,
 )
 
 CMS_BENCH_CONFIG = "cms_bench_runtime.json"
+DEFAULT_CONSOLE_LOG_MAX_BYTES = 2 * 1024 * 1024
+DEFAULT_CONSOLE_EVENT_MAX_BYTES = 4 * 1024 * 1024
+DEFAULT_EXECUTION_TIMEOUT_S = 5 * 60
+PROCESS_TERMINATE_GRACE_S = 5.0
+MAX_CONSOLE_EVENT_SEGMENT_BYTES = 64 * 1024
 
 
 @dataclass(slots=True)
@@ -54,11 +65,191 @@ class BenchResources:
     board: str = ""
     board_rev: str = ""
     device: str = ""
+    part_number: str = ""
+    serial_number: str = ""
     result_db: str = ""
     commander_path: str = ""
     xapi_path: str = ""
     group_id: int | None = None
     group_name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementRuntimePaths:
+    """Standard active files owned by one measurement runtime workspace."""
+
+    root: Path
+    status: Path
+    events: Path
+    console_events: Path
+    stdout: Path
+    stderr: Path
+
+    @classmethod
+    def from_root(cls, root: Path) -> "MeasurementRuntimePaths":
+        return cls(
+            root=root,
+            status=root / "current_status.json",
+            events=root / "events.jsonl",
+            console_events=root / "console_events",
+            stdout=root / "test_stdout.log",
+            stderr=root / "test_stderr.log",
+        )
+
+    def active_paths(self) -> tuple[Path, ...]:
+        return (self.status, self.events, self.console_events, self.stdout, self.stderr)
+
+
+class MeasurementEventStream:
+    """Thread-safe append-only events and atomic status for one measurement."""
+
+    def __init__(
+        self,
+        measurement_id: str,
+        paths: MeasurementRuntimePaths,
+        *,
+        max_console_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES,
+    ):
+        if max_console_bytes < 512:
+            raise ValueError("max_console_bytes must be at least 512")
+        self.measurement_id = measurement_id
+        self.paths = paths
+        self.max_console_bytes = max_console_bytes
+        self._segment_target_bytes = min(
+            MAX_CONSOLE_EVENT_SEGMENT_BYTES,
+            max_console_bytes,
+        )
+        self._lock = threading.Lock()
+        self._console_segments = _console_segment_paths(paths.console_events)
+        self._console_segment_bytes = sum(path.stat().st_size for path in self._console_segments)
+        self._cursor = EventCursor(_last_event_cursor(paths))
+        self._oldest_retained_cursor = _first_console_cursor(self._console_segments)
+        if self._oldest_retained_cursor == 0 and self._cursor.value:
+            self._oldest_retained_cursor = 1
+        self._truncated_log_sources = _truncated_log_sources(paths.events)
+
+    @property
+    def cursor(self) -> int:
+        with self._lock:
+            return self._cursor.value
+
+    @property
+    def oldest_retained_cursor(self) -> int:
+        with self._lock:
+            return self._oldest_retained_cursor
+
+    def append_lifecycle(self, state: str, **details: Any) -> dict[str, Any]:
+        with self._lock:
+            return self._append_structured_locked(state, **details)
+
+    def append_console(self, source: str, text: str) -> dict[str, Any]:
+        if source not in {"stdout", "stderr"}:
+            raise ValueError("console event source must be stdout or stderr")
+        with self._lock:
+            record = self._next_record_locked("console", source=source, text=text)
+            payload, record = _bounded_console_payload(record, self.max_console_bytes)
+            self._append_console_payload_locked(record["cursor"], payload)
+            self._cursor = EventCursor(record["cursor"])
+            discarded_through = self._prune_console_segments_locked()
+            if discarded_through is not None:
+                self._oldest_retained_cursor = _first_console_cursor(self._console_segments)
+                self._append_structured_locked(
+                    "console_truncated",
+                    discarded_through_cursor=discarded_through,
+                    oldest_retained_cursor=self._oldest_retained_cursor,
+                )
+            elif self._oldest_retained_cursor == 0:
+                self._oldest_retained_cursor = record["cursor"]
+            return record
+
+    def record_log_truncation(self, source: str, discarded_bytes: int) -> None:
+        """Record the first bounded-tail truncation for each raw output log."""
+
+        with self._lock:
+            if source in self._truncated_log_sources:
+                return
+            self._truncated_log_sources.add(source)
+            self._append_structured_locked(
+                "log_truncated",
+                source=source,
+                discarded_bytes=discarded_bytes,
+            )
+
+    def read_events(self) -> list[dict[str, Any]]:
+        """Return retained structured and console events in cursor order."""
+
+        with self._lock:
+            records = _read_jsonl_records(self.paths.events)
+            for segment in self._console_segments:
+                records.extend(_read_jsonl_records(segment))
+            return sorted(records, key=lambda record: int(record.get("cursor", 0)))
+
+    def replace_status(self, status: dict[str, Any]) -> None:
+        """Atomically replace the small current-status snapshot."""
+
+        with self._lock:
+            snapshot = {
+                **status,
+                "measurement_id": self.measurement_id,
+                "cursor": self._cursor.value,
+                "oldest_retained_cursor": self._oldest_retained_cursor,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.paths.root.mkdir(parents=True, exist_ok=True)
+            temporary_path = self.paths.status.with_name(self.paths.status.name + ".tmp")
+            temporary_path.write_text(
+                json.dumps(snapshot, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary_path, self.paths.status)
+
+    def _next_record_locked(self, event_type: str, **details: Any) -> dict[str, Any]:
+        return {
+            **details,
+            "measurement_id": self.measurement_id,
+            "cursor": self._cursor.next().value,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": event_type,
+        }
+
+    def _append_structured_locked(self, state: str, **details: Any) -> dict[str, Any]:
+        record = self._next_record_locked("lifecycle", state=state, **details)
+        self.paths.root.mkdir(parents=True, exist_ok=True)
+        with self.paths.events.open("a", encoding="utf-8") as event_file:
+            event_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+            event_file.flush()
+        self._cursor = EventCursor(record["cursor"])
+        if self._oldest_retained_cursor == 0:
+            self._oldest_retained_cursor = record["cursor"]
+        return record
+
+    def _append_console_payload_locked(self, cursor: int, payload: bytes) -> None:
+        self.paths.console_events.mkdir(parents=True, exist_ok=True)
+        current = self._console_segments[-1] if self._console_segments else None
+        if (
+            current is None
+            or (current.stat().st_size > 0 and current.stat().st_size + len(payload) > self._segment_target_bytes)
+        ):
+            current = self.paths.console_events / f"{cursor:020d}.jsonl"
+            self._console_segments.append(current)
+        with current.open("ab") as segment_file:
+            segment_file.write(payload)
+            segment_file.flush()
+        self._console_segment_bytes += len(payload)
+
+    def _prune_console_segments_locked(self) -> int | None:
+        discarded_through: int | None = None
+        while self._console_segment_bytes > self.max_console_bytes and len(self._console_segments) > 1:
+            oldest = self._console_segments.pop(0)
+            oldest_records = _read_jsonl_records(oldest)
+            if oldest_records:
+                discarded_through = max(
+                    discarded_through or 0,
+                    max(int(record["cursor"]) for record in oldest_records),
+                )
+            self._console_segment_bytes -= oldest.stat().st_size
+            oldest.unlink()
+        return discarded_through
 
 
 @dataclass(slots=True)
@@ -70,6 +261,22 @@ class BenchSession:
     manifest: FirmwareData
     request: MeasurementRequest
     notes: list[str] = field(default_factory=list)
+    max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
+    max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
+    execution_timeout_s: float = DEFAULT_EXECUTION_TIMEOUT_S
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    event_stream: MeasurementEventStream = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.event_stream = MeasurementEventStream(
+            self.measurement_id,
+            self.runtime_paths,
+            max_console_bytes=self.max_console_event_bytes,
+        )
+
+    @property
+    def runtime_paths(self) -> MeasurementRuntimePaths:
+        return MeasurementRuntimePaths.from_root(self.runtime_dir)
 
 
 @dataclass(slots=True)
@@ -315,6 +522,7 @@ class CMSBench:
                 progress_percent=90,
                 current_step=MeasurementState.COLLECTING_ARTIFACTS.value,
                 message="test execution completed" if completed.returncode == 0 else "test execution failed",
+                identity=session.request.identity,
             )
             run_summary_path = session.runtime_dir / "cms_test_run.json"
             run_summary_path.write_text(
@@ -341,6 +549,7 @@ class CMSBench:
                 progress_percent=100,
                 current_step=MeasurementState.FAILED.value,
                 message=str(exc),
+                identity=session.request.identity,
             )
         finally:
             self.state = BenchState.IDLE
@@ -354,14 +563,27 @@ class CMSBench:
     ) -> MeasurementResult:
         """Attach local artifact metadata after the execution step finishes."""
         for path in _run_diagnostic_artifacts(session):
+            relative_path = path.relative_to(session.runtime_dir)
+            result_type = (
+                ResultType.PYTEST_JUNIT
+                if relative_path.parts and relative_path.parts[0] == "junit"
+                else ResultType.DIAGNOSTIC
+            )
             result.artifacts.append(
                 Artifacts(
-                    name=(Path("cmsd") / session.measurement_id / path.name).as_posix(),
+                    name=(Path("cmsd") / session.measurement_id / relative_path).as_posix(),
                     path=path,
+                    result_type=result_type,
                 )
             )
         for path in _real_test_artifacts(session, since=artifact_since):
-            result.artifacts.append(Artifacts(name=_artifact_name(Path("artifacts"), path), path=path))
+            result.artifacts.append(
+                Artifacts(
+                    name=_artifact_name(Path("artifacts"), path),
+                    path=path,
+                    result_type=ResultType.CURRENT_MEASUREMENT,
+                )
+            )
         result.progress_percent = 100
         if result.state is MeasurementState.PASSED:
             result.current_step = MeasurementState.PASSED.value
@@ -456,6 +678,8 @@ def load_bench_runtime_config(path: str | Path = CMS_BENCH_CONFIG) -> tuple[Benc
         board=identity.board,
         board_rev=str(devices.get("board_rev", devices.get("brev", ""))),
         device=identity.device,
+        part_number=str(devices.get("part_number", devices.get("device", ""))),
+        serial_number=str(devices.get("serial_number", "")),
         result_db=str(config.get("result_db", "")),
         commander_path=str(tools.get("commander", config.get("commander", ""))),
         xapi_path=str(ble.get("xapi", tools.get("xapi", config.get("xapi", "")))),
@@ -482,6 +706,8 @@ def resolve_cms_resources_from_dev_config(dev_config: dict[str, Any]) -> BenchRe
         board=str(firmware.get("board", "")),
         board_rev=str(firmware.get("brev", firmware.get("board_rev", ""))),
         device=str(firmware.get("device", "")),
+        part_number=str(firmware.get("part_number", firmware.get("device", ""))),
+        serial_number=str(firmware.get("serial_number", "")),
         commander_path=str(tools.get("commander", dev_config.get("commander", ""))),
         xapi_path=str(ble.get("xapi", tools.get("xapi", dev_config.get("xapi", "")))),
     )
@@ -524,6 +750,13 @@ def resolve_cms_resources_from_hwmux(group_json: dict[str, Any]) -> BenchResourc
         board=str(metadata.get("cms_board", dut.get("part", {}).get("board_no", ""))),
         board_rev=str(metadata.get("cms_board_rev", dut.get("part", {}).get("board_rev", ""))),
         device=str(metadata.get("cms_device", dut.get("part", {}).get("variant", ""))),
+        part_number=str(
+            metadata.get(
+                "cms_part_number",
+                metadata.get("cms_device", dut.get("part", {}).get("variant", "")),
+            )
+        ),
+        serial_number=str(metadata.get("cms_serial_number", dut.get("serial_number", ""))),
     )
 
 
@@ -546,11 +779,24 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
     xapi_path = _staged_xapi_path(session)
 
     metadata = {
+        "identity": (
+            measurement_identity_to_dict(session.request.identity)
+            if session.request.identity is not None
+            else {
+                "measurement_id": session.measurement_id,
+                "run_name": session.measurement_id,
+                "created_at": "",
+            }
+        ),
         "firmware": {
             "build_root": str(build_root),
             "provision_state_root": str(Path("artifacts") / "cmsd" / "provision_state"),
             "board": resources.board,
             "brev": resources.board_rev,
+            "board_rev": resources.board_rev,
+            "board_revision": resources.board_rev,
+            "part_number": resources.part_number or resources.device,
+            "serial_number": resources.serial_number,
             "device": resources.device,
             "sisdk": session.manifest.sisdk_version,
             "dut_image": str(session.runtime_dir / session.manifest.dut_img.name),
@@ -620,7 +866,238 @@ def _copy_bootloader_image(session: BenchSession, build_root: Path) -> Path | No
     return _copy_image_to_project(source, build_root / "bootloader-uart-bgapi")
 
 
-def _run_test_orchestrator(session: BenchSession, results_log: Path, metadata_path: Path) -> subprocess.CompletedProcess:
+def _run_managed_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    stdout_path: Path,
+    stderr_path: Path,
+    event_stream: MeasurementEventStream | None = None,
+    log_max_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES,
+    timeout_s: float = DEFAULT_EXECUTION_TIMEOUT_S,
+    cancel_event: threading.Event | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a child while draining both output pipes into active runtime logs."""
+
+    if log_max_bytes < 1:
+        raise ValueError("log_max_bytes must be positive")
+    if timeout_s <= 0:
+        raise ValueError("timeout_s must be positive")
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+
+    child_environment = os.environ.copy()
+    child_environment["PYTHONUNBUFFERED"] = "1"
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=child_environment,
+        start_new_session=platform.system() == "Linux",
+    )
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("managed child process did not expose stdout and stderr pipes")
+
+    if event_stream is not None:
+        event_stream.append_lifecycle(
+            "process_started",
+            pid=process.pid,
+            command=command,
+        )
+        event_stream.replace_status(
+            {
+                "state": "running",
+                "pid": process.pid,
+                "command": command,
+            }
+        )
+
+    drain_errors: list[OSError] = []
+    stdout_thread = threading.Thread(
+        target=_drain_process_stream,
+        args=(
+            process.stdout,
+            stdout_path,
+            "stdout",
+            event_stream,
+            log_max_bytes,
+            drain_errors,
+        ),
+        name="cms-stdout-drain",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_process_stream,
+        args=(
+            process.stderr,
+            stderr_path,
+            "stderr",
+            event_stream,
+            log_max_bytes,
+            drain_errors,
+        ),
+        name="cms-stderr-drain",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    timed_out = False
+    cancelled = False
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            if event_stream is not None:
+                event_stream.append_lifecycle(
+                    "process_cancellation_requested",
+                    pid=process.pid,
+                )
+                event_stream.replace_status(
+                    {
+                        "state": "process_cancellation_requested",
+                        "pid": process.pid,
+                    }
+                )
+            _terminate_process_tree(process)
+            returncode = process.returncode if process.returncode is not None else -1
+            break
+
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            timed_out = True
+            break
+        try:
+            returncode = process.wait(timeout=min(0.1, remaining_s))
+            break
+        except subprocess.TimeoutExpired:
+            continue
+
+    if timed_out:
+        if event_stream is not None:
+            event_stream.append_lifecycle(
+                "process_timed_out",
+                pid=process.pid,
+                timeout_s=timeout_s,
+            )
+            event_stream.replace_status(
+                {
+                    "state": "process_timed_out",
+                    "pid": process.pid,
+                    "timeout_s": timeout_s,
+                }
+            )
+        _terminate_process_tree(process)
+        returncode = process.returncode if process.returncode is not None else -1
+    stdout_thread.join()
+    stderr_thread.join()
+    if event_stream is not None and cancelled:
+        event_stream.append_lifecycle(
+            "process_cancelled",
+            returncode=returncode,
+            output_error=bool(drain_errors),
+        )
+        event_stream.replace_status(
+            {
+                "state": "process_cancelled",
+                "returncode": returncode,
+                "output_error": bool(drain_errors),
+            }
+        )
+    elif event_stream is not None and not timed_out:
+        event_stream.append_lifecycle(
+            "process_completed",
+            returncode=returncode,
+            output_error=bool(drain_errors),
+        )
+        event_stream.replace_status(
+            {
+                "state": "process_completed",
+                "returncode": returncode,
+                "output_error": bool(drain_errors),
+            }
+        )
+    if drain_errors:
+        detail = "; ".join(str(error) for error in drain_errors)
+        raise RuntimeError(f"failed to drain child process output: {detail}")
+    if timed_out:
+        raise RuntimeError(f"orchestrator timed out after {timeout_s:g} seconds")
+
+    return subprocess.CompletedProcess(
+        command,
+        returncode,
+        stdout=stdout_path.read_text(encoding="utf-8"),
+        stderr=stderr_path.read_text(encoding="utf-8"),
+    )
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Stop a managed child and its Linux process group within a fixed grace period."""
+
+    linux_process_group = platform.system() == "Linux"
+    try:
+        if linux_process_group:
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        process.wait()
+        return
+
+    try:
+        process.wait(timeout=PROCESS_TERMINATE_GRACE_S)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        if linux_process_group:
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        process.wait()
+        return
+    process.wait()
+
+
+def _drain_process_stream(
+    stream,
+    destination: Path,
+    source: str,
+    event_stream: MeasurementEventStream | None,
+    log_max_bytes: int,
+    errors: list[OSError],
+) -> None:
+    try:
+        for line in stream:
+            discarded_bytes = _append_bounded_log(
+                destination,
+                line,
+                max_bytes=log_max_bytes,
+            )
+            if event_stream is not None:
+                event_stream.append_console(source, line)
+                if discarded_bytes:
+                    event_stream.record_log_truncation(source, discarded_bytes)
+    except OSError as exc:
+        errors.append(exc)
+    finally:
+        stream.close()
+
+
+def _run_test_orchestrator(
+    session: BenchSession,
+    results_log: Path,
+    metadata_path: Path,
+) -> subprocess.CompletedProcess[str]:
     feature = session.request.selector.feature
     if not feature:
         raise RuntimeError("test feature is required")
@@ -632,6 +1109,7 @@ def _run_test_orchestrator(session: BenchSession, results_log: Path, metadata_pa
     orchestrator_mode = "full_sweep" if mode == "full_sweep" else "default"
     cmd = [
         sys.executable,
+        "-u",
         "test_orchestrator.py",
         str(config_dir),
         "--mode",
@@ -653,23 +1131,39 @@ def _run_test_orchestrator(session: BenchSession, results_log: Path, metadata_pa
     ]
     if session.request.selector.config != "default":
         cmd.extend(["--cfg", session.request.selector.config])
+    if session.request.upload_results_to_database:
+        cmd.append("--upload-results-to-database")
 
-    completed = subprocess.run(cmd, cwd=Path("."), check=False, text=True, capture_output=True)
-    (session.runtime_dir / "test_stdout.log").write_text(completed.stdout, encoding="utf-8")
-    (session.runtime_dir / "test_stderr.log").write_text(completed.stderr, encoding="utf-8")
-    return completed
+    return _run_managed_process(
+        cmd,
+        cwd=Path("."),
+        stdout_path=session.runtime_paths.stdout,
+        stderr_path=session.runtime_paths.stderr,
+        event_stream=session.event_stream,
+        log_max_bytes=session.max_console_log_bytes,
+        timeout_s=session.execution_timeout_s,
+        cancel_event=session.cancel_event,
+    )
 
 
 def _run_diagnostic_artifacts(session: BenchSession) -> list[Path]:
     names = [
         "cms_fw_metadata.json",
         "cms_test_run.json",
+        "orchestrator_plan.json",
         "orchestrator_results.jsonl",
         "pytest.log",
-        "test_stdout.log",
-        "test_stderr.log",
     ]
-    return [path for name in names if (path := session.runtime_dir / name).exists()]
+    artifacts = [path for name in names if (path := session.runtime_dir / name).exists()]
+    artifacts.extend(
+        path
+        for path in (session.runtime_paths.stdout, session.runtime_paths.stderr)
+        if path.exists()
+    )
+    junit_dir = session.runtime_dir / "junit"
+    if junit_dir.exists():
+        artifacts.extend(sorted(junit_dir.glob("*.xml")))
+    return artifacts
 
 
 def _load_requested_test_config(session: BenchSession) -> dict[str, Any]:
@@ -727,6 +1221,98 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _append_bounded_log(path: Path, text: str, *, max_bytes: int) -> int:
+    encoded = text.encode("utf-8")
+    current_size = path.stat().st_size if path.exists() else 0
+    if current_size + len(encoded) <= max_bytes:
+        with path.open("ab") as output:
+            output.write(encoded)
+            output.flush()
+        return 0
+
+    combined = (path.read_bytes() if path.exists() else b"") + encoded
+    target_bytes = max(1, max_bytes // 2)
+    retained = combined[-target_bytes:].decode("utf-8", errors="ignore").encode("utf-8")
+    temporary_path = path.with_name(path.name + ".tmp")
+    temporary_path.write_bytes(retained)
+    os.replace(temporary_path, path)
+    return len(combined) - len(retained)
+
+
+def _bounded_console_payload(
+    record: dict[str, Any],
+    max_bytes: int,
+) -> tuple[bytes, dict[str, Any]]:
+    def serialize(candidate: dict[str, Any]) -> bytes:
+        return (json.dumps(candidate, separators=(",", ":")) + "\n").encode("utf-8")
+
+    payload = serialize(record)
+    if len(payload) <= max_bytes:
+        return payload, record
+
+    original_text = str(record.get("text", ""))
+    low = 0
+    high = len(original_text)
+    best_record = {**record, "text": "", "text_truncated": True}
+    best_payload = serialize(best_record)
+    if len(best_payload) > max_bytes:
+        raise ValueError("max_console_bytes is too small for console event metadata")
+    while low <= high:
+        retained_characters = (low + high) // 2
+        candidate = {
+            **record,
+            "text": original_text[-retained_characters:] if retained_characters else "",
+            "text_truncated": True,
+        }
+        candidate_payload = serialize(candidate)
+        if len(candidate_payload) <= max_bytes:
+            best_record = candidate
+            best_payload = candidate_payload
+            low = retained_characters + 1
+        else:
+            high = retained_characters - 1
+    return best_payload, best_record
+
+
+def _console_segment_paths(directory: Path) -> list[Path]:
+    if not directory.exists():
+        return []
+    return sorted(path for path in directory.glob("*.jsonl") if path.is_file())
+
+
+def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _last_event_cursor(paths: MeasurementRuntimePaths) -> int:
+    records = _read_jsonl_records(paths.events)
+    for segment in _console_segment_paths(paths.console_events):
+        records.extend(_read_jsonl_records(segment))
+    return max((int(record.get("cursor", 0)) for record in records), default=0)
+
+
+def _first_console_cursor(segments: list[Path]) -> int:
+    for segment in segments:
+        records = _read_jsonl_records(segment)
+        if records:
+            return int(records[0].get("cursor", 0))
+    return 0
+
+
+def _truncated_log_sources(path: Path) -> set[str]:
+    return {
+        str(record.get("source"))
+        for record in _read_jsonl_records(path)
+        if record.get("state") == "log_truncated" and record.get("source")
+    }
 
 
 def _optional_int(value: Any) -> int | None:

@@ -52,6 +52,8 @@ class CMSClientConfig:
     api_token: str = ""
     timeout_s: float = 30.0
     target: dict[str, str] | None = None
+    build: dict[str, str] | None = None
+    tools: dict[str, str] | None = None
 
 
 class CMSClient:
@@ -111,7 +113,8 @@ class CMSClient:
         mode: MeasurementMode,
         feature: str,
         config: str = "default",
-        request_id: str = "",
+        upload_results_to_database: bool = False,
+        run_name: str = "",
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
         payload = self._request_json(
@@ -121,7 +124,8 @@ class CMSClient:
                 "mode": mode.value,
                 "feature": feature,
                 "config": config,
-                "request_id": request_id,
+                "run_name": run_name,
+                "upload_results_to_database": upload_results_to_database,
             },
         )
         return measurement_result_from_dict(payload)
@@ -253,6 +257,8 @@ def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
         api_token=str(daemon.get("api_token", config.get("api_token", "silabs-cms"))),
         timeout_s=float(daemon.get("timeout_s", config.get("timeout_s", 30.0))),
         target={str(key): str(value) for key, value in config.get("target", {}).items()},
+        build={str(key): str(value) for key, value in config.get("build", {}).items()},
+        tools={str(key): str(value) for key, value in config.get("tools", {}).items()},
     )
 
 
@@ -270,6 +276,10 @@ def build_cli_parser() -> argparse.ArgumentParser:
     build = subparsers.add_parser("build", aliases=["BUILD"], help="build local firmware with SLC config")
     build.add_argument("targets", nargs="*", help="optional .slcp targets or app directories")
     build.add_argument("--action", default="build", choices=["generate", "upgrade", "build", "rebuild"])
+    build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
+    build.add_argument("--sisdk-version", default="", help="override selected SiSDK version")
+    build.add_argument("--build-root", default="", help="override firmware build root")
+    build.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
 
     send_fw = subparsers.add_parser("send_fw", aliases=["SEND_FW"], help="send firmware and metadata to the bench")
     send_fw.add_argument("--request-json", help="load the full firmware request from JSON")
@@ -285,14 +295,28 @@ def build_cli_parser() -> argparse.ArgumentParser:
     send_fw.add_argument("--git-commit", default="", help="firmware source commit")
     send_fw.add_argument("--sisdk-version", default="", help="SiSDK version")
     send_fw.add_argument("--sisdk-commit", default="", help="SiSDK commit")
+    send_fw.add_argument("--build-root", default="", help="override firmware build root used for provenance")
     send_fw.add_argument("--requested-by", default="", help="request owner")
 
     test = subparsers.add_parser("test", aliases=["TEST"], help="run a remote test with staged firmware")
     test.add_argument("mode", choices=[mode.value for mode in MeasurementMode])
     test.add_argument("feature")
     test.add_argument("--config-name", default="default", help="test config")
-    test.add_argument("--request-id", default="", help="test run id")
+    test.add_argument(
+        "--run-name",
+        dest="run_name",
+        default="",
+        help="human-readable test run name",
+    )
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
+    test.add_argument(
+        "--send-to-database",
+        "--upload-results-to-database",
+        action="store_true",
+        dest="upload_results_to_database",
+        help="also upload generated result JSON files to the configured database/data lake",
+    )
+
 
     measurement = subparsers.add_parser("measurement", help="show measurement status")
     measurement.add_argument("measurement_id")
@@ -335,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command in {"build", "BUILD"}:
-        return _run_local_build(args.action, args.targets)
+        return _run_local_build(args, args.config)
 
     if args.command in {"send_fw", "SEND_FW"}:
         request = _request_from_send_fw_args(args, client_config)
@@ -352,7 +376,8 @@ def main(argv: list[str] | None = None) -> int:
             MeasurementMode(args.mode),
             args.feature,
             config=args.config_name,
-            request_id=args.request_id,
+            run_name=args.run_name,
+            upload_results_to_database=args.upload_results_to_database,
         )
         if result.measurement_id:
             result = _poll_test_progress(client, result.measurement_id)
@@ -385,9 +410,40 @@ def _request_from_send_fw_args(
         with Path(args.request_json).open("r", encoding="utf-8") as request_file:
             return measurement_request_from_dict(json.load(request_file))
 
-    dev_cfg = _read_json_file(Path("dev_config.json"))
-    firmware_cfg = dev_cfg.get("firmware", {})
     target_cfg = client_config.target if client_config and client_config.target else {}
+    build_cfg = client_config.build if client_config and client_config.build else {}
+    build_root = Path(args.build_root or str(build_cfg.get("root", ".fw_build")))
+    fw_data = _read_json_file(build_root / "fw_data.json")
+    if not fw_data:
+        raise RuntimeError(
+            f"Build provenance is missing: {build_root / 'fw_data.json'}. "
+            "Run `cms build` before creating a firmware request."
+        )
+    firmware_cfg = dict(fw_data.get("firmware", {}))
+    firmware_cfg["build_root"] = str(build_root)
+    sdk_cfg = fw_data.get("sdk", {})
+    sdk_source = str(sdk_cfg.get("source", ""))
+    sdk_version = str(sdk_cfg.get("version", firmware_cfg.get("sisdk", "")))
+    sdk_commit = str(sdk_cfg.get("commit", ""))
+    sdk_hash = str(sdk_cfg.get("hash", ""))
+    recorded_xapi_hash = str(sdk_cfg.get("xapi_sha256", ""))
+    missing_provenance = [
+        name
+        for name, value in (
+            ("sdk.source", sdk_source),
+            ("sdk.version", sdk_version),
+            ("sdk.xapi_sha256", recorded_xapi_hash),
+        )
+        if not value
+    ]
+    if missing_provenance:
+        raise RuntimeError(
+            "Build provenance is incomplete in "
+            f"{build_root / 'fw_data.json'}: {', '.join(missing_provenance)}. "
+            "Run `cms build` again before creating a firmware request."
+        )
+    _require_matching_build_provenance("SiSDK version", args.sisdk_version, sdk_version)
+    _require_matching_build_provenance("SiSDK commit", args.sisdk_commit, sdk_commit)
     dut_image_arg = args.dut_image or str(target_cfg.get("dut_image", ""))
     tester_image_arg = args.tester_image or str(target_cfg.get("tester_image", ""))
     bootloader_image_arg = args.bootloader_image or str(target_cfg.get("bootloader_image", ""))
@@ -397,9 +453,34 @@ def _request_from_send_fw_args(
         bootloader_image_arg,
         "bootloader",
         firmware_cfg,
-    ) if bootloader_image_arg or firmware_cfg.get("bootloader_slcp") else None
-    xapi_file = _xapi_file_from_config(dev_cfg, target_cfg)
+    ) if bootloader_image_arg or firmware_cfg.get("bootloader_app_hash") else None
+    dut_sha256 = _selected_firmware_sha256(
+        dut_image,
+        requested=args.dut_sha256,
+        fallback=str(target_cfg.get("dut_sha256", firmware_cfg.get("dut_app_hash", ""))),
+    )
+    tester_sha256 = _selected_firmware_sha256(
+        tester_image,
+        requested=args.tester_sha256,
+        fallback=str(target_cfg.get("tester_sha256", firmware_cfg.get("tester_app_hash", ""))),
+    )
+    bootloader_sha256 = (
+        _selected_firmware_sha256(
+            bootloader_image,
+            requested=args.bootloader_sha256,
+            fallback=str(
+                target_cfg.get("bootloader_sha256", firmware_cfg.get("bootloader_app_hash", ""))
+            ),
+        )
+        if bootloader_image is not None
+        else ""
+    )
+    xapi_file = Path(str(fw_data.get("build", {}).get("xapi", build_root / "runtime" / "sl_bt.xapi")))
+    if not xapi_file.is_file():
+        raise RuntimeError(f"Staged sl_bt.xapi from the selected build does not exist: {xapi_file}")
     xapi_hash = _sha256_file(xapi_file)
+    if recorded_xapi_hash != xapi_hash:
+        raise RuntimeError("Staged sl_bt.xapi hash does not match the selected build provenance")
 
     request_id = args.request_id or f"cms-{int(time.time())}"
     return MeasurementRequest(
@@ -409,19 +490,19 @@ def _request_from_send_fw_args(
             dut_img=FirmwareImage(
                 name=dut_image["name"],
                 url=dut_image["url"],
-                sha256=args.dut_sha256 or str(target_cfg.get("dut_sha256", "")),
+                sha256=dut_sha256,
             ),
             tester_img=FirmwareImage(
                 name=tester_image["name"],
                 url=tester_image["url"],
-                sha256=args.tester_sha256 or str(target_cfg.get("tester_sha256", "")),
+                sha256=tester_sha256,
             ),
             bootloader_img=FirmwareImage(
                 name=bootloader_image["name"],
                 url=bootloader_image["url"],
-                sha256=args.bootloader_sha256 or str(target_cfg.get("bootloader_sha256", "")),
+                sha256=bootloader_sha256,
             ) if bootloader_image is not None else None,
-            bootloader_img_hash=args.bootloader_sha256 or str(target_cfg.get("bootloader_sha256", "")),
+            bootloader_img_hash=bootloader_sha256,
             board=args.board or str(target_cfg.get("board", firmware_cfg.get("board", ""))),
             device=args.device or str(target_cfg.get("device", firmware_cfg.get("device", ""))),
             xapi_file=FirmwareImage(
@@ -431,15 +512,34 @@ def _request_from_send_fw_args(
             ),
             xapi_file_hash=xapi_hash,
             git_commit=args.git_commit,
-            sisdk_version=args.sisdk_version or str(target_cfg.get("sisdk", firmware_cfg.get("sisdk", ""))),
-            sisdk_commit=args.sisdk_commit or str(target_cfg.get("sisdk_commit", "")),
+            sisdk_source=sdk_source,
+            sisdk_version=sdk_version,
+            sisdk_commit=sdk_commit,
+            sisdk_hash=sdk_hash,
         ),
         requested_by=args.requested_by,
     )
 
 
-def _run_local_build(action: str, targets: list[str]) -> int:
-    cmd = [sys.executable, str(Path("apps") / "app_manager.py"), action, *targets]
+def _require_matching_build_provenance(label: str, requested: str, built: str) -> None:
+    if requested and requested != built:
+        raise RuntimeError(
+            f"Requested {label} '{requested}' does not match the firmware build provenance '{built}'. "
+            "Rebuild with the requested SDK selection before sending firmware."
+        )
+
+
+def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
+    cmd = [sys.executable, str(Path("apps") / "app_manager.py"), args.action, *args.targets]
+    for option, value in (
+        ("--config", config_path),
+        ("--sdk-package-path", args.sdk_package_path),
+        ("--sisdk-version", args.sisdk_version),
+        ("--build-root", args.build_root),
+        ("--bootloader-slcp", args.bootloader_slcp),
+    ):
+        if value:
+            cmd.extend([option, value])
     result = subprocess.run(cmd, check=False)
     return result.returncode
 
@@ -476,14 +576,20 @@ def _firmware_image_from_arg(value: str, role: str, firmware_cfg: dict[str, Any]
     return {"name": path.name, "url": str(path)}
 
 
-def _xapi_file_from_config(dev_cfg: dict[str, Any], target_cfg: dict[str, str]) -> Path:
-    value = str(target_cfg.get("xapi", "") or dev_cfg.get("ble", {}).get("xapi", "")).strip()
-    if not value:
-        raise RuntimeError("No sl_bt.xapi configured. Set dev_config.json ble.xapi or cms_client_config.json target.xapi.")
-    path = Path(value)
-    if not path.exists() or not path.is_file():
-        raise RuntimeError(f"sl_bt.xapi does not exist: {path}")
-    return path
+def _selected_firmware_sha256(
+    image: dict[str, str],
+    *,
+    requested: str,
+    fallback: str,
+) -> str:
+    """Hash the exact local image that will be uploaded to the Bench."""
+
+    if requested:
+        return requested
+    source = image["url"]
+    if source.startswith("http://") or source.startswith("https://"):
+        return fallback
+    return _sha256_file(Path(source))
 
 
 def _sha256_file(path: Path) -> str:
@@ -513,6 +619,9 @@ def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
 
 def _print_measurement_result(result: MeasurementResult) -> None:
     print(f"{result.measurement_id}: {result.state.value} {result.progress_percent}%")
+    if result.identity is not None:
+        print(f"run_name: {result.identity.run_name}")
+        print(f"created_at: {result.identity.created_at.isoformat()}")
     if result.message:
         print(result.message)
     for artifact in result.artifacts:
