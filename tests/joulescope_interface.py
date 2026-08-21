@@ -349,7 +349,7 @@ def _reset_joulescope_usb(usb_id: str) -> None:
                 attempts,
             )
             result = subprocess.run(
-                ["sudo", "-n", "usbreset", usb_id],
+                ["usbreset", usb_id],
                 capture_output=True,
                 text=True,
                 check=True,
