@@ -17,31 +17,84 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from cms_protocol import (
+    CMS_OBSERVATION_PROTOCOL_VERSION,
+    Artifacts,
     BenchHealthReport,
     BenchIdentity,
     BenchState,
     BenchStatus,
     FirmwareImage,
     FirmwareData,
+    EventCursor,
+    MeasurementEventPage,
     MeasurementMode,
     MeasurementRequest,
     MeasurementResult,
     MeasurementState,
+    MeasurementSummary,
     SuiteSelector,
+    artifact_from_dict,
+    artifact_to_dict,
     bench_health_report_from_dict,
     measurement_request_from_dict,
     measurement_request_to_dict,
     measurement_result_from_dict,
+    measurement_event_page_from_dict,
+    measurement_summary_from_dict,
 )
 
 CMS_CLIENT_CONFIG = "cms_client_config.json"
+TERMINAL_MEASUREMENT_STATES = frozenset(
+    {
+        MeasurementState.PASSED,
+        MeasurementState.FAILED,
+        MeasurementState.CANCELLED,
+        MeasurementState.REJECTED,
+    }
+)
+
+
+class CMSCLIExitCode(IntEnum):
+    """Stable process outcomes for scripts, developers, and future CI."""
+
+    SUCCESS = 0
+    TEST_FAILED = 1
+    USAGE_ERROR = 2
+    TEST_CANCELLED = 3
+    TEST_REJECTED = 4
+    CONNECTION_FAILURE = 5
+    PROTOCOL_MISMATCH = 6
+    CLIENT_ERROR = 7
+
+
+class CMSClientError(RuntimeError):
+    """Base class for classified CMS Client failures."""
+
+
+class CMSConnectionError(CMSClientError):
+    """The daemon could not be reached or stopped responding."""
+
+
+class CMSProtocolMismatchError(CMSClientError):
+    """The daemon response is incompatible with the client protocol."""
+
+
+class CMSDaemonError(CMSClientError):
+    """The daemon rejected or could not complete a valid client request."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(f"CMS daemon returned HTTP {status_code}: {detail}")
+        self.status_code = status_code
+        self.detail = detail
 
 
 @dataclass(slots=True)
@@ -54,6 +107,36 @@ class CMSClientConfig:
     target: dict[str, str] | None = None
     build: dict[str, str] | None = None
     tools: dict[str, str] | None = None
+
+
+@dataclass(slots=True)
+class MeasurementWatchState:
+    """Reconnectable client-side cursor and latest structured summary."""
+
+    measurement_id: str
+    cursor: EventCursor = EventCursor()
+    summary: MeasurementSummary | None = None
+
+    def __post_init__(self) -> None:
+        if not self.measurement_id:
+            raise ValueError("measurement watch requires a measurement id")
+
+    @property
+    def is_terminal(self) -> bool:
+        return (
+            self.summary is not None
+            and self.summary.state in TERMINAL_MEASUREMENT_STATES
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementWatchUpdate:
+    """One independently fetched summary and cursor-based event page."""
+
+    requested_cursor: EventCursor
+    summary: MeasurementSummary
+    event_page: MeasurementEventPage
+    console_truncated: bool = False
 
 
 class CMSClient:
@@ -134,6 +217,82 @@ class CMSClient:
         """Fetch the current state and result summary for one submitted measurement."""
         return measurement_result_from_dict(self._request_json("GET", f"/measurement/{measurement_id}"))
 
+    def get_active_measurement_id(self) -> str | None:
+        """Discover the measurement currently controlled by the daemon."""
+
+        payload = self._request_json("GET", _observation_path("/measurement/active"))
+        _validate_observation_envelope(payload)
+        measurement_id = payload.get("measurement_id")
+        if measurement_id is None:
+            return None
+        if not isinstance(measurement_id, str) or not measurement_id:
+            raise CMSProtocolMismatchError(
+                "active measurement response contains an invalid measurement id"
+            )
+        return measurement_id
+
+    def get_measurement_summary(self, measurement_id: str) -> MeasurementSummary:
+        """Fetch concise authoritative test state for one measurement."""
+
+        encoded_id = urllib.parse.quote(measurement_id, safe="")
+        payload = self._request_json(
+            "GET",
+            _observation_path(f"/measurement/{encoded_id}/summary"),
+        )
+        _validate_observation_envelope(payload, measurement_id)
+        try:
+            return measurement_summary_from_dict(payload)
+        except (TypeError, ValueError) as exc:
+            raise CMSProtocolMismatchError(
+                f"measurement summary response is invalid: {exc}"
+            ) from exc
+
+    def get_measurement_events(
+        self,
+        measurement_id: str,
+        after_cursor: EventCursor = EventCursor(),
+    ) -> MeasurementEventPage:
+        """Fetch retained events strictly after the supplied client cursor."""
+
+        encoded_id = urllib.parse.quote(measurement_id, safe="")
+        path = _observation_path(
+            f"/measurement/{encoded_id}/events",
+            after=str(after_cursor.value),
+        )
+        payload = self._request_json("GET", path)
+        _validate_observation_envelope(payload, measurement_id)
+        try:
+            page = measurement_event_page_from_dict(payload)
+        except (TypeError, ValueError) as exc:
+            raise CMSProtocolMismatchError(
+                f"measurement event response is invalid: {exc}"
+            ) from exc
+        if page.next_cursor < after_cursor:
+            raise CMSProtocolMismatchError(
+                "measurement event response moved the cursor backwards"
+            )
+        if any(event.cursor <= after_cursor for event in page.events):
+            raise CMSProtocolMismatchError(
+                "measurement event response repeated an acknowledged cursor"
+            )
+        return page
+
+    def list_measurement_artifacts(self, measurement_id: str) -> list[Artifacts]:
+        """List published artifacts belonging to an explicit measurement."""
+
+        encoded_id = urllib.parse.quote(measurement_id, safe="")
+        payload = self._request_json(
+            "GET",
+            _observation_path(f"/measurement/{encoded_id}/artifacts"),
+        )
+        _validate_observation_envelope(payload, measurement_id)
+        try:
+            return [artifact_from_dict(artifact) for artifact in payload.get("artifacts", [])]
+        except (TypeError, ValueError) as exc:
+            raise CMSProtocolMismatchError(
+                f"measurement artifact response is invalid: {exc}"
+            ) from exc
+
     def cancel_measurement(self, measurement_id: str) -> MeasurementResult:
         """Request cancellation for the active measurement when the daemon allows it."""
         return measurement_result_from_dict(
@@ -146,28 +305,23 @@ class CMSClient:
 
     def download_artifact(self, measurement_id: str, artifact_name: str, out_dir: Path) -> Path:
         """Copy one published result artifact from the daemon to the client host."""
-        payload = self._request_json("GET", f"/measurement/{measurement_id}/artifacts")
-        artifacts = payload.get("artifacts", [])
-        artifact = next((item for item in artifacts if item.get("name") == artifact_name), None)
+        artifacts = self.list_measurement_artifacts(measurement_id)
+        artifact = next((item for item in artifacts if item.name == artifact_name), None)
         if artifact is None:
             raise RuntimeError(f"artifact is not available: {artifact_name}")
 
-        out_dir.mkdir(parents=True, exist_ok=True)
-        destination = out_dir / artifact_name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        source_url = str(artifact.get("url", ""))
-        source_path = str(artifact.get("path", ""))
-        if source_path and Path(source_path).exists():
-            shutil.copy2(source_path, destination)
-            return destination
-        if source_url.startswith("http://") or source_url.startswith("https://"):
-            urllib.request.urlretrieve(source_url, destination)
-            return destination
-        if source_url.startswith("/"):
-            with urllib.request.urlopen(f"{self.base_url}{source_url}", timeout=self.timeout_s) as response:
-                destination.write_bytes(response.read())
-            return destination
-        raise RuntimeError(f"artifact has no downloadable location: {artifact_name}")
+        return self._download_artifact_payload(artifact_to_dict(artifact), out_dir)
+
+    def download_measurement_artifacts(self, measurement_id: str, out_dir: Path) -> list[Path]:
+        """Download every published artifact for an explicit measurement."""
+
+        artifacts = self.list_measurement_artifacts(measurement_id)
+        if not artifacts:
+            raise RuntimeError(f"measurement has no published artifacts: {measurement_id}")
+        return [
+            self._download_artifact_payload(artifact_to_dict(artifact), out_dir)
+            for artifact in artifacts
+        ]
 
     def download_last_artifacts(self, out_dir: Path) -> list[Path]:
         """Download every artifact from the last completed remote test."""
@@ -207,12 +361,24 @@ class CMSClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-                return json.loads(response.read().decode("utf-8"))
+                response_body = response.read().decode("utf-8")
+                try:
+                    return json.loads(response_body)
+                except json.JSONDecodeError as exc:
+                    raise CMSProtocolMismatchError(
+                        "CMS daemon returned invalid JSON"
+                    ) from exc
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"CMS daemon returned HTTP {exc.code}: {detail}") from exc
+            if _http_error_code(detail) == "incompatible_protocol":
+                raise CMSProtocolMismatchError(
+                    f"CMS daemon rejected the observation protocol: {detail}"
+                ) from exc
+            raise CMSDaemonError(exc.code, detail) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"CMS daemon is unreachable: {exc.reason}") from exc
+            raise CMSConnectionError(f"CMS daemon is unreachable: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise CMSConnectionError("CMS daemon request timed out") from exc
 
     def _download_artifact_payload(self, artifact: dict[str, Any], out_dir: Path) -> Path:
         name = str(artifact.get("name", ""))
@@ -224,14 +390,117 @@ class CMSClient:
         if source_path and Path(source_path).exists():
             shutil.copy2(source_path, destination)
             return destination
-        if source_url.startswith("http://") or source_url.startswith("https://"):
-            urllib.request.urlretrieve(source_url, destination)
-            return destination
-        if source_url.startswith("/"):
-            with urllib.request.urlopen(f"{self.base_url}{source_url}", timeout=self.timeout_s) as response:
-                destination.write_bytes(response.read())
-            return destination
+        try:
+            if source_url.startswith("http://") or source_url.startswith("https://"):
+                urllib.request.urlretrieve(source_url, destination)
+                return destination
+            if source_url.startswith("/"):
+                with urllib.request.urlopen(
+                    f"{self.base_url}{source_url}",
+                    timeout=self.timeout_s,
+                ) as response:
+                    destination.write_bytes(response.read())
+                return destination
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise CMSDaemonError(exc.code, detail) from exc
+        except urllib.error.URLError as exc:
+            raise CMSConnectionError(f"CMS artifact download failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise CMSConnectionError("CMS artifact download timed out") from exc
         raise RuntimeError(f"artifact has no downloadable location: {name}")
+
+
+def _observation_path(path: str, **query: str) -> str:
+    parameters = {
+        **query,
+        "protocol_version": str(CMS_OBSERVATION_PROTOCOL_VERSION),
+    }
+    return f"{path}?{urllib.parse.urlencode(parameters)}"
+
+
+def _validate_observation_envelope(
+    payload: dict[str, Any],
+    expected_measurement_id: str | None = None,
+) -> None:
+    try:
+        protocol_version = int(payload.get("protocol_version", 0))
+    except (TypeError, ValueError) as exc:
+        raise CMSProtocolMismatchError(
+            "observation response contains an invalid protocol version"
+        ) from exc
+    if protocol_version != CMS_OBSERVATION_PROTOCOL_VERSION:
+        raise CMSProtocolMismatchError(
+            "CMS observation protocol mismatch: "
+            f"client={CMS_OBSERVATION_PROTOCOL_VERSION}, daemon={protocol_version}"
+        )
+    if expected_measurement_id is None:
+        return
+    response_measurement_id = payload.get("measurement_id")
+    if response_measurement_id != expected_measurement_id:
+        raise CMSProtocolMismatchError(
+            "observation response measurement id does not match the requested measurement"
+        )
+
+
+def _http_error_code(detail: str) -> str:
+    try:
+        payload = json.loads(detail)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    error_detail = payload.get("detail", {}) if isinstance(payload, dict) else {}
+    return str(error_detail.get("code", "")) if isinstance(error_detail, dict) else ""
+
+
+def poll_measurement_watch(
+    client: CMSClient,
+    state: MeasurementWatchState,
+) -> MeasurementWatchUpdate:
+    """Fetch one summary and one event page, advancing state only on success."""
+
+    requested_cursor = state.cursor
+    summary = client.get_measurement_summary(state.measurement_id)
+    event_page = client.get_measurement_events(state.measurement_id, requested_cursor)
+    console_truncated = (
+        event_page.truncated
+        and event_page.oldest_retained_cursor.value > 0
+        and requested_cursor.value < event_page.oldest_retained_cursor.value - 1
+    )
+    state.summary = summary
+    state.cursor = event_page.next_cursor
+    return MeasurementWatchUpdate(
+        requested_cursor=requested_cursor,
+        summary=summary,
+        event_page=event_page,
+        console_truncated=console_truncated,
+    )
+
+
+def watch_measurement(
+    client: CMSClient,
+    state: MeasurementWatchState,
+    *,
+    poll_interval_s: float = 1.0,
+    on_summary: Callable[[MeasurementSummary], None] | None = None,
+    on_events: Callable[[MeasurementEventPage], None] | None = None,
+    on_truncation: Callable[[EventCursor], None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> MeasurementWatchState:
+    """Watch until terminal state while preserving cursor state for reconnect."""
+
+    if poll_interval_s < 0:
+        raise ValueError("watch poll interval cannot be negative")
+    while True:
+        update = poll_measurement_watch(client, state)
+        if on_summary is not None:
+            on_summary(update.summary)
+        if update.console_truncated and on_truncation is not None:
+            on_truncation(update.event_page.oldest_retained_cursor)
+        if update.event_page.events and on_events is not None:
+            on_events(update.event_page)
+        if state.is_terminal:
+            return state
+        sleep(poll_interval_s)
 
 
 def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
@@ -260,6 +529,20 @@ def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
         build={str(key): str(value) for key, value in config.get("build", {}).items()},
         tools={str(key): str(value) for key, value in config.get("tools", {}).items()},
     )
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
 
 
 def build_cli_parser() -> argparse.ArgumentParser:
@@ -310,6 +593,17 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
     test.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show live stdout, stderr, and lifecycle events",
+    )
+    test.add_argument(
+        "--poll-interval",
+        type=_non_negative_float,
+        default=1.0,
+        help="seconds between observation polls",
+    )
+    test.add_argument(
         "--send-to-database",
         "--upload-results-to-database",
         action="store_true",
@@ -321,14 +615,71 @@ def build_cli_parser() -> argparse.ArgumentParser:
     measurement = subparsers.add_parser("measurement", help="show measurement status")
     measurement.add_argument("measurement_id")
 
+    watch = subparsers.add_parser(
+        "watch",
+        aliases=["WATCH"],
+        help="attach to an active or explicit measurement",
+    )
+    watch.add_argument("measurement_id", nargs="?", default="")
+    watch.add_argument(
+        "--cursor",
+        type=_non_negative_int,
+        default=0,
+        help="resume after this previously acknowledged event cursor",
+    )
+    watch.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show live stdout, stderr, and lifecycle events",
+    )
+    watch.add_argument(
+        "--poll-interval",
+        type=_non_negative_float,
+        default=1.0,
+        help="seconds between observation polls",
+    )
+
     cancel = subparsers.add_parser("cancel", aliases=["CANCEL"], help="cancel the active test")
 
-    artifacts = subparsers.add_parser("artifacts", aliases=["ARTIFACTS"], help="download artifacts from the last test")
+    artifacts = subparsers.add_parser(
+        "artifacts",
+        aliases=["ARTIFACTS"],
+        help="download artifacts from an explicit measurement",
+    )
+    artifacts.add_argument("measurement_id")
     artifacts.add_argument("--out-dir", default="artifacts")
     return parser
 
 
+def _measurement_exit_code(
+    state: MeasurementState | None,
+) -> CMSCLIExitCode:
+    return {
+        MeasurementState.PASSED: CMSCLIExitCode.SUCCESS,
+        MeasurementState.FAILED: CMSCLIExitCode.TEST_FAILED,
+        MeasurementState.CANCELLED: CMSCLIExitCode.TEST_CANCELLED,
+        MeasurementState.REJECTED: CMSCLIExitCode.TEST_REJECTED,
+    }.get(state, CMSCLIExitCode.CLIENT_ERROR)
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return int(_main(argv))
+    except CMSConnectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return int(CMSCLIExitCode.CONNECTION_FAILURE)
+    except CMSProtocolMismatchError as exc:
+        print(str(exc), file=sys.stderr)
+        return int(CMSCLIExitCode.PROTOCOL_MISMATCH)
+    except CMSDaemonError as exc:
+        print(str(exc), file=sys.stderr)
+        return int(CMSCLIExitCode.CLIENT_ERROR)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return int(CMSCLIExitCode.CLIENT_ERROR)
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = build_cli_parser().parse_args(argv)
     client_config = load_client_config(args.config)
     client = CMSClient(base_url=args.base_url, api_token=args.api_token, config_path=args.config)
@@ -339,7 +690,11 @@ def main(argv: list[str] | None = None) -> int:
         for check in report.checks:
             detail = f" ({check.detail})" if check.detail else ""
             print(f"{check.status.value} {check.name}: {check.summary}{detail}")
-        return 0 if report.state is not BenchState.ERROR else 1
+        return (
+            CMSCLIExitCode.SUCCESS
+            if report.state is not BenchState.ERROR
+            else CMSCLIExitCode.CLIENT_ERROR
+        )
 
     if args.command == "status":
         status = client.get_status()
@@ -348,7 +703,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"active_measurement_id: {status.active_measurement_id}")
         if status.detail:
             print(status.detail)
-        return 0 if status.state is not BenchState.ERROR else 1
+        return (
+            CMSCLIExitCode.SUCCESS
+            if status.state is not BenchState.ERROR
+            else CMSCLIExitCode.CLIENT_ERROR
+        )
 
     if args.command in {"tests", "TESTS"}:
         payload = client.list_tests()
@@ -356,20 +715,43 @@ def main(argv: list[str] | None = None) -> int:
         for feature in payload.get("features", []):
             configs = ", ".join(feature.get("configs", []))
             print(f"{feature.get('feature', '')}: {configs}")
-        return 0
+        return CMSCLIExitCode.SUCCESS
 
     if args.command in {"build", "BUILD"}:
-        return _run_local_build(args, args.config)
+        return (
+            CMSCLIExitCode.SUCCESS
+            if _run_local_build(args, args.config) == 0
+            else CMSCLIExitCode.CLIENT_ERROR
+        )
 
     if args.command in {"send_fw", "SEND_FW"}:
         request = _request_from_send_fw_args(args, client_config)
         result = client.send_firmware(request)
         _print_measurement_result(result)
-        return 0 if result.state is not MeasurementState.FAILED else 1
+        if result.state is MeasurementState.REJECTED:
+            return CMSCLIExitCode.TEST_REJECTED
+        return (
+            CMSCLIExitCode.CLIENT_ERROR
+            if result.state is MeasurementState.FAILED
+            else CMSCLIExitCode.SUCCESS
+        )
 
     if args.command == "measurement":
         _print_measurement_result(client.get_measurement(args.measurement_id))
-        return 0
+        return CMSCLIExitCode.SUCCESS
+
+    if args.command in {"watch", "WATCH"}:
+        measurement_id = _resolve_watch_measurement_id(client, args.measurement_id)
+        state = _watch_remote_measurement(
+            client,
+            measurement_id,
+            after_cursor=EventCursor(args.cursor),
+            verbose=args.verbose,
+            poll_interval_s=args.poll_interval,
+        )
+        return _measurement_exit_code(
+            state.summary.state if state.summary is not None else None
+        )
 
     if args.command in {"test", "TEST"}:
         result = client.run_test(
@@ -379,27 +761,46 @@ def main(argv: list[str] | None = None) -> int:
             run_name=args.run_name,
             upload_results_to_database=args.upload_results_to_database,
         )
-        if result.measurement_id:
-            result = _poll_test_progress(client, result.measurement_id)
-        else:
+        if not result.measurement_id:
             _print_measurement_result(result)
+            return _measurement_exit_code(result.state)
+        state = _watch_remote_measurement(
+            client,
+            result.measurement_id,
+            verbose=args.verbose,
+            poll_interval_s=args.poll_interval,
+        )
+        result = client.get_measurement(result.measurement_id)
         if result.artifacts:
-            for path in client.download_last_artifacts(Path(args.out_dir)):
+            for path in client.download_measurement_artifacts(
+                result.measurement_id,
+                Path(args.out_dir),
+            ):
                 print(f"saved {path}")
-        if result.state is MeasurementState.PASSED:
-            return 0
-        return 1
+        return _measurement_exit_code(
+            state.summary.state if state.summary is not None else None
+        )
 
     if args.command in {"cancel", "CANCEL"}:
-        _print_measurement_result(client.cancel_active_test())
-        return 0
+        result = client.cancel_active_test()
+        _print_measurement_result(result)
+        if result.state is MeasurementState.REJECTED:
+            return CMSCLIExitCode.TEST_REJECTED
+        return (
+            CMSCLIExitCode.CLIENT_ERROR
+            if result.state is MeasurementState.FAILED
+            else CMSCLIExitCode.SUCCESS
+        )
 
     if args.command in {"artifacts", "ARTIFACTS"}:
-        for path in client.download_last_artifacts(Path(args.out_dir)):
+        for path in client.download_measurement_artifacts(
+            args.measurement_id,
+            Path(args.out_dir),
+        ):
             print(path)
-        return 0
+        return CMSCLIExitCode.SUCCESS
 
-    return 2
+    return CMSCLIExitCode.USAGE_ERROR
 
 
 def _request_from_send_fw_args(
@@ -629,23 +1030,93 @@ def _print_measurement_result(result: MeasurementResult) -> None:
         print(f"artifact {artifact.name}: {location}")
 
 
-def _poll_test_progress(client: CMSClient, measurement_id: str, poll_interval_s: float = 1.0) -> MeasurementResult:
-    terminal_states = {
-        MeasurementState.PASSED,
-        MeasurementState.FAILED,
-        MeasurementState.CANCELLED,
-        MeasurementState.REJECTED,
-    }
-    last_progress = None
-    while True:
-        result = client.get_measurement(measurement_id)
-        progress_key = (result.state, result.progress_percent, result.message)
-        if progress_key != last_progress:
-            _print_measurement_result(result)
-            last_progress = progress_key
-        if result.state in terminal_states:
-            return result
-        time.sleep(poll_interval_s)
+def _resolve_watch_measurement_id(client: CMSClient, requested_measurement_id: str) -> str:
+    measurement_id = requested_measurement_id.strip()
+    if measurement_id:
+        return measurement_id
+    measurement_id = client.get_active_measurement_id()
+    if measurement_id is None:
+        raise RuntimeError("the CMS daemon has no active measurement")
+    return measurement_id
+
+
+def _measurement_summary_key(summary: MeasurementSummary) -> tuple[Any, ...]:
+    return (
+        summary.state,
+        summary.counts,
+        summary.current_test,
+        summary.failed_tests,
+    )
+
+
+def _print_measurement_summary(summary: MeasurementSummary) -> None:
+    counts = summary.counts
+    print(f"{summary.measurement_id}: {summary.state.value}")
+    print(
+        "tests: "
+        f"total={counts.total} completed={counts.completed} passed={counts.passed} "
+        f"failed={counts.failed} skipped={counts.skipped} remaining={counts.remaining}"
+    )
+    if summary.current_test is not None:
+        current = summary.current_test
+        print(
+            f"current: {current.ordinal}/{current.total_jobs} "
+            f"{current.feature} {current.config}"
+        )
+    if summary.failed_tests:
+        print("failed tests:")
+        for failed in summary.failed_tests:
+            print(
+                f"  {failed.ordinal}/{failed.total_jobs} "
+                f"{failed.feature} {failed.config}"
+            )
+
+
+def _print_verbose_event_page(page: MeasurementEventPage) -> None:
+    for event in page.events:
+        timestamp = event.timestamp.isoformat()
+        if event.event_type == "console":
+            source = str(event.details.get("source", "console"))
+            text = str(event.details.get("text", ""))
+            for line in text.splitlines() or [""]:
+                print(f"{timestamp} [{source}] {line}")
+            continue
+        state = str(event.details.get("state", event.event_type))
+        print(f"{timestamp} [event] {state}")
+
+
+def _watch_remote_measurement(
+    client: CMSClient,
+    measurement_id: str,
+    *,
+    after_cursor: EventCursor = EventCursor(),
+    verbose: bool = False,
+    poll_interval_s: float = 1.0,
+) -> MeasurementWatchState:
+    state = MeasurementWatchState(measurement_id, cursor=after_cursor)
+    last_summary_key: tuple[Any, ...] | None = None
+
+    def render_summary(summary: MeasurementSummary) -> None:
+        nonlocal last_summary_key
+        summary_key = _measurement_summary_key(summary)
+        if summary_key != last_summary_key:
+            _print_measurement_summary(summary)
+            last_summary_key = summary_key
+
+    def render_truncation(oldest_retained_cursor: EventCursor) -> None:
+        print(
+            "warning: verbose console output was truncated; "
+            f"continuing from cursor {oldest_retained_cursor.value}"
+        )
+
+    return watch_measurement(
+        client,
+        state,
+        poll_interval_s=poll_interval_s,
+        on_summary=render_summary,
+        on_events=_print_verbose_event_page if verbose else None,
+        on_truncation=render_truncation,
+    )
 
 
 if __name__ == "__main__":

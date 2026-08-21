@@ -29,24 +29,37 @@ from cms_bench import (
     BenchSession,
     CMSBench,
     CMS_BENCH_CONFIG,
+    MeasurementEventStream,
+    MeasurementRuntimePaths,
     load_bench_runtime_config,
 )
 from cms_protocol import (
+    CMS_OBSERVATION_PROTOCOL_VERSION,
     Artifacts,
     BenchCheckResult,
     BenchCheckStatus,
     BenchHealthReport,
     BenchState,
+    EventCursor,
+    MeasurementEventPage,
+    MeasurementSummary,
     MeasurementState,
     MeasurementRequest,
     MeasurementResult,
     ResultType,
+    TestCaseIdentity,
+    TestCaseState,
+    TestCounts,
     bench_health_report_to_dict,
     bench_identity_to_dict,
     create_measurement_identity,
+    measurement_event_from_dict,
+    measurement_event_page_to_dict,
     measurement_request_from_dict,
     measurement_request_to_dict,
     measurement_result_to_dict,
+    measurement_summary_to_dict,
+    test_case_identity_from_dict,
 )
 
 
@@ -255,6 +268,121 @@ class CMSDaemon:
             "artifacts_root": str(self.config.artifacts_root),
             "files": self.files.as_dict(),
         }
+
+    def get_active_measurement_id(self) -> str | None:
+        """Return the daemon-authoritative active measurement, if any."""
+
+        return self.active_measurement_id
+
+    def get_measurement_summary(self, measurement_id: str) -> MeasurementSummary:
+        """Reconstruct concise job state from the runtime plan and result log."""
+
+        runtime_dir = self._observation_runtime_path(measurement_id)
+        plan_path = runtime_dir / "orchestrator_plan.json"
+        results_path = runtime_dir / "orchestrator_results.jsonl"
+        plan = json.loads(plan_path.read_text(encoding="utf-8")) if plan_path.exists() else {}
+        plan_jobs = plan.get("jobs", [])
+        if not isinstance(plan_jobs, list):
+            raise ValueError("orchestrator plan jobs must be a list")
+
+        identities: dict[str, TestCaseIdentity] = {}
+        ordered_job_ids: list[str] = []
+        states: dict[str, TestCaseState] = {}
+        for job in plan_jobs:
+            identity = test_case_identity_from_dict(job)
+            if identity.job_id in identities:
+                raise ValueError(f"orchestrator plan contains duplicate job id: {identity.job_id}")
+            identities[identity.job_id] = identity
+            ordered_job_ids.append(identity.job_id)
+            states[identity.job_id] = TestCaseState.PENDING
+
+        current_job_id: str | None = None
+        for record in _read_jsonl_records(results_path):
+            job_id = str(record.get("job_id", ""))
+            if not job_id or job_id not in identities:
+                continue
+            status = TestCaseState(str(record.get("status", TestCaseState.PENDING.value)))
+            states[job_id] = status
+            if status is TestCaseState.RUNNING:
+                current_job_id = job_id
+            elif current_job_id == job_id:
+                current_job_id = None
+
+        terminal_states = {
+            TestCaseState.PASSED,
+            TestCaseState.FAILED,
+            TestCaseState.SKIPPED,
+            TestCaseState.CANCELLED,
+        }
+        counts = TestCounts(
+            total=len(ordered_job_ids),
+            completed=sum(states[job_id] in terminal_states for job_id in ordered_job_ids),
+            passed=sum(states[job_id] is TestCaseState.PASSED for job_id in ordered_job_ids),
+            failed=sum(states[job_id] is TestCaseState.FAILED for job_id in ordered_job_ids),
+            skipped=sum(states[job_id] is TestCaseState.SKIPPED for job_id in ordered_job_ids),
+        )
+        tracked_result = self.measurements.get(measurement_id)
+        state = tracked_result.state if tracked_result is not None else MeasurementState.RUNNING
+        identity = tracked_result.identity if tracked_result is not None else None
+        return MeasurementSummary(
+            measurement_id=measurement_id,
+            identity=identity,
+            state=state,
+            counts=counts,
+            current_test=identities.get(current_job_id or ""),
+            failed_tests=tuple(
+                identities[job_id]
+                for job_id in ordered_job_ids
+                if states[job_id] is TestCaseState.FAILED
+            ),
+        )
+
+    def get_measurement_events(
+        self,
+        measurement_id: str,
+        after_cursor: EventCursor = EventCursor(),
+    ) -> MeasurementEventPage:
+        """Return retained structured and console events after one cursor."""
+
+        runtime_dir = self._observation_runtime_path(measurement_id)
+        stream = MeasurementEventStream(
+            measurement_id,
+            MeasurementRuntimePaths.from_root(runtime_dir),
+            max_console_bytes=self.config.max_console_event_bytes,
+        )
+        retained_records = stream.read_events()
+        events = tuple(
+            measurement_event_from_dict(record)
+            for record in retained_records
+            if int(record.get("cursor", 0)) > after_cursor.value
+        )
+        next_cursor = events[-1].cursor if events else after_cursor
+        console_was_truncated = any(
+            record.get("type") == "lifecycle"
+            and record.get("state") == "console_truncated"
+            for record in retained_records
+        )
+        if console_was_truncated:
+            oldest_retained_cursor = EventCursor(stream.oldest_retained_cursor)
+        else:
+            oldest_retained_cursor = EventCursor(
+                min(
+                    (int(record.get("cursor", 0)) for record in retained_records),
+                    default=0,
+                )
+            )
+        return MeasurementEventPage(
+            measurement_id=measurement_id,
+            events=events,
+            next_cursor=next_cursor,
+            oldest_retained_cursor=oldest_retained_cursor,
+            truncated=(
+                console_was_truncated
+                and
+                oldest_retained_cursor.value > 0
+                and after_cursor.value < oldest_retained_cursor.value - 1
+            ),
+        )
 
     def measurement_accept(self, request: MeasurementRequest) -> dict[str, Any]:
         """Stage the current measurement request without launching execution."""
@@ -605,10 +733,38 @@ class CMSDaemon:
     def create_app(self) -> Any:
         """Create the FastAPI app for daemon bringup routes."""
 
-        from fastapi import FastAPI
+        from fastapi import FastAPI, HTTPException
         from fastapi.responses import FileResponse
 
         app = FastAPI(title="CMS Daemon")
+
+        def require_observation_protocol(protocol_version: int) -> None:
+            if protocol_version != CMS_OBSERVATION_PROTOCOL_VERSION:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "incompatible_protocol",
+                        "message": "observation protocol version is not supported",
+                        "received_version": protocol_version,
+                        "supported_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+                    },
+                )
+
+        def raise_observation_error(exc: Exception) -> None:
+            if isinstance(exc, KeyError):
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "unknown_measurement", "message": str(exc.args[0])},
+                ) from exc
+            if isinstance(exc, OSError):
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "observation_unavailable", "message": str(exc)},
+                ) from exc
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "observation_data_invalid", "message": str(exc)},
+            ) from exc
 
         @app.get("/health")
         def health() -> dict[str, Any]:
@@ -660,6 +816,48 @@ class CMSDaemon:
             )
             return measurement_result_to_dict(result)
 
+        @app.get("/measurement/active")
+        def active_measurement(
+            protocol_version: int = CMS_OBSERVATION_PROTOCOL_VERSION,
+        ) -> dict[str, Any]:
+            require_observation_protocol(protocol_version)
+            return {
+                "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+                "measurement_id": self.get_active_measurement_id(),
+            }
+
+        @app.get("/measurement/{measurement_id}/summary")
+        def measurement_summary(
+            measurement_id: str,
+            protocol_version: int = CMS_OBSERVATION_PROTOCOL_VERSION,
+        ) -> dict[str, Any]:
+            require_observation_protocol(protocol_version)
+            try:
+                return measurement_summary_to_dict(self.get_measurement_summary(measurement_id))
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise_observation_error(exc)
+
+        @app.get("/measurement/{measurement_id}/events")
+        def measurement_events(
+            measurement_id: str,
+            after: str = "0",
+            protocol_version: int = CMS_OBSERVATION_PROTOCOL_VERSION,
+        ) -> dict[str, Any]:
+            require_observation_protocol(protocol_version)
+            try:
+                after_cursor = EventCursor(int(after))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "invalid_cursor", "message": str(exc)},
+                ) from exc
+            try:
+                return measurement_event_page_to_dict(
+                    self.get_measurement_events(measurement_id, after_cursor)
+                )
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise_observation_error(exc)
+
         @app.get("/measurement/{measurement_id}")
         def measurement_status(measurement_id: str) -> dict[str, Any]:
             result = self.measurements.get(measurement_id)
@@ -679,19 +877,39 @@ class CMSDaemon:
             return measurement_result_to_dict(result)
 
         @app.get("/measurement/{measurement_id}/artifacts")
-        def measurement_artifacts(measurement_id: str) -> dict[str, Any]:
+        def measurement_artifacts(
+            measurement_id: str,
+            protocol_version: int = CMS_OBSERVATION_PROTOCOL_VERSION,
+        ) -> dict[str, Any]:
+            require_observation_protocol(protocol_version)
+            try:
+                self._runtime_workspace_path(measurement_id)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "invalid_measurement_id", "message": str(exc)},
+                ) from exc
             result = self.measurements.get(measurement_id)
             if result is None:
                 result_path = self.config.artifacts_root / "measurements" / measurement_id / "measurement_result.json"
                 if result_path.exists():
-                    result = MeasurementResult(
-                        measurement_id=measurement_id,
-                        state=MeasurementState.PASSED,
-                    )
-                    payload = json.loads(result_path.read_text(encoding="utf-8"))
-                    return {"artifacts": payload.get("artifacts", [])}
-                return {"artifacts": []}
-            return {"artifacts": measurement_result_to_dict(result)["artifacts"]}
+                    try:
+                        payload = json.loads(result_path.read_text(encoding="utf-8"))
+                    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise_observation_error(exc)
+                    return {
+                        "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+                        "measurement_id": measurement_id,
+                        "artifacts": payload.get("artifacts", []),
+                    }
+                raise_observation_error(
+                    KeyError(f"measurement id is unknown: {measurement_id}")
+                )
+            return {
+                "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+                "measurement_id": measurement_id,
+                "artifacts": measurement_result_to_dict(result)["artifacts"],
+            }
 
         @app.get("/artifacts/last")
         def last_measurement_artifacts() -> dict[str, Any]:
@@ -707,9 +925,29 @@ class CMSDaemon:
 
         @app.get("/measurement/{measurement_id}/artifacts/{artifact_path:path}")
         def measurement_artifact_file(measurement_id: str, artifact_path: str) -> FileResponse:
-            safe_name = _safe_artifact_name(urllib.parse.unquote(artifact_path))
-            artifact_path = self.config.artifacts_root / "measurements" / measurement_id / safe_name
-            return FileResponse(artifact_path)
+            try:
+                self._runtime_workspace_path(measurement_id)
+                safe_name = _safe_artifact_name(urllib.parse.unquote(artifact_path))
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "invalid_artifact_path", "message": str(exc)},
+                ) from exc
+            published_dir = self.config.artifacts_root / "measurements" / measurement_id
+            if not published_dir.is_dir():
+                raise_observation_error(
+                    KeyError(f"measurement id is unknown: {measurement_id}")
+                )
+            requested_artifact = published_dir / safe_name
+            if not requested_artifact.is_file():
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "code": "unknown_artifact",
+                        "message": f"artifact is unavailable: {safe_name}",
+                    },
+                )
+            return FileResponse(requested_artifact)
 
         @app.post("/measurement/{measurement_id}/cancel")
         def cancel_measurement(measurement_id: str) -> dict[str, Any]:
@@ -806,6 +1044,12 @@ class CMSDaemon:
         ):
             raise ValueError("measurement_id must be a single non-empty path component")
         return self.config.runtime_root / "measurements" / measurement_id
+
+    def _observation_runtime_path(self, measurement_id: str) -> Path:
+        runtime_dir = self._runtime_workspace_path(measurement_id)
+        if measurement_id not in self.measurements and not runtime_dir.is_dir():
+            raise KeyError(f"measurement id is unknown: {measurement_id}")
+        return runtime_dir
 
     def _touch_staging_files(self) -> None:
         for path in self.files.as_dict().values():
@@ -932,6 +1176,16 @@ def _decode_mountinfo_path(value: str) -> str:
         lambda match: chr(int(match.group(1), 8)),
         value,
     )
+
+
+def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            records.append(json.loads(line))
+    return records
 
 
 def _file_check(name: str, path: Path) -> BenchCheckResult:

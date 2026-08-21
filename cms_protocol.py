@@ -11,6 +11,9 @@ import secrets
 from typing import Any
 
 
+CMS_OBSERVATION_PROTOCOL_VERSION = 1
+
+
 class DeviceState(str, Enum):
     READY = "ready"
     ERROR = "error"
@@ -138,6 +141,77 @@ class EventCursor:
     def next(self) -> "EventCursor":
         """Return the next monotonically increasing cursor."""
         return EventCursor(self.value + 1)
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementEvent:
+    """One typed record from a measurement's reconnectable event stream."""
+
+    measurement_id: str
+    cursor: EventCursor
+    timestamp: datetime
+    event_type: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.measurement_id:
+            raise ValueError("measurement event requires a measurement id")
+        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
+            raise ValueError("measurement event timestamp must include a timezone")
+        if not self.event_type:
+            raise ValueError("measurement event requires an event type")
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementSummary:
+    """Concise authoritative state for reconnecting measurement observers."""
+
+    measurement_id: str
+    state: MeasurementState
+    counts: TestCounts
+    identity: MeasurementIdentity | None = None
+    current_test: TestCaseIdentity | None = None
+    failed_tests: tuple[TestCaseIdentity, ...] = ()
+    protocol_version: int = CMS_OBSERVATION_PROTOCOL_VERSION
+
+    def __post_init__(self) -> None:
+        if self.protocol_version < 1:
+            raise ValueError("observation protocol version must be positive")
+        if not self.measurement_id:
+            raise ValueError("measurement summary requires a measurement id")
+        if self.identity is not None and self.identity.measurement_id != self.measurement_id:
+            raise ValueError("measurement summary identity must match its measurement id")
+        if self.current_test is not None and self.current_test.total_jobs != self.counts.total:
+            raise ValueError("current test total must match summary counts")
+        if len(self.failed_tests) != self.counts.failed:
+            raise ValueError("failed test identities must match the failed count")
+        if any(test.total_jobs != self.counts.total for test in self.failed_tests):
+            raise ValueError("failed test totals must match summary counts")
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementEventPage:
+    """Retained measurement events returned after a client cursor."""
+
+    measurement_id: str
+    events: tuple[MeasurementEvent, ...]
+    next_cursor: EventCursor
+    oldest_retained_cursor: EventCursor
+    truncated: bool = False
+    protocol_version: int = CMS_OBSERVATION_PROTOCOL_VERSION
+
+    def __post_init__(self) -> None:
+        if self.protocol_version < 1:
+            raise ValueError("observation protocol version must be positive")
+        if not self.measurement_id:
+            raise ValueError("measurement event page requires a measurement id")
+        if any(event.measurement_id != self.measurement_id for event in self.events):
+            raise ValueError("measurement event ids must match their page")
+        cursors = [event.cursor.value for event in self.events]
+        if any(current >= following for current, following in zip(cursors, cursors[1:])):
+            raise ValueError("measurement event cursors must be strictly increasing")
+        if self.events and self.next_cursor != self.events[-1].cursor:
+            raise ValueError("next cursor must identify the last returned event")
 
 
 @dataclass(slots=True)
@@ -354,6 +428,86 @@ def event_cursor_to_int(cursor: EventCursor) -> int:
 
 def event_cursor_from_int(value: Any) -> EventCursor:
     return EventCursor(int(value))
+
+
+def measurement_event_to_dict(event: MeasurementEvent) -> dict[str, Any]:
+    return {
+        **event.details,
+        "measurement_id": event.measurement_id,
+        "cursor": event_cursor_to_int(event.cursor),
+        "timestamp": event.timestamp.isoformat(),
+        "type": event.event_type,
+    }
+
+
+def measurement_event_from_dict(data: dict[str, Any]) -> MeasurementEvent:
+    timestamp = _datetime_from_optional_string(data.get("timestamp"))
+    if timestamp is None:
+        raise ValueError("measurement event requires a valid timestamp")
+    reserved = {"measurement_id", "cursor", "timestamp", "type"}
+    return MeasurementEvent(
+        measurement_id=str(data.get("measurement_id", "")),
+        cursor=event_cursor_from_int(data.get("cursor", -1)),
+        timestamp=timestamp,
+        event_type=str(data.get("type", "")),
+        details={key: value for key, value in data.items() if key not in reserved},
+    )
+
+
+def measurement_summary_to_dict(summary: MeasurementSummary) -> dict[str, Any]:
+    return {
+        "protocol_version": summary.protocol_version,
+        "measurement_id": summary.measurement_id,
+        "identity": (
+            measurement_identity_to_dict(summary.identity) if summary.identity is not None else None
+        ),
+        "state": summary.state.value,
+        "counts": test_counts_to_dict(summary.counts),
+        "current_test": (
+            test_case_identity_to_dict(summary.current_test)
+            if summary.current_test is not None
+            else None
+        ),
+        "failed_tests": [test_case_identity_to_dict(test) for test in summary.failed_tests],
+    }
+
+
+def measurement_summary_from_dict(data: dict[str, Any]) -> MeasurementSummary:
+    identity_data = data.get("identity")
+    current_test_data = data.get("current_test")
+    return MeasurementSummary(
+        protocol_version=int(data.get("protocol_version", 0)),
+        measurement_id=str(data.get("measurement_id", "")),
+        identity=(measurement_identity_from_dict(identity_data) if identity_data else None),
+        state=MeasurementState(str(data.get("state", MeasurementState.FAILED.value))),
+        counts=test_counts_from_dict(data.get("counts", {})),
+        current_test=(test_case_identity_from_dict(current_test_data) if current_test_data else None),
+        failed_tests=tuple(
+            test_case_identity_from_dict(test) for test in data.get("failed_tests", [])
+        ),
+    )
+
+
+def measurement_event_page_to_dict(page: MeasurementEventPage) -> dict[str, Any]:
+    return {
+        "protocol_version": page.protocol_version,
+        "measurement_id": page.measurement_id,
+        "events": [measurement_event_to_dict(event) for event in page.events],
+        "next_cursor": event_cursor_to_int(page.next_cursor),
+        "oldest_retained_cursor": event_cursor_to_int(page.oldest_retained_cursor),
+        "truncated": page.truncated,
+    }
+
+
+def measurement_event_page_from_dict(data: dict[str, Any]) -> MeasurementEventPage:
+    return MeasurementEventPage(
+        protocol_version=int(data.get("protocol_version", 0)),
+        measurement_id=str(data.get("measurement_id", "")),
+        events=tuple(measurement_event_from_dict(event) for event in data.get("events", [])),
+        next_cursor=event_cursor_from_int(data.get("next_cursor", 0)),
+        oldest_retained_cursor=event_cursor_from_int(data.get("oldest_retained_cursor", 0)),
+        truncated=bool(data.get("truncated", False)),
+    )
 
 
 def bench_identity_to_dict(identity: BenchIdentity) -> dict[str, str]:
