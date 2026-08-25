@@ -126,7 +126,29 @@ and the bench validates the same config again before execution.
 Continue only when the concise watch output shows the requested config identity
 and either a passed terminal state or the failed identities you need to inspect.
 
-9. Reconnect to the active measurement from another shell or after a disconnect.
+9. Preview a variable-filtered generated campaign.
+
+```text
+cms TEST full_sweep beacon --variable phy=2m --preview
+```
+
+This validates the filter against the selected feature's `parameters.json` and
+prints the expected job count before bench time is spent. For `beacon`,
+`parameters.json` declares the exact parameter name `phy` and accepted value
+`2m`; use the spelling shown by preview.
+
+10. Run the variable-filtered generated campaign and watch it until completion.
+
+```text
+cms TEST full_sweep beacon --variable phy=2m --out-dir artifacts
+```
+
+This submits every generated `beacon` full-sweep case whose declared `phy`
+parameter resolves to `2m`. It does not run the default config and it does not
+select one exact config. The daemon and bench revalidate the filter and final
+job count before hardware execution.
+
+11. Reconnect to the active measurement from another shell or after a disconnect.
 
 ```text
 cms WATCH
@@ -136,7 +158,7 @@ This only observes an already-running measurement. It does not restart, pause,
 or cancel bench execution. Continue when the client prints the active
 measurement summary and resumes counts from daemon state.
 
-10. Reconnect to a known measurement ID from the beginning of retained output.
+12. Reconnect to a known measurement ID from the beginning of retained output.
 
 ```text
 cms WATCH <measurement_id> --cursor 0
@@ -147,7 +169,7 @@ structured summary. If older verbose console output has been truncated, the
 client prints a truncation warning and continues from the oldest retained
 cursor.
 
-11. Reconnect after the last cursor you already saw.
+13. Reconnect after the last cursor you already saw.
 
 ```text
 cms WATCH <measurement_id> --cursor <last_cursor>
@@ -156,7 +178,7 @@ cms WATCH <measurement_id> --cursor <last_cursor>
 This avoids duplicating already acknowledged events. Continue when the next
 displayed events have cursors later than the cursor you supplied.
 
-12. Show retained stdout, stderr, and lifecycle events while watching.
+14. Show retained stdout, stderr, and lifecycle events while watching.
 
 ```text
 cms WATCH <measurement_id> --verbose
@@ -165,7 +187,18 @@ cms WATCH <measurement_id> --verbose
 This changes only the client display. It preserves the stdout/stderr source on
 rendered console lines and still refreshes structured counts independently.
 
-13. Cancel the active measurement.
+15. Force or disable colored human output when needed.
+
+```text
+cms TEST full_sweep beacon --variable phy=2m --color always --out-dir artifacts
+cms WATCH <measurement_id> --verbose --color never
+```
+
+The default is `--color auto`, which colors terminal output only when stdout is
+a TTY. ANSI color is never written to JSON, JUnit XML, result artifacts, or
+`cms FAILED --json`.
+
+16. Cancel the active measurement.
 
 ```text
 cms CANCEL
@@ -175,7 +208,7 @@ Cancellation requests the real bench-side process to stop; it is not just a
 client display change.
 Continue only when the measurement reaches a cancelled or other terminal state.
 
-14. Download artifacts for a completed measurement by explicit ID.
+17. Download artifacts for a completed measurement by explicit ID.
 
 ```text
 cms ARTIFACTS <measurement_id> --out-dir artifacts
@@ -186,7 +219,7 @@ those files locally. It does not use the daemon's `last` measurement shortcut.
 Continue when every expected artifact path is printed or saved under the output
 directory.
 
-15. List failed test identities and rerun commands for a completed measurement.
+18. List failed test identities and rerun commands for a completed measurement.
 
 ```text
 cms FAILED <measurement_id>
@@ -206,7 +239,7 @@ The normal result destination is the CMS Client artifact download path. Add
 `--upload-results-to-database` to `cms TEST` only when the measurement results
 should also be sent through the database/data-lake path.
 
-16. Print stable CLI exit codes for scripts and troubleshooting.
+19. Print stable CLI exit codes for scripts and troubleshooting.
 
 ```text
 cms EXIT_CODES
@@ -216,7 +249,7 @@ Use this to distinguish a completed test failure from a connection failure,
 protocol mismatch, rejected request, client usage error, or other client-side
 operational error.
 
-17. Print troubleshooting guidance for common operator failures.
+20. Print troubleshooting guidance for common operator failures.
 
 ```text
 cms TROUBLESHOOT
@@ -263,6 +296,87 @@ passes that requested config hash to the bench, and the bench validates the same
 config before starting pytest. If the config is missing, malformed, outside the
 feature directory, or hash-mismatched, the run is rejected before hardware
 execution.
+
+### Run A Variable-Filtered Generated Campaign
+
+Use this when the bench should execute every generated config that matches a
+declared parameter value, rather than one named config or the whole generated
+campaign.
+
+First preview the accepted parameter spelling and job count:
+
+```text
+cms TEST full_sweep beacon --variable phy=2m --preview
+```
+
+For `beacon`, `tests/configs/ble/beacon/parameters.json` declares the parameter
+name `phy` with accepted values `coded`, `1m`, and `2m`, so `phy=2m` is valid
+for that feature. The same file declares `dcdc` with values `On` and `Off`, so
+filters can be intersected:
+
+```text
+cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --preview
+cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --out-dir artifacts
+```
+
+The preview prints `available_variables:` from the selected feature's
+`parameters.json`; copy the exact spelling shown there. Do not infer parameter
+names from generated filenames. A filter such as `--variable phy=2m` is matched
+against the parsed config content through the parameter's declared
+`config_path` or `config_paths`.
+
+Variable filters are for generated configs in `one_factor` or `full_sweep`
+campaigns. They are intentionally separate from exact config selection:
+
+| Selector | What it chooses |
+| --- | --- |
+| `--feature beacon` | The feature config directory, such as `tests/configs/ble/beacon` |
+| `full_sweep` or `default` mode | Which campaign family to discover |
+| `--config-name dcdc` | One exact named config from the feature directory |
+| `--variable phy=2m` | Generated configs whose declared `phy` parameter resolves to `2m` |
+| `test_orchestrator.py --exact-config ...` | The orchestrator's direct exact-config selector for local/bench internals |
+
+In the CMS Client workflow, `--config-name` and `--variable` are mutually clear:
+use `--config-name` for one exact config, or use one or more `--variable`
+options for a generated campaign. The bench revalidates names, values, config
+hashes, and the final selected job count before hardware execution.
+
+To make local and watched output easier to scan, color can be controlled with:
+
+```text
+cms TEST full_sweep beacon --variable phy=2m --color always --out-dir artifacts
+cms WATCH <measurement_id> --verbose --color never
+```
+
+`--color auto` is the default. Color is only for human terminal output; JSON,
+JUnit XML, retained result artifacts, and `cms FAILED --json` remain plain.
+
+### Rerun A Failed Variable-Filtered Campaign
+
+After a variable-filtered campaign reaches a terminal state, list the failed
+jobs:
+
+```text
+cms FAILED <measurement_id>
+```
+
+For scripts, use:
+
+```text
+cms FAILED <measurement_id> --json
+```
+
+Each failed record includes the feature, generated config path, mode, partition,
+and config hash. For a broad failure pattern, rerun the same filtered campaign:
+
+```text
+cms TEST full_sweep beacon --variable phy=2m --preview
+cms TEST full_sweep beacon --variable phy=2m --out-dir artifacts
+```
+
+For a single failed generated config, use the `rerun:` command printed by
+`cms FAILED`, or preview that exact config with `--config-name` after staging
+current firmware.
 
 ### Attach Or Reconnect
 
@@ -546,7 +660,7 @@ The current CLI commands are:
 | `cms TROUBLESHOOT` | Print troubleshooting guidance |
 | `cms BUILD` | Build local firmware through `apps/app_manager.py` |
 | `cms SEND_FW` | Stage firmware and metadata on the daemon |
-| `cms TEST` | Start a remote test using the most recently staged firmware |
+| `cms TEST` | Start a remote test, exact config, or variable-filtered campaign using the most recently staged firmware |
 | `cms measurement <id>` | Print status for one measurement |
 | `cms CANCEL` | Cancel the active or last measurement |
 | `cms ARTIFACTS` | Download artifacts from an explicit measurement |
@@ -606,6 +720,7 @@ using the most recently staged firmware request. The request body contains:
 - measurement mode: `debug`, `default`, `full_sweep`, or `diff`
 - feature name
 - config name
+- zero or more variable filters as `name=value`
 - optional request ID
 - `upload_results_to_database`
 
@@ -622,6 +737,30 @@ The client prints concise counts, the current test, and failed test identities
 when structured state changes. `--verbose` also renders timestamped stdout,
 stderr, and lifecycle events. When the final result includes artifacts, the CLI
 downloads artifacts using that measurement's explicit ID.
+
+Variable filters are repeatable and select the intersection of generated
+configs that match every requested parameter value. The accepted parameter names
+and values are feature-specific and come from that feature's `parameters.json`.
+For `beacon`, the current declared examples include `phy=2m` and `dcdc=On`.
+Unknown variables, unsupported values, malformed filters, incompatible exact
+config combinations, and zero selected jobs are rejected before pytest or
+hardware setup starts.
+
+Human output can be colored with `--color auto|always|never`. The default is
+`auto`, which emits ANSI colors only on a TTY. Use `--color always` for local
+interactive demos and `--color never` for plain copied logs. Machine-readable
+output and artifacts remain uncolored.
+
+The local orchestrator accepts the same variable-filter and color concepts when
+running outside the CMS Client workflow:
+
+```text
+python test_orchestrator.py tests/configs/ble/beacon --mode full_sweep --feature beacon --variable phy=2m --dry-run --color always
+```
+
+This local path writes the same plain `orchestrator_plan.json` and
+`orchestrator_results.jsonl` records as before; color affects only the terminal
+progress text.
 
 ## Artifact Download Behavior
 

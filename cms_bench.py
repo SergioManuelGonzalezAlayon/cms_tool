@@ -42,6 +42,7 @@ from cms_protocol import (
     measurement_request_to_dict,
     measurement_result_to_dict,
     measurement_identity_to_dict,
+    variable_filters_to_dicts,
 )
 
 CMS_BENCH_CONFIG = "cms_bench_runtime.json"
@@ -497,6 +498,7 @@ class CMSBench:
             xapi_path,
             session.manifest.xapi_file.sha256 or session.manifest.xapi_file_hash,
         )
+        _validate_variable_filtered_campaign(session)
 
     def test_smoke(self, session: BenchSession) -> None:
         """Run a lightweight preflight before spending time on a full run."""
@@ -795,6 +797,9 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
                 "feature": session.request.selector.feature,
                 "config": session.request.selector.config,
                 "config_hash": session.request.selector.config_hash,
+                "variable_filters": variable_filters_to_dicts(
+                    session.request.selector.variable_filters
+                ),
             },
         },
         "firmware": {
@@ -1116,8 +1121,7 @@ def _run_test_orchestrator(
     if not config_dir.exists():
         raise RuntimeError(f"test config directory does not exist: {config_dir}")
 
-    mode = session.request.mode.value
-    orchestrator_mode = "full_sweep" if mode == "full_sweep" else "default"
+    orchestrator_mode = _orchestrator_mode(session)
     cmd = [
         sys.executable,
         "-u",
@@ -1142,6 +1146,8 @@ def _run_test_orchestrator(
     ]
     if session.request.selector.config != "default":
         cmd.extend(["--exact-config", session.request.selector.config])
+    for variable_filter in session.request.selector.variable_filters:
+        cmd.extend(["--variable", f"{variable_filter.name}={variable_filter.value}"])
     if session.request.upload_results_to_database:
         cmd.append("--upload-results-to-database")
 
@@ -1155,6 +1161,49 @@ def _run_test_orchestrator(
         timeout_s=session.execution_timeout_s,
         cancel_event=session.cancel_event,
     )
+
+
+def _validate_variable_filtered_campaign(session: BenchSession) -> None:
+    variable_filters = session.request.selector.variable_filters
+    if not variable_filters:
+        return
+    if session.request.selector.config != "default" or session.request.selector.config_hash:
+        raise RuntimeError(
+            "variable filters cannot be combined with an exact config selection"
+        )
+    feature = session.request.selector.feature
+    config_dir = Path("tests") / "configs" / session.request.selector.mode / feature
+    orchestrator_mode = _orchestrator_mode(session)
+    try:
+        from test_orchestrator import build_jobs, validate_variable_filters_for_targets
+
+        validate_variable_filters_for_targets(
+            [config_dir],
+            feature_filters={feature},
+            variable_filters=variable_filters,
+        )
+        jobs = build_jobs(
+            [config_dir],
+            mode=orchestrator_mode,
+            feature_filters={feature},
+            partition_filters=set(),
+            variable_filters=variable_filters,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if not jobs:
+        filters_text = ", ".join(
+            f"{variable_filter.name}={variable_filter.value}"
+            for variable_filter in variable_filters
+        )
+        raise RuntimeError(
+            f"variable filters selected zero configs before execution: {filters_text}"
+        )
+
+
+def _orchestrator_mode(session: BenchSession) -> str:
+    mode = session.request.mode.value
+    return "full_sweep" if mode == "full_sweep" else "default"
 
 
 def _run_diagnostic_artifacts(session: BenchSession) -> list[Path]:

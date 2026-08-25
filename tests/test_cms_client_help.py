@@ -48,6 +48,10 @@ def test_test_help_explains_config_preview_watch_and_results(capsys):
     assert "mode" in text
     assert "feature" in text
     assert "--config-name" in text
+    assert "--variable" in text
+    assert "parameters.json" in text
+    assert "cms TEST full_sweep beacon --variable phy=2m --preview" in text
+    assert "phy values coded, 1m, 2m" in text
     assert "--preview" in text
     assert "--upload-results-to-database" in text
     assert "Example:" in text
@@ -137,3 +141,15 @@ def test_documented_cms_commands_parse_successfully():
         )
         argv = shlex.split(normalized)[1:]
         parser.parse_args(argv)
+
+
+def test_variable_filter_docs_use_declared_beacon_parameter_spelling():
+    docs = Path("docs/cms_client.md").read_text(encoding="utf-8")
+
+    assert "tests/configs/ble/beacon/parameters.json" in docs
+    assert "`phy` with accepted values `coded`, `1m`, and `2m`" in docs
+    assert "`dcdc` with values `On` and `Off`" in docs
+    assert "cms TEST full_sweep beacon --variable phy=2m --preview" in docs
+    assert "cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --preview" in docs
+    assert "cms FAILED <measurement_id> --json" in docs
+    assert "--color auto|always|never" in docs

@@ -50,6 +50,7 @@ from cms_protocol import (
     TestCaseIdentity,
     TestCaseState,
     TestCounts,
+    VariableFilter,
     bench_health_report_to_dict,
     bench_identity_to_dict,
     create_measurement_identity,
@@ -61,6 +62,7 @@ from cms_protocol import (
     measurement_result_to_dict,
     measurement_summary_to_dict,
     test_case_identity_from_dict,
+    variable_filters_from_dicts,
 )
 
 
@@ -678,6 +680,7 @@ class CMSDaemon:
         feature: str,
         config: str = "default",
         config_hash: str = "",
+        variable_filters: tuple[VariableFilter, ...] = (),
         run_name: str = "",
         upload_results_to_database: bool = False,
     ) -> MeasurementResult:
@@ -699,6 +702,7 @@ class CMSDaemon:
         request.selector.feature = feature
         request.selector.config = config
         request.selector.config_hash = config_hash
+        request.selector.variable_filters = variable_filters
         request.upload_results_to_database = upload_results_to_database
         request.identity = None
         request.request_id = ""
@@ -988,6 +992,7 @@ class CMSDaemon:
                 feature=str(request.get("feature", "")),
                 config=str(request.get("config", "default")),
                 config_hash=str(request.get("config_hash", "")),
+                variable_filters=variable_filters_from_dicts(request.get("variable_filters")),
                 run_name=str(request.get("run_name", "")),
                 upload_results_to_database=bool(request.get("upload_results_to_database", False)),
             )

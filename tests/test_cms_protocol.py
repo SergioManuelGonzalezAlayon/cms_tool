@@ -19,6 +19,7 @@ from cms_protocol import (
     TestCaseIdentity as CaseIdentity,
     TestCaseState as CaseState,
     TestCounts as Counts,
+    VariableFilter,
     create_measurement_identity,
     event_cursor_from_int,
     event_cursor_to_int,
@@ -161,6 +162,46 @@ def test_measurement_request_round_trip_preserves_requested_config_hash():
 
     assert payload["selector"]["config_hash"] == "sha256:dcdc"
     assert measurement_request_from_dict(payload).selector.config_hash == "sha256:dcdc"
+
+
+def test_measurement_request_round_trip_preserves_variable_filters():
+    request = MeasurementRequest(
+        request_id="measurement-123",
+        selector=SuiteSelector(
+            mode="ble",
+            feature="beacon",
+            config="default",
+            variable_filters=(
+                VariableFilter(name="phy", value="2m"),
+                VariableFilter(name="dcdc", value="On"),
+            ),
+        ),
+        firmware=FirmwareData(
+            dut_img=FirmwareImage(name="dut.s37", url="dut.s37"),
+            tester_img=FirmwareImage(name="tester.s37", url="tester.s37"),
+        ),
+        mode=MeasurementMode.FULL_SWEEP,
+    )
+
+    payload = measurement_request_to_dict(request)
+
+    assert payload["selector"]["variable_filters"] == [
+        {"name": "phy", "value": "2m"},
+        {"name": "dcdc", "value": "On"},
+    ]
+    assert measurement_request_from_dict(payload).selector.variable_filters == (
+        VariableFilter(name="phy", value="2m"),
+        VariableFilter(name="dcdc", value="On"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("", "2m"), ("phy", ""), ("phy=value", "2m")],
+)
+def test_variable_filter_rejects_invalid_contract_values(name, value):
+    with pytest.raises(ValueError):
+        VariableFilter(name=name, value=value)
 
 
 @pytest.mark.parametrize(

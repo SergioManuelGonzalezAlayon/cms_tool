@@ -10,11 +10,13 @@ from cms_protocol import (
     FirmwareData,
     FirmwareImage,
     MeasurementIdentity,
+    MeasurementMode,
     MeasurementRequest,
     MeasurementResult,
     MeasurementState,
     ResultType,
     SuiteSelector,
+    VariableFilter,
 )
 
 
@@ -23,6 +25,8 @@ def _session(
     *,
     config: str = "default",
     config_hash: str = "",
+    mode: str = "default",
+    variable_filters: tuple[VariableFilter, ...] = (),
 ) -> BenchSession:
     firmware = FirmwareData(
         dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut-hash"),
@@ -36,8 +40,10 @@ def _session(
             feature="beacon",
             config=config,
             config_hash=config_hash,
+            variable_filters=variable_filters,
         ),
         firmware=firmware,
+        mode=MeasurementMode(mode),
     )
     return BenchSession(
         measurement_id=request.request_id,
@@ -126,7 +132,30 @@ def test_pytest_runtime_metadata_contains_requested_config_hash(tmp_path, monkey
         "feature": "beacon",
         "config": "dcdc",
         "config_hash": "sha256:dcdc",
+        "variable_filters": [],
     }
+
+
+def test_pytest_runtime_metadata_contains_variable_filters(tmp_path, monkeypatch):
+    session = _session(
+        tmp_path,
+        mode="full_sweep",
+        variable_filters=(VariableFilter("phy", "2m"),),
+    )
+    for name in ("dut.s37", "tester.s37", "sl_bt.xapi"):
+        (tmp_path / name).write_bytes(name.encode("ascii"))
+    monkeypatch.setattr(
+        cms_bench,
+        "_load_requested_test_config",
+        lambda session: {"firmware": {"dut_slcp": "dut.slcp", "tester_slcp": "tester.slcp"}},
+    )
+
+    prepared = cms_bench._prepare_pytest_runtime(session, BenchResources())
+    metadata = json.loads(prepared["metadata_path"].read_text(encoding="utf-8"))
+
+    assert metadata["request"]["selector"]["variable_filters"] == [
+        {"name": "phy", "value": "2m"}
+    ]
 
 
 def test_pytest_runtime_records_selected_config_evidence_in_measurement_workspace(
@@ -249,5 +278,105 @@ def test_bench_runs_one_exact_named_config(tmp_path, monkeypatch):
     assert _option_value(captured["command"], "--exact-config") == "dcdc"
 
 
+def test_bench_passes_variable_filters_to_orchestrator(tmp_path, monkeypatch):
+    session = _session(
+        tmp_path,
+        mode="full_sweep",
+        variable_filters=(VariableFilter("phy", "2m"), VariableFilter("dcdc", "On")),
+    )
+    captured = {}
+
+    def fake_run_managed_process(command, **kwargs):
+        captured["command"] = command
+        return cms_bench.subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cms_bench, "_run_managed_process", fake_run_managed_process)
+
+    cms_bench._run_test_orchestrator(
+        session,
+        tmp_path / "orchestrator_results.jsonl",
+        tmp_path / "cms_fw_metadata.json",
+    )
+
+    assert _option_values(captured["command"], "--variable") == ["phy=2m", "dcdc=On"]
+
+
+def test_bench_rejects_variable_filters_with_exact_config(tmp_path):
+    session = _session(
+        tmp_path,
+        config="dcdc",
+        mode="full_sweep",
+        variable_filters=(VariableFilter("phy", "2m"),),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot be combined with an exact config"):
+        cms_bench._validate_variable_filtered_campaign(session)
+
+
+def test_bench_rejects_variable_filters_that_select_zero_jobs(tmp_path, monkeypatch):
+    config_root = _write_variable_filter_fixture(tmp_path, config_value="slow")
+    monkeypatch.setattr("test_orchestrator.REPO_ROOT", tmp_path)
+    monkeypatch.setattr("test_orchestrator.CONFIG_ROOT", tmp_path / "tests" / "configs")
+    monkeypatch.chdir(tmp_path)
+    session = _session(
+        tmp_path,
+        mode="full_sweep",
+        variable_filters=(VariableFilter("rate", "fast"),),
+    )
+
+    with pytest.raises(RuntimeError, match="selected zero configs"):
+        cms_bench._validate_variable_filtered_campaign(session)
+    assert config_root.exists()
+
+
+def test_bench_accepts_variable_filters_that_select_jobs(tmp_path, monkeypatch):
+    _write_variable_filter_fixture(tmp_path, config_value="fast")
+    monkeypatch.setattr("test_orchestrator.REPO_ROOT", tmp_path)
+    monkeypatch.setattr("test_orchestrator.CONFIG_ROOT", tmp_path / "tests" / "configs")
+    monkeypatch.chdir(tmp_path)
+    session = _session(
+        tmp_path,
+        mode="full_sweep",
+        variable_filters=(VariableFilter("rate", "fast"),),
+    )
+
+    cms_bench._validate_variable_filtered_campaign(session)
+
+
 def _option_value(command: list[str], option: str) -> str:
     return command[command.index(option) + 1]
+
+
+def _option_values(command: list[str], option: str) -> list[str]:
+    values = []
+    for index, item in enumerate(command):
+        if item == option:
+            values.append(command[index + 1])
+    return values
+
+
+def _write_variable_filter_fixture(tmp_path, *, config_value: str):
+    config_root = tmp_path / "tests" / "configs" / "ble" / "beacon"
+    sweep_root = config_root / "full_sweep" / "partition"
+    sweep_root.mkdir(parents=True)
+    (config_root / "parameters.json").write_text(
+        json.dumps(
+            {
+                "generator": {"steps": 4},
+                "parameters": [
+                    {
+                        "name": "rate",
+                        "values": ["slow", "fast"],
+                        "config_path": "radio.rate",
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (sweep_root / "case.json").write_text(
+        json.dumps({"radio": {"rate": config_value}}) + "\n",
+        encoding="utf-8",
+    )
+    return config_root

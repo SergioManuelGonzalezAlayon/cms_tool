@@ -15,11 +15,13 @@ from cms_client import (
     _request_from_send_fw_args,
     build_cli_parser,
 )
+from cms_colors import ColorFormatter
 from cms_protocol import (
     MeasurementIdentity,
     MeasurementMode,
     MeasurementResult,
     MeasurementState,
+    VariableFilter,
 )
 
 
@@ -27,11 +29,19 @@ def test_test_command_accepts_run_name():
     parser = build_cli_parser()
 
     named = parser.parse_args(["test", "default", "beacon", "--run-name", "Nightly Run"])
+    colored = parser.parse_args(["--color", "always", "test", "default", "beacon"])
+    colored_after_command = parser.parse_args(["test", "default", "beacon", "--color", "never"])
     preview = parser.parse_args(["test", "default", "beacon", "--config-name", "dcdc", "--preview"])
+    filtered = parser.parse_args(
+        ["test", "full_sweep", "beacon", "--variable", "phy=2m", "--preview"]
+    )
 
     assert named.run_name == "Nightly Run"
+    assert colored.color == "always"
+    assert colored_after_command.color == "never"
     assert preview.preview is True
     assert preview.config_name == "dcdc"
+    assert filtered.variable == ["phy=2m"]
 
 
 def test_run_test_sends_requested_run_name_to_daemon():
@@ -89,6 +99,7 @@ def test_test_preview_shows_exact_submission_without_contacting_daemon(capsys, m
     assert "config_path:" in output
     assert "tests\\configs\\ble\\beacon\\dcdc.json" in output or "tests/configs/ble/beacon/dcdc.json" in output
     assert "config_hash:" in output
+    assert "expected_jobs: 1" in output
     assert "results_destination: cms_client" in output
 
 
@@ -112,6 +123,65 @@ def test_test_preview_shows_database_destination(capsys, monkeypatch):
     output = capsys.readouterr().out
     assert exit_code == 0
     assert "results_destination: database" in output
+
+
+def test_test_preview_shows_variable_filters_from_parameters_json(capsys, monkeypatch):
+    class Client:
+        def run_test(self, *args, **kwargs):
+            raise AssertionError("preview must not submit a test")
+
+    monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
+
+    exit_code = cms_client.main(
+        ["test", "full_sweep", "beacon", "--variable", "phy=2m", "--preview"]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "variables: phy=2m" in output
+    assert "expected_jobs:" in output
+    assert "available_variables:" in output
+    assert "phy: coded, 1m, 2m" in output
+
+
+def test_test_command_passes_variable_filters_to_client(monkeypatch):
+    captured = {}
+
+    class Client:
+        def run_test(self, *args, **kwargs):
+            captured.update(kwargs)
+            return MeasurementResult(
+                measurement_id="",
+                state=MeasurementState.REJECTED,
+                message="daemon validation is a later step",
+            )
+
+    monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
+
+    exit_code = cms_client.main(["test", "full_sweep", "beacon", "--variable", "phy=2m"])
+
+    assert exit_code == int(cms_client.CMSCLIExitCode.TEST_REJECTED)
+    assert captured["variable_filters"] == (VariableFilter("phy", "2m"),)
+
+
+def test_run_test_sends_variable_filters_to_daemon():
+    captured = {}
+    client = CMSClient.__new__(CMSClient)
+
+    def fake_request(method, path, payload):
+        captured.update(payload)
+        return {"measurement_id": "", "state": "rejected"}
+
+    client._request_json = fake_request
+
+    result = client.run_test(
+        MeasurementMode.FULL_SWEEP,
+        "beacon",
+        variable_filters=(VariableFilter("phy", "2m"),),
+    )
+
+    assert captured["variable_filters"] == [{"name": "phy", "value": "2m"}]
+    assert result.state is MeasurementState.REJECTED
 
 
 def test_recipes_command_prints_copy_paste_workflows(capsys):
@@ -265,10 +335,14 @@ def test_failed_command_can_emit_machine_readable_json(capsys, monkeypatch):
 
     monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
 
-    exit_code = cms_client.main(["FAILED", "measurement-123", "--json"])
+    exit_code = cms_client.main(
+        ["FAILED", "measurement-123", "--json", "--color", "always"]
+    )
 
-    payload = json.loads(capsys.readouterr().out)
+    output = capsys.readouterr().out
+    payload = json.loads(output)
     assert exit_code == 0
+    assert "\033[" not in output
     assert payload["measurement_id"] == "measurement-123"
     assert payload["failed_tests"][0]["config"] == "dcdc.json"
     assert payload["failed_tests"][0]["rerun_command"] == (
@@ -294,6 +368,21 @@ def test_measurement_display_includes_run_identity(capsys):
     output = capsys.readouterr().out
     assert "run_name: Nightly Beacon Run" in output
     assert "created_at: 2026-08-18T09:30:00+00:00" in output
+
+
+def test_measurement_display_can_force_or_disable_color(capsys):
+    result = MeasurementResult(
+        measurement_id="measurement-123",
+        state=MeasurementState.PASSED,
+    )
+
+    _print_measurement_result(result, colors=ColorFormatter(True))
+    forced_output = capsys.readouterr().out
+    _print_measurement_result(result, colors=ColorFormatter(False))
+    plain_output = capsys.readouterr().out
+
+    assert "\033[" in forced_output
+    assert "\033[" not in plain_output
 
 
 def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypatch):

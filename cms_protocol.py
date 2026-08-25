@@ -260,6 +260,22 @@ class SuiteSelector:
     feature: str
     config: str = "default"
     config_hash: str = ""
+    variable_filters: tuple["VariableFilter", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class VariableFilter:
+    """One generated-config parameter/value filter requested by the operator."""
+    name: str
+    value: str
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("variable filter name must not be empty")
+        if not self.value.strip():
+            raise ValueError("variable filter value must not be empty")
+        if "=" in self.name:
+            raise ValueError("variable filter name must not contain '='")
 
 
 @dataclass(slots=True)
@@ -422,6 +438,32 @@ def test_counts_from_dict(data: dict[str, Any]) -> TestCounts:
     if "remaining" in data and int(data["remaining"]) != counts.remaining:
         raise ValueError("remaining test count must equal total minus completed")
     return counts
+
+
+def variable_filter_to_dict(variable_filter: VariableFilter) -> dict[str, str]:
+    return {
+        "name": variable_filter.name,
+        "value": variable_filter.value,
+    }
+
+
+def variable_filter_from_dict(data: dict[str, Any]) -> VariableFilter:
+    return VariableFilter(
+        name=str(data.get("name", "")),
+        value=str(data.get("value", "")),
+    )
+
+
+def variable_filters_to_dicts(filters: tuple[VariableFilter, ...]) -> list[dict[str, str]]:
+    return [variable_filter_to_dict(item) for item in filters]
+
+
+def variable_filters_from_dicts(data: Any) -> tuple[VariableFilter, ...]:
+    if data is None:
+        return ()
+    if not isinstance(data, list):
+        raise ValueError("variable_filters must be a list")
+    return tuple(variable_filter_from_dict(item) for item in data)
 
 
 def event_cursor_to_int(cursor: EventCursor) -> int:
@@ -662,6 +704,7 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
             "feature": request.selector.feature,
             "config": request.selector.config,
             "config_hash": request.selector.config_hash,
+            "variable_filters": variable_filters_to_dicts(request.selector.variable_filters),
         },
         "firmware": firmware_data_to_dict(request.firmware),
         "mode": request.mode.value,
@@ -680,6 +723,7 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
             feature=str(selector.get("feature", "")),
             config=str(selector.get("config", "default")),
             config_hash=str(selector.get("config_hash", "")),
+            variable_filters=variable_filters_from_dicts(selector.get("variable_filters")),
         ),
         firmware=firmware_data_from_dict(data.get("firmware", data)),
         mode=MeasurementMode(str(data.get("mode", MeasurementMode.DEFAULT.value))),

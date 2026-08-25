@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from cms_colors import ColorFormatter
 import test_orchestrator as orchestrator
 
 
@@ -177,6 +178,40 @@ def test_failed_job_gets_terminal_failed_record(tmp_path, monkeypatch):
     assert records[-1]["result_type"] == "pytest_junit"
 
 
+def test_print_plan_can_force_or_disable_color(capsys):
+    jobs = [_job("default")]
+
+    orchestrator.print_plan(jobs, colors=ColorFormatter(True))
+    forced_output = capsys.readouterr().out
+    orchestrator.print_plan(jobs, colors=ColorFormatter(False))
+    plain_output = capsys.readouterr().out
+
+    assert "\033[" in forced_output
+    assert "\033[" not in plain_output
+
+
+def test_orchestrator_color_option_only_affects_human_output(tmp_path, monkeypatch, capsys):
+    job = _job("default")
+    results_log = tmp_path / "orchestrator_results.jsonl"
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: [job])
+
+    exit_code = orchestrator.main(
+        [
+            "--color",
+            "always",
+            "--dry-run",
+            "--results-log",
+            str(results_log),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    plan = json.loads((tmp_path / "orchestrator_plan.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert "\033[" in output
+    assert "\033[" not in json.dumps(plan)
+
+
 def test_build_jobs_hashes_config_and_propagates_measurement_identity(tmp_path, monkeypatch):
     config_root = tmp_path / "configs"
     feature_dir = config_root / "ble" / "beacon"
@@ -288,6 +323,288 @@ def test_build_jobs_rejects_requested_config_hash_mismatch(tmp_path, monkeypatch
             partition_filters=set(),
             cms_metadata_path=str(metadata_path),
         )
+
+
+def test_orchestrator_validates_variable_filters_from_parameters_json(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text(
+        json.dumps({"parameters": [{"name": "phy", "values": ["1m", "2m"]}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    filters = orchestrator.parse_variable_filters(["phy=2m"])
+
+    orchestrator.validate_variable_filters_for_targets(
+        [config_root],
+        feature_filters={"beacon"},
+        variable_filters=filters,
+    )
+
+
+def test_orchestrator_rejects_unknown_variable_before_building_jobs(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text(
+        json.dumps({"parameters": [{"name": "phy", "values": ["1m", "2m"]}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    exit_code = orchestrator.main(
+        [
+            str(config_root),
+            "--feature",
+            "beacon",
+            "--variable",
+            "unknown=2m",
+        ]
+    )
+
+    assert exit_code == 2
+
+
+def test_build_jobs_filters_generated_configs_by_declared_variable_value(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    sweep_dir = feature_dir / "full_sweep" / "dcdc"
+    sweep_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text(
+        json.dumps(
+            {
+                "parameters": [
+                    {
+                        "name": "phy",
+                        "values": ["1m", "2m", "coded"],
+                        "config_paths": ["advertiser.phy", "scanner.phy"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (feature_dir / "default.json").write_text('{"advertiser":{"phy":"1m"}}\n', encoding="utf-8")
+    one_factor_2m = feature_dir / "phy_2m.json"
+    one_factor_2m.write_text(
+        '{"advertiser":{"phy":"2m"},"scanner":{"phy":"1m"}}\n',
+        encoding="utf-8",
+    )
+    one_factor_coded = feature_dir / "phy_coded.json"
+    one_factor_coded.write_text(
+        '{"advertiser":{"phy":"coded"},"scanner":{"phy":"coded"}}\n',
+        encoding="utf-8",
+    )
+    full_sweep_2m = sweep_dir / "case_2m.json"
+    full_sweep_2m.write_text(
+        '{"advertiser":{"phy":"2m"},"scanner":{"phy":"1m"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    filters = orchestrator.parse_variable_filters(["phy=2m"])
+    jobs = orchestrator.build_jobs(
+        [config_root],
+        mode="all",
+        feature_filters={"beacon"},
+        partition_filters=set(),
+        variable_filters=filters,
+    )
+    plan = orchestrator.build_job_plan(jobs)
+
+    assert [job.cfg_arg for job in jobs] == [
+        "phy_2m.json",
+        "full_sweep/dcdc/case_2m.json",
+    ]
+    assert all(job.variable_filters == filters for job in jobs)
+    assert plan["variable_filters"] == [{"name": "phy", "value": "2m"}]
+    assert all(
+        record["variable_filters"] == [{"name": "phy", "value": "2m"}]
+        for record in plan["jobs"]
+    )
+
+
+def test_build_jobs_variable_filters_use_declared_option_mappings(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text(
+        json.dumps(
+            {
+                "parameters": [
+                    {
+                        "name": "dcdc",
+                        "values": ["On", "Off"],
+                        "config_path": "firmware.dut_slcp",
+                        "options": {
+                            "On": "apps/ncp_ble_dut_dcdc.slcp",
+                            "Off": "apps/ncp_ble_dut.slcp",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (feature_dir / "dcdc.json").write_text(
+        '{"firmware":{"dut_slcp":"apps/ncp_ble_dut_dcdc.slcp"}}\n',
+        encoding="utf-8",
+    )
+    (feature_dir / "no_dcdc.json").write_text(
+        '{"firmware":{"dut_slcp":"apps/ncp_ble_dut.slcp"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    jobs = orchestrator.build_jobs(
+        [config_root],
+        mode="one_factor",
+        feature_filters={"beacon"},
+        partition_filters=set(),
+        variable_filters=orchestrator.parse_variable_filters(["dcdc=On"]),
+    )
+
+    assert [job.cfg_arg for job in jobs] == ["dcdc.json"]
+
+
+def test_build_jobs_variable_filters_select_intersection(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    sweep_dir = feature_dir / "full_sweep" / "dcdc"
+    sweep_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text(
+        json.dumps(
+            {
+                "parameters": [
+                    {
+                        "name": "phy",
+                        "values": ["1m", "2m"],
+                        "config_path": "advertiser.phy",
+                    },
+                    {
+                        "name": "tx_power",
+                        "values": ["0 dBm", "10 dBm"],
+                        "config_path": "advertiser.tx_power_label",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (sweep_dir / "2m_0dbm.json").write_text(
+        '{"advertiser":{"phy":"2m","tx_power_label":"0 dBm"}}\n',
+        encoding="utf-8",
+    )
+    (sweep_dir / "2m_10dbm.json").write_text(
+        '{"advertiser":{"phy":"2m","tx_power_label":"10 dBm"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    jobs = orchestrator.build_jobs(
+        [config_root],
+        mode="full_sweep",
+        feature_filters={"beacon"},
+        partition_filters=set(),
+        variable_filters=orchestrator.parse_variable_filters(["phy=2m", "tx_power=10 dBm"]),
+    )
+
+    assert [job.cfg_arg for job in jobs] == ["full_sweep/dcdc/2m_10dbm.json"]
+
+
+def test_orchestrator_rejects_zero_match_variable_filters_before_pytest(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text(
+        json.dumps(
+            {
+                "parameters": [
+                    {
+                        "name": "phy",
+                        "values": ["1m", "2m"],
+                        "config_path": "advertiser.phy",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (feature_dir / "phy_1m.json").write_text(
+        '{"advertiser":{"phy":"1m"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("pytest must not start for zero-match filters")
+        ),
+    )
+
+    exit_code = orchestrator.main(
+        [
+            str(config_root),
+            "--mode",
+            "one_factor",
+            "--feature",
+            "beacon",
+            "--variable",
+            "phy=2m",
+        ]
+    )
+
+    assert exit_code == 1
+
+
+def test_orchestrator_dry_run_writes_variable_filtered_plan(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text(
+        json.dumps(
+            {
+                "parameters": [
+                    {
+                        "name": "phy",
+                        "values": ["1m", "2m"],
+                        "config_path": "advertiser.phy",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (feature_dir / "phy_2m.json").write_text(
+        '{"advertiser":{"phy":"2m"}}\n',
+        encoding="utf-8",
+    )
+    results_log = tmp_path / "orchestrator_results.jsonl"
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    exit_code = orchestrator.main(
+        [
+            str(config_root),
+            "--mode",
+            "one_factor",
+            "--feature",
+            "beacon",
+            "--variable",
+            "phy=2m",
+            "--dry-run",
+            "--results-log",
+            str(results_log),
+        ]
+    )
+    plan = json.loads((tmp_path / "orchestrator_plan.json").read_text(encoding="utf-8"))
+
+    assert exit_code == 0
+    assert plan["total_jobs"] == 1
+    assert plan["variable_filters"] == [{"name": "phy", "value": "2m"}]
+    assert plan["jobs"][0]["cfg_arg"] == "phy_2m.json"
 
 
 def test_build_jobs_can_select_one_exact_named_config(tmp_path, monkeypatch):

@@ -9,7 +9,20 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cms_protocol import ResultType, TestCaseIdentity, TestCaseState, test_case_identity_to_dict
+from cms_colors import COLOR_CHOICES, ColorFormatter, color_formatter
+from cms_protocol import (
+    ResultType,
+    TestCaseIdentity,
+    TestCaseState,
+    VariableFilter,
+    test_case_identity_to_dict,
+    variable_filters_to_dicts,
+)
+from cms_variable_filters import (
+    config_matches_variable_filters,
+    parse_variable_filters,
+    validate_variable_filters,
+)
 
 
 # This is an executable application module, not a pytest test module.
@@ -45,6 +58,7 @@ class Job:
     measurement_id: str = ""
     run_name: str = ""
     measurement_created_at: str = ""
+    variable_filters: tuple[VariableFilter, ...] = ()
 
     @property
     def job_id(self) -> str:
@@ -161,6 +175,7 @@ def build_jobs(
     partition_filters: set[str],
     exact_config: str = "",
     cms_metadata_path: str = "",
+    variable_filters: tuple[VariableFilter, ...] = (),
 ) -> list[Job]:
     cms_metadata = cms_execution_metadata(cms_metadata_path)
     cms_firmware = cms_metadata.get("firmware", {})
@@ -191,6 +206,19 @@ def build_jobs(
             partition = partition_name(config_path, config_dir)
             if partition_filters and partition not in partition_filters:
                 continue
+            if variable_filters:
+                if job_mode not in {"one_factor", "full_sweep"}:
+                    continue
+                try:
+                    matches_filters = config_matches_variable_filters(
+                        parameter_file,
+                        config,
+                        variable_filters,
+                    )
+                except ValueError:
+                    continue
+                if not matches_filters:
+                    continue
 
             firmware = config.get("firmware", {})
             hw = config.get("hw", {})
@@ -225,9 +253,45 @@ def build_jobs(
                     measurement_id=str(measurement_identity.get("measurement_id", "")),
                     run_name=str(measurement_identity.get("run_name", "")),
                     measurement_created_at=str(measurement_identity.get("created_at", "")),
+                    variable_filters=variable_filters,
                 )
             )
     return sorted(jobs, key=job_sort_key)
+
+
+def validate_variable_filters_for_targets(
+    targets: list[Path],
+    *,
+    feature_filters: set[str],
+    variable_filters,
+) -> None:
+    if not variable_filters:
+        return
+    parameter_files = [
+        parameter_file
+        for parameter_file in discover_parameter_files(targets)
+        if not feature_filters or parameter_file.parent.name in feature_filters
+    ]
+    if not parameter_files:
+        raise ValueError("no selected feature parameters are available for variable filters")
+    for variable_filter in variable_filters:
+        matching_parameter_files = []
+        unsupported_value_errors = []
+        for parameter_file in parameter_files:
+            try:
+                validate_variable_filters(parameter_file, (variable_filter,))
+                matching_parameter_files.append(parameter_file)
+            except ValueError as exc:
+                if str(exc).startswith("unknown variable"):
+                    continue
+                unsupported_value_errors.append(str(exc))
+        if matching_parameter_files:
+            continue
+        if unsupported_value_errors:
+            raise ValueError("; ".join(unsupported_value_errors))
+        raise ValueError(
+            f"unknown variable '{variable_filter.name}' for selected features"
+        )
 
 
 def voltage_sort_value(value):
@@ -307,6 +371,7 @@ def job_record(
     record = asdict(job)
     record["config_path"] = str(job.config_path)
     record["cfg_path"] = str(job.config_path)
+    record["variable_filters"] = variable_filters_to_dicts(job.variable_filters)
     if junit_path is not None:
         record["junit_path"] = str(junit_path)
     record.update(
@@ -328,10 +393,12 @@ def job_record(
 
 def build_job_plan(jobs: list[Job], results_log: Path | None = None) -> dict:
     total_jobs = len(jobs)
+    variable_filters = jobs[0].variable_filters if jobs else ()
     return {
         "record_type": "job_plan",
         "schema_version": 1,
         "total_jobs": total_jobs,
+        "variable_filters": variable_filters_to_dicts(variable_filters),
         "jobs": [
             {
                 **job_record(
@@ -400,19 +467,20 @@ def job_completed_record(
     return record
 
 
-def print_plan(jobs: list[Job]) -> None:
-    print(f"Planned jobs: {len(jobs)}")
+def print_plan(jobs: list[Job], *, colors: ColorFormatter | None = None) -> None:
+    colors = colors or color_formatter("never")
+    print(f"{colors.color('Planned jobs', 'heading')}: {len(jobs)}")
     last_group = None
     for index, job in enumerate(jobs, start=1):
         group = (job.feature, job.dut_slcp, job.partition, job.supply_v)
         if group != last_group:
             print(
-                f"\n[{job.feature}] dut={job.dut_slcp or '-'} "
+                f"\n{colors.color(f'[{job.feature}]', 'heading')} dut={job.dut_slcp or '-'} "
                 f"tester={job.tester_slcp or '-'} board={job.board or '-'} "
                 f"partition={job.partition or '-'} v={job.supply_v}"
             )
             last_group = group
-        print(f"  {index:04d} {job.cfg_arg}")
+        print(f"  {colors.color(f'{index:04d}', 'running')} {job.cfg_arg}")
         if job.cms_fw_metadata:
             print(
                 f"       cms dut_hash={job.dut_image_sha256[:12] or '-'} "
@@ -516,6 +584,22 @@ def parse_args_with_pytest(argv: list[str]) -> tuple[argparse.Namespace, list[st
         help="Only run a specific full_sweep partition such as dcdc or no_dcdc.",
     )
     parser.add_argument(
+        "--variable",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help=(
+            "Only run generated configs matching a parameter declared in parameters.json; "
+            "repeat to intersect filters."
+        ),
+    )
+    parser.add_argument(
+        "--color",
+        choices=COLOR_CHOICES,
+        default="auto",
+        help="color human output: auto, always, or never",
+    )
+    parser.add_argument(
         "--exact-config",
         default="",
         help="Run exactly one config path or name from the selected feature directory.",
@@ -575,19 +659,36 @@ def cms_pytest_args(parsed: argparse.Namespace) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parsed, pytest_args = parse_args_with_pytest(list(argv if argv is not None else sys.argv[1:]))
+    colors = color_formatter(parsed.color)
     targets = [Path(target) for target in parsed.targets]
     results_log = Path(parsed.results_log)
+    try:
+        variable_filters = parse_variable_filters(parsed.variable)
+        validate_variable_filters_for_targets(
+            targets,
+            feature_filters=set(parsed.feature),
+            variable_filters=variable_filters,
+        )
+    except ValueError as exc:
+        print(colors.color(str(exc), "failed"))
+        return 2
     pytest_args, ignored_cfg_args = strip_forwarded_cfg_args(pytest_args)
     if ignored_cfg_args:
         if parsed.cms_fw_metadata:
             print(
-                "CMS orchestrator runs must use --exact-config for selected "
-                "configs; forwarded pytest --cfg argument(s) are not allowed."
+                colors.color(
+                    "CMS orchestrator runs must use --exact-config for selected "
+                    "configs; forwarded pytest --cfg argument(s) are not allowed.",
+                    "failed",
+                )
             )
             return 2
         print(
-            "Ignoring forwarded --cfg argument(s); "
-            "test_orchestrator selects configs from discovered jobs."
+            colors.color(
+                "Ignoring forwarded --cfg argument(s); "
+                "test_orchestrator selects configs from discovered jobs.",
+                "warning",
+            )
         )
     pytest_args = [*cms_pytest_args(parsed), *pytest_args]
 
@@ -601,13 +702,23 @@ def main(argv: list[str] | None = None) -> int:
         partition_filters=set(parsed.partition),
         exact_config=parsed.exact_config,
         cms_metadata_path=parsed.cms_fw_metadata,
+        variable_filters=variable_filters,
     )
     if not jobs:
-        print("No orchestrated jobs found.")
+        if variable_filters:
+            filters_text = ", ".join(f"{item.name}={item.value}" for item in variable_filters)
+            print(
+                colors.color(
+                    f"No orchestrated jobs found for variable filter(s): {filters_text}",
+                    "failed",
+                )
+            )
+        else:
+            print(colors.color("No orchestrated jobs found.", "failed"))
         return 1
 
     plan_path = write_job_plan(results_log, jobs)
-    print(f"Wrote complete job plan: {plan_path}")
+    print(f"{colors.color('Wrote complete job plan', 'info')}: {plan_path}")
     planned_positions = {job.job_id: (ordinal, len(jobs)) for ordinal, job in enumerate(jobs, start=1)}
     junit_paths = {
         job.job_id: junit_path_for_job(results_log, job, ordinal)
@@ -618,10 +729,10 @@ def main(argv: list[str] | None = None) -> int:
         done = completed_job_ids(results_log)
         jobs = [job for job in jobs if job.job_id not in done]
         if not jobs:
-            print("All matching jobs are already marked as passed in the results log.")
+            print(colors.color("All matching jobs are already marked as passed in the results log.", "passed"))
             return 0
 
-    print_plan(jobs)
+    print_plan(jobs, colors=colors)
     if parsed.dry_run:
         return 0
 
@@ -629,7 +740,11 @@ def main(argv: list[str] | None = None) -> int:
     for job in jobs:
         ordinal, total_jobs = planned_positions[job.job_id]
         junit_path = junit_paths[job.job_id]
-        print(f"\nRunning {ordinal}/{total_jobs}: {job.nodeid} --cfg {job.cfg_arg}")
+        print(
+            "\n"
+            + colors.color(f"Running {ordinal}/{total_jobs}", "running")
+            + f": {job.nodeid} --cfg {job.cfg_arg}"
+        )
         started_at = datetime.now(timezone.utc).isoformat()
         append_result(
             results_log,
@@ -652,9 +767,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         if returncode != 0:
             failures += 1
+            print(
+                colors.color(
+                    f"Failed {ordinal}/{total_jobs}: {job.cfg_arg} returncode={returncode}",
+                    "failed",
+                )
+            )
             if parsed.max_fail and failures >= parsed.max_fail:
-                print(f"Stopping early after {failures} failure(s).")
+                print(colors.color(f"Stopping early after {failures} failure(s).", "warning"))
                 return 1
+        else:
+            print(colors.color(f"Passed {ordinal}/{total_jobs}: {job.cfg_arg}", "passed"))
 
     return 1 if failures else 0
 

@@ -5,7 +5,9 @@ from cms_protocol import (
     FirmwareImage,
     MeasurementMode,
     MeasurementRequest,
+    MeasurementState,
     SuiteSelector,
+    VariableFilter,
 )
 from cmsd import CMSDaemon
 
@@ -97,3 +99,27 @@ def test_staged_execution_preserves_requested_config_hash(monkeypatch):
     request = captured["kwargs"]["args"][0]
     assert request.selector.config == "dcdc"
     assert request.selector.config_hash == "sha256:dcdc"
+
+
+def test_staged_execution_preserves_variable_filters(monkeypatch):
+    captured = {}
+
+    class CapturingThread(_DormantThread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("cmsd.threading.Thread", CapturingThread)
+    daemon = CMSDaemon()
+    daemon.last_firmware_request = _staged_request()
+    filters = (VariableFilter("phy", "2m"),)
+
+    result = daemon.start_staged_test(
+        mode=MeasurementMode.FULL_SWEEP.value,
+        feature="beacon",
+        variable_filters=filters,
+    )
+
+    request = captured["kwargs"]["args"][0]
+    assert result.state is MeasurementState.ACCEPTED
+    assert request.selector.variable_filters == filters

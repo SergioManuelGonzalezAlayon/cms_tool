@@ -26,6 +26,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any, Callable
 
+from cms_colors import COLOR_CHOICES, ColorFormatter, color_formatter, state_role
 from cms_protocol import (
     CMS_OBSERVATION_PROTOCOL_VERSION,
     Artifacts,
@@ -43,6 +44,7 @@ from cms_protocol import (
     MeasurementState,
     MeasurementSummary,
     SuiteSelector,
+    VariableFilter,
     artifact_from_dict,
     artifact_to_dict,
     bench_health_report_from_dict,
@@ -51,6 +53,11 @@ from cms_protocol import (
     measurement_result_from_dict,
     measurement_event_page_from_dict,
     measurement_summary_from_dict,
+)
+from cms_variable_filters import (
+    parse_variable_filters,
+    validate_variable_filters,
+    variable_help_text,
 )
 
 CMS_CLIENT_CONFIG = "cms_client_config.json"
@@ -200,6 +207,7 @@ class CMSClient:
         config: str = "default",
         upload_results_to_database: bool = False,
         run_name: str = "",
+        variable_filters: tuple[VariableFilter, ...] = (),
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
         config_hash = _validate_local_test_config(feature, config)
@@ -211,6 +219,10 @@ class CMSClient:
                 "feature": feature,
                 "config": config,
                 "config_hash": config_hash,
+                "variable_filters": [
+                    {"name": item.name, "value": item.value}
+                    for item in variable_filters
+                ],
                 "run_name": run_name,
                 "upload_results_to_database": upload_results_to_database,
             },
@@ -603,12 +615,21 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=CMS_CLIENT_CONFIG, help="client config JSON path")
     parser.add_argument("--base-url", default="", help="override daemon base URL")
     parser.add_argument("--api-token", default="", help="override daemon API token")
+    parser.add_argument(
+        "--color",
+        choices=COLOR_CHOICES,
+        default="auto",
+        help="color human output: auto, always, or never",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("health", help="show daemon and bench health")
-    subparsers.add_parser("status", help="show bench status")
-    subparsers.add_parser("tests", aliases=["TESTS"], help="list test modes and features")
-    subparsers.add_parser(
+    health = subparsers.add_parser("health", help="show daemon and bench health")
+    _add_color_argument(health)
+    status = subparsers.add_parser("status", help="show bench status")
+    _add_color_argument(status)
+    tests = subparsers.add_parser("tests", aliases=["TESTS"], help="list test modes and features")
+    _add_color_argument(tests)
+    exit_codes = subparsers.add_parser(
         "exit_codes",
         aliases=["EXIT_CODES"],
         help="document stable CLI exit codes",
@@ -620,6 +641,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "connection failure, protocol mismatch, rejected request, or client usage error."
         ),
     )
+    _add_color_argument(exit_codes)
     troubleshoot = subparsers.add_parser(
         "troubleshoot",
         aliases=["TROUBLESHOOT"],
@@ -639,6 +661,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms TROUBLESHOOT --topic health"
         ),
     )
+    _add_color_argument(troubleshoot)
     troubleshoot.add_argument(
         "--topic",
         default="all",
@@ -668,6 +691,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  Run cms SEND_FW to stage the built firmware on the bench."
         ),
     )
+    _add_color_argument(build)
     build.add_argument("targets", nargs="*", help="optional .slcp targets or app directories")
     build.add_argument("--action", default="build", choices=["generate", "upgrade", "build", "rebuild"])
     build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
@@ -689,6 +713,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  Run cms TEST default beacon --config-name default --preview before starting a test."
         ),
     )
+    _add_color_argument(send_fw)
     send_fw.add_argument("--request-json", help="load the full firmware request from JSON")
     send_fw.add_argument("--request-id", default="", help="firmware staging id")
     send_fw.add_argument("--dut-image", default="", help="DUT firmware path or URL")
@@ -715,10 +740,17 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms TEST default beacon --config-name default --preview\n"
             "  cms TEST default beacon --config-name default --out-dir artifacts\n"
             "  cms TEST default beacon --config-name dcdc --preview\n"
-            "  cms TEST default beacon --config-name dcdc --upload-results-to-database\n\n"
+            "  cms TEST default beacon --config-name dcdc --upload-results-to-database\n"
+            "  cms TEST full_sweep beacon --variable phy=2m --preview\n"
+            "  cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
             "Required arguments:\n"
             "  mode      debug, default, full_sweep, or diff\n"
             "  feature   BLE feature name such as beacon\n\n"
+            "Variable filters:\n"
+            "  Use --variable name=value to target generated configs by parameter.\n"
+            "  Names and values come from the selected feature's parameters.json.\n"
+            "  For beacon today, parameters.json declares phy values coded, 1m, 2m.\n"
+            "  Run --preview to print accepted variable names and values before testing.\n\n"
             "Defaults:\n"
             "  --config-name default\n"
             "  --out-dir artifacts\n"
@@ -727,9 +759,20 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  The command watches automatically. Reattach later with cms WATCH <measurement_id>."
         ),
     )
+    _add_color_argument(test)
     test.add_argument("mode", choices=[mode.value for mode in MeasurementMode])
     test.add_argument("feature")
     test.add_argument("--config-name", default="default", help="test config")
+    test.add_argument(
+        "--variable",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help=(
+            "filter generated configs by a parameter declared in parameters.json; "
+            "repeat to intersect filters"
+        ),
+    )
     test.add_argument(
         "--run-name",
         dest="run_name",
@@ -773,6 +816,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  Use cms WATCH <measurement_id> to follow a running measurement."
         ),
     )
+    _add_color_argument(measurement)
     measurement.add_argument("measurement_id")
 
     watch = subparsers.add_parser(
@@ -793,6 +837,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  After completion, run cms ARTIFACTS <measurement_id> --out-dir artifacts."
         ),
     )
+    _add_color_argument(watch)
     watch.add_argument("measurement_id", nargs="?", default="")
     watch.add_argument(
         "--cursor",
@@ -826,6 +871,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  Run cms WATCH to observe the final cancelled state."
         ),
     )
+    _add_color_argument(cancel)
 
     artifacts = subparsers.add_parser(
         "artifacts",
@@ -843,6 +889,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  Inspect the downloaded result JSON, JUnit XML, logs, and measurement artifacts."
         ),
     )
+    _add_color_argument(artifacts)
     artifacts.add_argument("measurement_id")
     artifacts.add_argument("--out-dir", default="artifacts")
 
@@ -861,6 +908,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  Use the printed rerun command for each failed config."
         ),
     )
+    _add_color_argument(failed)
     failed.add_argument("measurement_id")
     failed.add_argument(
         "--json",
@@ -885,12 +933,22 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms RECIPES --feature beacon --config-name dcdc --measurement-id <id>"
         ),
     )
+    _add_color_argument(recipes)
     recipes.add_argument("--feature", default="beacon", help="feature used in TEST examples")
     recipes.add_argument("--config-name", default="dcdc", help="named config used in exact-config examples")
     recipes.add_argument("--measurement-id", default="<measurement_id>", help="measurement ID used in WATCH and ARTIFACTS examples")
     recipes.add_argument("--cursor", type=_non_negative_int, default=0, help="cursor used in reconnect examples")
     recipes.add_argument("--out-dir", default="artifacts", help="artifact output directory used in examples")
     return parser
+
+
+def _add_color_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--color",
+        choices=COLOR_CHOICES,
+        default=argparse.SUPPRESS,
+        help="color human output: auto, always, or never",
+    )
 
 
 def _measurement_exit_code(
@@ -924,15 +982,16 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     args = build_cli_parser().parse_args(argv)
+    colors = color_formatter(args.color)
     client_config = load_client_config(args.config)
     client = CMSClient(base_url=args.base_url, api_token=args.api_token, config_path=args.config)
 
     if args.command == "health":
         report = client.get_health()
-        print(f"{report.state.value}: {report.summary}")
+        print(f"{colors.state(report.state)}: {report.summary}")
         for check in report.checks:
             detail = f" ({check.detail})" if check.detail else ""
-            print(f"{check.status.value} {check.name}: {check.summary}{detail}")
+            print(f"{colors.state(check.status.value)} {check.name}: {check.summary}{detail}")
         return (
             CMSCLIExitCode.SUCCESS
             if report.state is not BenchState.ERROR
@@ -941,7 +1000,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "status":
         status = client.get_status()
-        print(f"{status.state.value}: {status.identity.bench_id}")
+        print(f"{colors.state(status.state)}: {status.identity.bench_id}")
         if status.active_measurement_id:
             print(f"active_measurement_id: {status.active_measurement_id}")
         if status.detail:
@@ -978,7 +1037,7 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command in {"send_fw", "SEND_FW"}:
         request = _request_from_send_fw_args(args, client_config)
         result = client.send_firmware(request)
-        _print_measurement_result(result)
+        _print_measurement_result(result, colors=colors)
         if result.state is MeasurementState.REJECTED:
             return CMSCLIExitCode.TEST_REJECTED
         return (
@@ -988,7 +1047,7 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "measurement":
-        _print_measurement_result(client.get_measurement(args.measurement_id))
+        _print_measurement_result(client.get_measurement(args.measurement_id), colors=colors)
         return CMSCLIExitCode.SUCCESS
 
     if args.command in {"watch", "WATCH"}:
@@ -999,14 +1058,18 @@ def _main(argv: list[str] | None = None) -> int:
             after_cursor=EventCursor(args.cursor),
             verbose=args.verbose,
             poll_interval_s=args.poll_interval,
+            colors=colors,
         )
         return _measurement_exit_code(
             state.summary.state if state.summary is not None else None
         )
 
     if args.command in {"test", "TEST"}:
+        variable_filters = parse_variable_filters(args.variable)
+        if variable_filters:
+            validate_variable_filters(_local_parameters_path(args.feature), variable_filters)
         if args.preview:
-            _print_test_preview(args)
+            _print_test_preview(args, variable_filters)
             return CMSCLIExitCode.SUCCESS
         result = client.run_test(
             MeasurementMode(args.mode),
@@ -1014,15 +1077,17 @@ def _main(argv: list[str] | None = None) -> int:
             config=args.config_name,
             run_name=args.run_name,
             upload_results_to_database=args.upload_results_to_database,
+            variable_filters=variable_filters,
         )
         if not result.measurement_id:
-            _print_measurement_result(result)
+            _print_measurement_result(result, colors=colors)
             return _measurement_exit_code(result.state)
         state = _watch_remote_measurement(
             client,
             result.measurement_id,
             verbose=args.verbose,
             poll_interval_s=args.poll_interval,
+            colors=colors,
         )
         result = client.get_measurement(result.measurement_id)
         if result.artifacts:
@@ -1037,7 +1102,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"cancel", "CANCEL"}:
         result = client.cancel_active_test()
-        _print_measurement_result(result)
+        _print_measurement_result(result, colors=colors)
         if result.state is MeasurementState.REJECTED:
             return CMSCLIExitCode.TEST_REJECTED
         return (
@@ -1320,8 +1385,13 @@ def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
     return payloads
 
 
-def _print_measurement_result(result: MeasurementResult) -> None:
-    print(f"{result.measurement_id}: {result.state.value} {result.progress_percent}%")
+def _print_measurement_result(
+    result: MeasurementResult,
+    *,
+    colors: ColorFormatter | None = None,
+) -> None:
+    colors = colors or color_formatter("never")
+    print(f"{result.measurement_id}: {colors.state(result.state)} {result.progress_percent}%")
     if result.identity is not None:
         print(f"run_name: {result.identity.run_name}")
         print(f"created_at: {result.identity.created_at.isoformat()}")
@@ -1332,15 +1402,62 @@ def _print_measurement_result(result: MeasurementResult) -> None:
         print(f"artifact {artifact.name}: {location}")
 
 
-def _print_test_preview(args: argparse.Namespace) -> None:
+def _local_parameters_path(feature: str) -> Path:
+    feature_name = feature.strip()
+    if not feature_name:
+        raise RuntimeError("test feature is required")
+    if Path(feature_name).name != feature_name or feature_name in {".", ".."}:
+        raise RuntimeError("test feature must be a single feature name")
+    parameters_path = Path("tests") / "configs" / "ble" / feature_name / "parameters.json"
+    if not parameters_path.is_file():
+        raise RuntimeError(f"test feature parameters do not exist: {parameters_path}")
+    return parameters_path
+
+
+def _preview_job_count(
+    args: argparse.Namespace,
+    variable_filters: tuple[VariableFilter, ...],
+) -> int:
+    from test_orchestrator import build_jobs
+
+    config_root = Path("tests") / "configs" / "ble" / args.feature
+    exact_config = "" if args.config_name == "default" else args.config_name
+    discovery_mode = "all" if exact_config else args.mode
+    jobs = build_jobs(
+        [config_root],
+        mode=discovery_mode,
+        feature_filters={args.feature},
+        partition_filters=set(),
+        exact_config=exact_config,
+        variable_filters=variable_filters,
+    )
+    return len(jobs)
+
+
+def _print_test_preview(
+    args: argparse.Namespace,
+    variable_filters: tuple[VariableFilter, ...] = (),
+) -> None:
     config_path = _local_test_config_path(args.feature, args.config_name)
     config_hash = _validate_local_test_config(args.feature, args.config_name)
+    parameters_path = _local_parameters_path(args.feature)
+    validate_variable_filters(parameters_path, variable_filters)
+    expected_job_count = _preview_job_count(args, variable_filters)
     print("test preview")
     print(f"mode: {args.mode}")
     print(f"feature: {args.feature}")
     print(f"config: {args.config_name}")
     print(f"config_path: {config_path}")
     print(f"config_hash: {config_hash}")
+    if variable_filters:
+        print(
+            "variables: "
+            + ", ".join(f"{item.name}={item.value}" for item in variable_filters)
+        )
+    print(f"expected_jobs: {expected_job_count}")
+    print("available_variables:")
+    for line in variable_help_text(parameters_path).splitlines():
+        print(f"  {line}")
     if args.run_name:
         print(f"run_name: {args.run_name}")
     destination = "database" if args.upload_results_to_database else "cms_client"
@@ -1557,13 +1674,21 @@ def _measurement_summary_key(summary: MeasurementSummary) -> tuple[Any, ...]:
     )
 
 
-def _print_measurement_summary(summary: MeasurementSummary) -> None:
+def _print_measurement_summary(
+    summary: MeasurementSummary,
+    *,
+    colors: ColorFormatter | None = None,
+) -> None:
+    colors = colors or color_formatter("never")
     counts = summary.counts
-    print(f"{summary.measurement_id}: {summary.state.value}")
+    print(f"{summary.measurement_id}: {colors.state(summary.state)}")
     print(
         "tests: "
-        f"total={counts.total} completed={counts.completed} passed={counts.passed} "
-        f"failed={counts.failed} skipped={counts.skipped} remaining={counts.remaining}"
+        f"total={counts.total} completed={counts.completed} "
+        f"passed={colors.color(counts.passed, 'passed')} "
+        f"failed={colors.color(counts.failed, 'failed')} "
+        f"skipped={colors.color(counts.skipped, 'skipped')} "
+        f"remaining={colors.color(counts.remaining, 'running')}"
     )
     if summary.current_test is not None:
         current = summary.current_test
@@ -1580,17 +1705,22 @@ def _print_measurement_summary(summary: MeasurementSummary) -> None:
             )
 
 
-def _print_verbose_event_page(page: MeasurementEventPage) -> None:
+def _print_verbose_event_page(
+    page: MeasurementEventPage,
+    *,
+    colors: ColorFormatter | None = None,
+) -> None:
+    colors = colors or color_formatter("never")
     for event in page.events:
         timestamp = event.timestamp.isoformat()
         if event.event_type == "console":
             source = str(event.details.get("source", "console"))
             text = str(event.details.get("text", ""))
             for line in text.splitlines() or [""]:
-                print(f"{timestamp} [{source}] {line}")
+                print(f"{colors.color(timestamp, 'dim')} [{source}] {line}")
             continue
         state = str(event.details.get("state", event.event_type))
-        print(f"{timestamp} [event] {state}")
+        print(f"{colors.color(timestamp, 'dim')} [event] {colors.color(state, state_role(state))}")
 
 
 def _watch_remote_measurement(
@@ -1600,7 +1730,9 @@ def _watch_remote_measurement(
     after_cursor: EventCursor = EventCursor(),
     verbose: bool = False,
     poll_interval_s: float = 1.0,
+    colors: ColorFormatter | None = None,
 ) -> MeasurementWatchState:
+    colors = colors or color_formatter("never")
     state = MeasurementWatchState(measurement_id, cursor=after_cursor)
     last_summary_key: tuple[Any, ...] | None = None
 
@@ -1608,12 +1740,13 @@ def _watch_remote_measurement(
         nonlocal last_summary_key
         summary_key = _measurement_summary_key(summary)
         if summary_key != last_summary_key:
-            _print_measurement_summary(summary)
+            _print_measurement_summary(summary, colors=colors)
             last_summary_key = summary_key
 
     def render_truncation(oldest_retained_cursor: EventCursor) -> None:
         print(
-            "warning: verbose console output was truncated; "
+            colors.color("warning:", "warning")
+            + " verbose console output was truncated; "
             f"continuing from cursor {oldest_retained_cursor.value}"
         )
 
@@ -1622,7 +1755,7 @@ def _watch_remote_measurement(
         state,
         poll_interval_s=poll_interval_s,
         on_summary=render_summary,
-        on_events=_print_verbose_event_page if verbose else None,
+        on_events=(lambda page: _print_verbose_event_page(page, colors=colors)) if verbose else None,
         on_truncation=render_truncation,
     )
 
