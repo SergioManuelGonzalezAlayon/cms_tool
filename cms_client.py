@@ -200,6 +200,7 @@ class CMSClient:
         run_name: str = "",
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
+        config_hash = _validate_local_test_config(feature, config)
         payload = self._request_json(
             "POST",
             "/test",
@@ -207,6 +208,7 @@ class CMSClient:
                 "mode": mode.value,
                 "feature": feature,
                 "config": config,
+                "config_hash": config_hash,
                 "run_name": run_name,
                 "upload_results_to_database": upload_results_to_database,
             },
@@ -593,6 +595,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
     test.add_argument(
+        "--preview",
+        action="store_true",
+        help="show exactly what test would be submitted without starting it",
+    )
+    test.add_argument(
         "--verbose",
         action="store_true",
         help="show live stdout, stderr, and lifecycle events",
@@ -754,6 +761,9 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command in {"test", "TEST"}:
+        if args.preview:
+            _print_test_preview(args)
+            return CMSCLIExitCode.SUCCESS
         result = client.run_test(
             MeasurementMode(args.mode),
             args.feature,
@@ -1001,6 +1011,45 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_local_test_config(feature: str, config: str) -> str:
+    config_path = _local_test_config_path(feature, config)
+    if not config_path.exists():
+        raise RuntimeError(f"test config does not exist: {config_path}")
+    try:
+        config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"test config is not valid JSON: {config_path}") from exc
+    if not isinstance(config_data, dict):
+        raise RuntimeError(f"test config must be a JSON object: {config_path}")
+    for section in ("firmware", "hw"):
+        if section in config_data and not isinstance(config_data[section], dict):
+            raise RuntimeError(f"test config section must be an object: {section}")
+    return _sha256_file(config_path)
+
+
+def _local_test_config_path(feature: str, config: str) -> Path:
+    feature_name = feature.strip()
+    if not feature_name:
+        raise RuntimeError("test feature is required")
+    if Path(feature_name).name != feature_name or feature_name in {".", ".."}:
+        raise RuntimeError("test feature must be a single feature name")
+    config_dir = Path("tests") / "configs" / "ble" / feature_name
+    if not config_dir.is_dir():
+        raise RuntimeError(f"test feature config directory does not exist: {config_dir}")
+    config_name = (config or "default").strip().replace("\\", "/")
+    if not config_name.endswith(".json"):
+        config_name = f"{config_name}.json"
+    relative = Path(config_name)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise RuntimeError("test config must be a single relative config path")
+    resolved = (config_dir / relative).resolve()
+    try:
+        resolved.relative_to(config_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError("test config must stay beneath the selected feature directory") from exc
+    return resolved
+
+
 def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
     payloads: dict[str, str] = {}
     for key, image in (("dut_img", request.firmware.dut_img), ("tester_img", request.firmware.tester_img)):
@@ -1028,6 +1077,21 @@ def _print_measurement_result(result: MeasurementResult) -> None:
     for artifact in result.artifacts:
         location = artifact.url or str(artifact.path or "")
         print(f"artifact {artifact.name}: {location}")
+
+
+def _print_test_preview(args: argparse.Namespace) -> None:
+    config_path = _local_test_config_path(args.feature, args.config_name)
+    config_hash = _validate_local_test_config(args.feature, args.config_name)
+    print("test preview")
+    print(f"mode: {args.mode}")
+    print(f"feature: {args.feature}")
+    print(f"config: {args.config_name}")
+    print(f"config_path: {config_path}")
+    print(f"config_hash: {config_hash}")
+    if args.run_name:
+        print(f"run_name: {args.run_name}")
+    destination = "database" if args.upload_results_to_database else "cms_client"
+    print(f"results_destination: {destination}")
 
 
 def _resolve_watch_measurement_id(client: CMSClient, requested_measurement_id: str) -> str:

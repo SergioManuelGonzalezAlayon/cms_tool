@@ -72,3 +72,28 @@ def test_staged_execution_derives_readable_name_without_client_override(monkeypa
     assert result.identity is not None
     assert result.identity.run_name == "beacon-default-default"
     assert "firmware-staging-request" not in result.measurement_id
+
+
+def test_staged_execution_preserves_requested_config_hash(monkeypatch):
+    captured = {}
+
+    class CapturingThread(_DormantThread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("cmsd.threading.Thread", CapturingThread)
+    daemon = CMSDaemon()
+    daemon.last_firmware_request = _staged_request()
+
+    daemon.start_staged_test(
+        mode=MeasurementMode.DEFAULT.value,
+        feature="beacon",
+        config="dcdc",
+        config_hash="sha256:dcdc",
+    )
+
+    request = captured["kwargs"]["args"][0]
+    assert request.selector.config == "dcdc"
+    assert request.selector.config_hash == "sha256:dcdc"

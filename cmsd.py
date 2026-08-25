@@ -470,6 +470,7 @@ class CMSDaemon:
         mode: str,
         feature: str,
         config: str = "default",
+        config_hash: str = "",
         run_name: str = "",
         upload_results_to_database: bool = False,
     ) -> MeasurementResult:
@@ -489,6 +490,7 @@ class CMSDaemon:
         request.selector.mode = "ble"
         request.selector.feature = feature
         request.selector.config = config
+        request.selector.config_hash = config_hash
         request.upload_results_to_database = upload_results_to_database
         request.identity = None
         request.request_id = ""
@@ -503,6 +505,7 @@ class CMSDaemon:
         mode: str,
         feature: str,
         config: str = "default",
+        config_hash: str = "",
         run_name: str = "",
         upload_results_to_database: bool = False,
     ) -> MeasurementResult:
@@ -523,6 +526,7 @@ class CMSDaemon:
         request.selector.mode = "ble"
         request.selector.feature = feature
         request.selector.config = config
+        request.selector.config_hash = config_hash
         request.upload_results_to_database = upload_results_to_database
         request.identity = None
         request.request_id = ""
@@ -811,6 +815,7 @@ class CMSDaemon:
                 mode=str(request.get("mode", "default")),
                 feature=str(request.get("feature", "")),
                 config=str(request.get("config", "default")),
+                config_hash=str(request.get("config_hash", "")),
                 run_name=str(request.get("run_name", "")),
                 upload_results_to_database=bool(request.get("upload_results_to_database", False)),
             )

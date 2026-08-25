@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+import cms_client
 from cms_client import (
     CMSClient,
     CMSClientConfig,
@@ -25,8 +26,11 @@ def test_test_command_accepts_run_name():
     parser = build_cli_parser()
 
     named = parser.parse_args(["test", "default", "beacon", "--run-name", "Nightly Run"])
+    preview = parser.parse_args(["test", "default", "beacon", "--config-name", "dcdc", "--preview"])
 
     assert named.run_name == "Nightly Run"
+    assert preview.preview is True
+    assert preview.config_name == "dcdc"
 
 
 def test_run_test_sends_requested_run_name_to_daemon():
@@ -46,8 +50,67 @@ def test_run_test_sends_requested_run_name_to_daemon():
     )
 
     assert captured["run_name"] == "Nightly Beacon Run"
+    assert captured["config_hash"]
     assert "request_id" not in captured
     assert result.measurement_id == "generated-id"
+
+
+def test_run_test_rejects_unknown_or_unsafe_local_config():
+    client = CMSClient.__new__(CMSClient)
+    client._request_json = lambda *args, **kwargs: {"measurement_id": "unused", "state": "accepted"}
+
+    with pytest.raises(RuntimeError, match="test config does not exist"):
+        client.run_test(MeasurementMode.DEFAULT, "beacon", config="missing")
+
+    with pytest.raises(RuntimeError, match="single relative config path"):
+        client.run_test(MeasurementMode.DEFAULT, "beacon", config="../default")
+
+    with pytest.raises(RuntimeError, match="single feature name"):
+        client.run_test(MeasurementMode.DEFAULT, "../beacon", config="default")
+
+
+def test_test_preview_shows_exact_submission_without_contacting_daemon(capsys, monkeypatch):
+    class Client:
+        def run_test(self, *args, **kwargs):
+            raise AssertionError("preview must not submit a test")
+
+    monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
+
+    exit_code = cms_client.main(
+        ["test", "default", "beacon", "--config-name", "dcdc", "--preview"]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "mode: default" in output
+    assert "feature: beacon" in output
+    assert "config: dcdc" in output
+    assert "config_path:" in output
+    assert "tests\\configs\\ble\\beacon\\dcdc.json" in output or "tests/configs/ble/beacon/dcdc.json" in output
+    assert "config_hash:" in output
+    assert "results_destination: cms_client" in output
+
+
+def test_test_preview_shows_database_destination(capsys, monkeypatch):
+    class Client:
+        def run_test(self, *args, **kwargs):
+            raise AssertionError("preview must not submit a test")
+
+    monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
+
+    exit_code = cms_client.main(
+        [
+            "test",
+            "default",
+            "beacon",
+            "--preview",
+            "--upload-results-to-database",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "results_destination: database" in output
 
 
 def test_measurement_display_includes_run_identity(capsys):

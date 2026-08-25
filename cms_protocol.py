@@ -258,6 +258,7 @@ class SuiteSelector:
     mode: str
     feature: str
     config: str = "default"
+    config_hash: str = ""
 
 
 @dataclass(slots=True)
@@ -659,6 +660,7 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
             "mode": request.selector.mode,
             "feature": request.selector.feature,
             "config": request.selector.config,
+            "config_hash": request.selector.config_hash,
         },
         "firmware": firmware_data_to_dict(request.firmware),
         "mode": request.mode.value,
@@ -676,6 +678,7 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
             mode=str(selector.get("mode", selector.get("suite", "ble"))),
             feature=str(selector.get("feature", "")),
             config=str(selector.get("config", "default")),
+            config_hash=str(selector.get("config_hash", "")),
         ),
         firmware=firmware_data_from_dict(data.get("firmware", data)),
         mode=MeasurementMode(str(data.get("mode", MeasurementMode.DEFAULT.value))),

@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import test_orchestrator as orchestrator
 
 
@@ -213,6 +215,133 @@ def test_build_jobs_hashes_config_and_propagates_measurement_identity(tmp_path, 
     assert jobs[0].measurement_created_at == "2026-08-18T09:30:00+00:00"
 
 
+def test_build_jobs_propagates_requested_config_hash_from_cms_metadata(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text("{}\n", encoding="utf-8")
+    config_path = feature_dir / "default.json"
+    config_path.write_text("{}\n", encoding="utf-8")
+    config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    metadata_path = tmp_path / "cms_fw_metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "request": {
+                    "selector": {
+                        "mode": "ble",
+                        "feature": "beacon",
+                        "config": "default",
+                        "config_hash": config_hash,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    jobs = orchestrator.build_jobs(
+        [config_root],
+        mode="default",
+        feature_filters=set(),
+        partition_filters=set(),
+        cms_metadata_path=str(metadata_path),
+    )
+    plan = orchestrator.build_job_plan(jobs)
+
+    assert jobs[0].requested_config_hash == config_hash
+    assert jobs[0].config_hash == config_hash
+    assert plan["jobs"][0]["requested_config_hash"] == config_hash
+    assert plan["jobs"][0]["config_hash"] == jobs[0].config_hash
+
+
+def test_build_jobs_rejects_requested_config_hash_mismatch(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text("{}\n", encoding="utf-8")
+    (feature_dir / "default.json").write_text("{}\n", encoding="utf-8")
+    metadata_path = tmp_path / "cms_fw_metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "request": {
+                    "selector": {
+                        "mode": "ble",
+                        "feature": "beacon",
+                        "config": "default",
+                        "config_hash": "not-the-default-hash",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    with pytest.raises(ValueError, match="requested config hash does not match"):
+        orchestrator.build_jobs(
+            [config_root],
+            mode="default",
+            feature_filters=set(),
+            partition_filters=set(),
+            cms_metadata_path=str(metadata_path),
+        )
+
+
+def test_build_jobs_can_select_one_exact_named_config(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text("{}\n", encoding="utf-8")
+    (feature_dir / "default.json").write_text('{"hw":{"supply_v":3.0}}\n', encoding="utf-8")
+    exact_path = feature_dir / "dcdc.json"
+    exact_path.write_text('{"hw":{"supply_v":2.4}}\n', encoding="utf-8")
+    (feature_dir / "payload_63bytes.json").write_text('{"hw":{"supply_v":1.8}}\n', encoding="utf-8")
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    jobs = orchestrator.build_jobs(
+        [config_root],
+        mode="all",
+        feature_filters=set(),
+        partition_filters=set(),
+        exact_config="dcdc",
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0].cfg_arg == "dcdc.json"
+    assert jobs[0].config_path == exact_path
+    assert jobs[0].config_hash == hashlib.sha256(exact_path.read_bytes()).hexdigest()
+
+
+def test_exact_named_config_rejects_missing_and_out_of_scope_paths(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text("{}\n", encoding="utf-8")
+    (feature_dir / "default.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    with pytest.raises(ValueError, match="exact config was not found"):
+        orchestrator.build_jobs(
+            [config_root],
+            mode="all",
+            feature_filters=set(),
+            partition_filters=set(),
+            exact_config="missing",
+        )
+
+    with pytest.raises(ValueError, match="single relative config path"):
+        orchestrator.build_jobs(
+            [config_root],
+            mode="all",
+            feature_filters=set(),
+            partition_filters=set(),
+            exact_config="../default",
+        )
+
+
 def test_junit_paths_are_unique_inside_each_measurement_workspace(tmp_path):
     first_workspace = tmp_path / "measurement-one"
     second_workspace = tmp_path / "measurement-two"
@@ -275,3 +404,50 @@ def test_orchestrated_job_does_not_write_configured_global_junit(tmp_path, monke
     assert returncode == 0
     assert junit_path.exists()
     assert not (tmp_path / "artifacts" / "pytest-results.xml").exists()
+
+
+def test_standalone_orchestrator_still_strips_forwarded_pytest_cfg(tmp_path, monkeypatch):
+    job = _job("default")
+    results_log = tmp_path / "orchestrator_results.jsonl"
+    observed_pytest_args = []
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: [job])
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path: (
+            observed_pytest_args.extend(pytest_args) or 0,
+            0.01,
+        ),
+    )
+
+    exit_code = orchestrator.main(
+        [
+            "--results-log",
+            str(results_log),
+            "--",
+            "--cfg",
+            "dcdc.json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "--cfg" not in observed_pytest_args
+    assert "dcdc.json" not in observed_pytest_args
+
+
+def test_cms_orchestrator_rejects_forwarded_pytest_cfg(tmp_path, monkeypatch, capsys):
+    metadata_path = tmp_path / "cms_fw_metadata.json"
+    metadata_path.write_text('{"request":{"selector":{}}}\n', encoding="utf-8")
+
+    exit_code = orchestrator.main(
+        [
+            "--cms-fw-metadata",
+            str(metadata_path),
+            "--cfg",
+            "dcdc.json",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    assert "CMS orchestrator runs must use --exact-config" in output

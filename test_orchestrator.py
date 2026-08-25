@@ -41,6 +41,7 @@ class Job:
     tester_image_sha256: str = ""
     cms_fw_metadata: str = ""
     config_hash: str = ""
+    requested_config_hash: str = ""
     measurement_id: str = ""
     run_name: str = ""
     measurement_created_at: str = ""
@@ -115,6 +116,26 @@ def discover_config_files(config_dir: Path, mode: str) -> list[Path]:
     return config_files
 
 
+def exact_config_path(config_dir: Path, exact_config: str) -> Path:
+    """Resolve a user-selected config name beneath one feature config directory."""
+    requested = exact_config.strip().replace("\\", "/")
+    if not requested:
+        raise ValueError("exact config must not be empty")
+    if not requested.endswith(".json"):
+        requested = f"{requested}.json"
+
+    relative = Path(requested)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("exact config must be a single relative config path")
+
+    resolved = (config_dir / relative).resolve()
+    try:
+        resolved.relative_to(config_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("exact config must stay beneath the selected config directory") from exc
+    return resolved
+
+
 def cms_execution_metadata(path: str) -> dict:
     if not path:
         return {}
@@ -138,10 +159,13 @@ def build_jobs(
     mode: str,
     feature_filters: set[str],
     partition_filters: set[str],
+    exact_config: str = "",
     cms_metadata_path: str = "",
 ) -> list[Job]:
     cms_metadata = cms_execution_metadata(cms_metadata_path)
     cms_firmware = cms_metadata.get("firmware", {})
+    requested_selector = cms_metadata.get("request", {}).get("selector", {})
+    requested_config_hash = str(requested_selector.get("config_hash", ""))
     measurement_identity = cms_metadata.get("identity", {})
     jobs: list[Job] = []
     for parameter_file in discover_parameter_files(targets):
@@ -150,7 +174,18 @@ def build_jobs(
         if feature_filters and feature not in feature_filters:
             continue
 
-        for config_path in discover_config_files(config_dir, mode):
+        config_paths = discover_config_files(config_dir, mode)
+        if exact_config:
+            selected_config_path = exact_config_path(config_dir, exact_config)
+            config_paths = [
+                config_path
+                for config_path in config_paths
+                if config_path.resolve() == selected_config_path
+            ]
+            if not config_paths:
+                raise ValueError(f"exact config was not found: {exact_config}")
+
+        for config_path in config_paths:
             config = load_json(config_path)
             job_mode = classify_mode(config_path, config_dir)
             partition = partition_name(config_path, config_dir)
@@ -161,6 +196,12 @@ def build_jobs(
             hw = config.get("hw", {})
             dut_slcp = str(cms_firmware.get("dut_slcp") or firmware.get("dut_slcp", ""))
             tester_slcp = str(cms_firmware.get("tester_slcp") or firmware.get("tester_slcp", ""))
+            config_hash = sha256_file(config_path)
+            if requested_config_hash and config_hash.lower() != requested_config_hash.lower():
+                raise ValueError(
+                    "requested config hash does not match selected config: "
+                    f"{cfg_argument(config_path, config_dir)}"
+                )
             jobs.append(
                 Job(
                     suite=suite,
@@ -179,7 +220,8 @@ def build_jobs(
                     dut_image_sha256=str(cms_firmware.get("dut_image_sha256", "")),
                     tester_image_sha256=str(cms_firmware.get("tester_image_sha256", "")),
                     cms_fw_metadata=cms_metadata_path,
-                    config_hash=sha256_file(config_path),
+                    config_hash=config_hash,
+                    requested_config_hash=requested_config_hash,
                     measurement_id=str(measurement_identity.get("measurement_id", "")),
                     run_name=str(measurement_identity.get("run_name", "")),
                     measurement_created_at=str(measurement_identity.get("created_at", "")),
@@ -474,6 +516,11 @@ def parse_args_with_pytest(argv: list[str]) -> tuple[argparse.Namespace, list[st
         help="Only run a specific full_sweep partition such as dcdc or no_dcdc.",
     )
     parser.add_argument(
+        "--exact-config",
+        default="",
+        help="Run exactly one config path or name from the selected feature directory.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the execution order without running pytest.",
@@ -532,6 +579,12 @@ def main(argv: list[str] | None = None) -> int:
     results_log = Path(parsed.results_log)
     pytest_args, ignored_cfg_args = strip_forwarded_cfg_args(pytest_args)
     if ignored_cfg_args:
+        if parsed.cms_fw_metadata:
+            print(
+                "CMS orchestrator runs must use --exact-config for selected "
+                "configs; forwarded pytest --cfg argument(s) are not allowed."
+            )
+            return 2
         print(
             "Ignoring forwarded --cfg argument(s); "
             "test_orchestrator selects configs from discovered jobs."
@@ -546,6 +599,7 @@ def main(argv: list[str] | None = None) -> int:
         mode=parsed.mode,
         feature_filters=set(parsed.feature),
         partition_filters=set(parsed.partition),
+        exact_config=parsed.exact_config,
         cms_metadata_path=parsed.cms_fw_metadata,
     )
     if not jobs:
