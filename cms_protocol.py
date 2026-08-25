@@ -48,6 +48,7 @@ class MeasurementState(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     REJECTED = "rejected"
+    INTERRUPTED = "interrupted"
 
 
 class MeasurementMode(str, Enum):

@@ -111,6 +111,21 @@ def test_measurement_result_round_trip_preserves_identity():
     assert measurement_result_from_dict(measurement_result_to_dict(result)) == result
 
 
+def test_interrupted_measurement_state_is_serialized_as_terminal_outcome():
+    result = MeasurementResult(
+        measurement_id="measurement-123",
+        state=MeasurementState.INTERRUPTED,
+        progress_percent=100,
+        current_step="interrupted",
+        message="daemon restarted before completion",
+    )
+
+    payload = measurement_result_to_dict(result)
+
+    assert payload["state"] == "interrupted"
+    assert measurement_result_from_dict(payload).state is MeasurementState.INTERRUPTED
+
+
 def test_test_case_identity_round_trip_preserves_plan_order_and_config_identity():
     identity = CaseIdentity(
         job_id="tests/ble.py::test_beacon|beacon/default.json",

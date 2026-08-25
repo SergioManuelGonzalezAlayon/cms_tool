@@ -60,6 +60,7 @@ TERMINAL_MEASUREMENT_STATES = frozenset(
         MeasurementState.FAILED,
         MeasurementState.CANCELLED,
         MeasurementState.REJECTED,
+        MeasurementState.INTERRUPTED,
     }
 )
 
@@ -900,6 +901,7 @@ def _measurement_exit_code(
         MeasurementState.FAILED: CMSCLIExitCode.TEST_FAILED,
         MeasurementState.CANCELLED: CMSCLIExitCode.TEST_CANCELLED,
         MeasurementState.REJECTED: CMSCLIExitCode.TEST_REJECTED,
+        MeasurementState.INTERRUPTED: CMSCLIExitCode.CLIENT_ERROR,
     }.get(state, CMSCLIExitCode.CLIENT_ERROR)
 
 

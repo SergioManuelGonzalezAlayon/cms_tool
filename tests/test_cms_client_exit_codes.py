@@ -45,6 +45,7 @@ def test_cli_exit_code_values_are_stable() -> None:
         (MeasurementState.FAILED, CMSCLIExitCode.TEST_FAILED),
         (MeasurementState.CANCELLED, CMSCLIExitCode.TEST_CANCELLED),
         (MeasurementState.REJECTED, CMSCLIExitCode.TEST_REJECTED),
+        (MeasurementState.INTERRUPTED, CMSCLIExitCode.CLIENT_ERROR),
         (MeasurementState.RUNNING, CMSCLIExitCode.CLIENT_ERROR),
         (None, CMSCLIExitCode.CLIENT_ERROR),
     ],
