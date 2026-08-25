@@ -32,6 +32,354 @@ daemon endpoint. It speaks the daemon protocol using JSON over HTTP, wraps the
 local application build flow, prepares firmware payloads, and provides the
 command-line entry point named `cms` by the parser.
 
+## Operator Quick Start
+
+Use this sequence when you want to build firmware, stage it on the configured
+CMS Bench, run one BLE measurement, reconnect if needed, cancel if needed, and
+download artifacts without SSH.
+
+This section is the short operator workflow. It is intentionally separate from
+the architecture and protocol reference below, so a first-time operator can run
+the normal path without reading the complete manual first.
+
+1. Check daemon and bench health.
+
+```text
+cms health
+```
+
+This does not change the bench or any firmware. Continue when the summary is
+not `error` and the required checks for daemon startup, runtime storage,
+artifact storage, bench configuration, tools, board, device, and serial mappings
+are reported as pass or expected warnings.
+
+2. Check whether the bench is idle or already running a measurement.
+
+```text
+cms status
+```
+
+If a run is active, the output includes `active_measurement_id`.
+This does not start or stop a test. Continue with a new run only when the bench
+is idle, or use `cms WATCH` to attach to the active measurement.
+
+3. List available BLE features and named configs.
+
+```text
+cms tests
+```
+
+This does not generate configs. It reads the bench-advertised persistent config
+library. Continue when the feature you plan to run appears with the expected
+config name, such as `default` or `dcdc`.
+
+4. Build local firmware from the configured client build settings.
+
+```text
+cms BUILD
+```
+
+This changes only the local build output under the configured build root. It
+does not stage firmware on the bench and does not start a measurement. Continue
+when the build command exits successfully and writes current build provenance.
+
+5. Stage the built firmware and build metadata on the bench.
+
+```text
+cms SEND_FW --request-id cms-dev-001 --requested-by <user>
+```
+
+This uploads or stages firmware and `sl_bt.xapi` for later use by the bench. It
+does not run pytest or start a measurement. Continue when the response reports
+that firmware is staged and ready for test.
+
+6. Preview the default config that would be submitted.
+
+```text
+cms TEST default beacon --config-name default --preview
+```
+
+This validates the selected local config and prints the exact mode, feature,
+config path, config hash, and result destination. It does not contact the daemon
+and does not use the bench. Continue only when the displayed config is exactly
+the one you intend to run.
+
+7. Run the default config and watch it until completion.
+
+```text
+cms TEST default beacon --config-name default --out-dir artifacts
+```
+
+This submits a measurement using the most recently staged firmware, attaches to
+the structured watch stream, and downloads final artifacts after completion. It
+does not regenerate configs. A successful running submission prints the
+measurement ID, current test, and total/pass/fail/remaining counts.
+
+8. Run one exact named config and watch it until completion.
+
+```text
+cms TEST default beacon --config-name dcdc --out-dir artifacts
+```
+
+The client validates the selected config locally, sends its hash to the daemon,
+and the bench validates the same config again before execution.
+Continue only when the concise watch output shows the requested config identity
+and either a passed terminal state or the failed identities you need to inspect.
+
+9. Reconnect to the active measurement from another shell or after a disconnect.
+
+```text
+cms WATCH
+```
+
+This only observes an already-running measurement. It does not restart, pause,
+or cancel bench execution. Continue when the client prints the active
+measurement summary and resumes counts from daemon state.
+
+10. Reconnect to a known measurement ID from the beginning of retained output.
+
+```text
+cms WATCH <measurement_id> --cursor 0
+```
+
+This replays retained observation events for that measurement and refreshes the
+structured summary. If older verbose console output has been truncated, the
+client prints a truncation warning and continues from the oldest retained
+cursor.
+
+11. Reconnect after the last cursor you already saw.
+
+```text
+cms WATCH <measurement_id> --cursor <last_cursor>
+```
+
+This avoids duplicating already acknowledged events. Continue when the next
+displayed events have cursors later than the cursor you supplied.
+
+12. Show retained stdout, stderr, and lifecycle events while watching.
+
+```text
+cms WATCH <measurement_id> --verbose
+```
+
+This changes only the client display. It preserves the stdout/stderr source on
+rendered console lines and still refreshes structured counts independently.
+
+13. Cancel the active measurement.
+
+```text
+cms CANCEL
+```
+
+Cancellation requests the real bench-side process to stop; it is not just a
+client display change.
+Continue only when the measurement reaches a cancelled or other terminal state.
+
+14. Download artifacts for a completed measurement by explicit ID.
+
+```text
+cms ARTIFACTS <measurement_id> --out-dir artifacts
+```
+
+This reads the published artifact list for the specified measurement and saves
+those files locally. It does not use the daemon's `last` measurement shortcut.
+Continue when every expected artifact path is printed or saved under the output
+directory.
+
+15. List failed test identities and rerun commands for a completed measurement.
+
+```text
+cms FAILED <measurement_id>
+```
+
+For machine-readable output:
+
+```text
+cms FAILED <measurement_id> --json
+```
+
+This reads structured `orchestrator_results.jsonl` records from the published
+measurement artifacts. It reports the failed feature, config, mode, partition,
+config hash, and a rerun command for each failed job.
+
+The normal result destination is the CMS Client artifact download path. Add
+`--upload-results-to-database` to `cms TEST` only when the measurement results
+should also be sent through the database/data-lake path.
+
+16. Print stable CLI exit codes for scripts and troubleshooting.
+
+```text
+cms EXIT_CODES
+```
+
+Use this to distinguish a completed test failure from a connection failure,
+protocol mismatch, rejected request, client usage error, or other client-side
+operational error.
+
+17. Print troubleshooting guidance for common operator failures.
+
+```text
+cms TROUBLESHOOT
+```
+
+For one topic:
+
+```text
+cms TROUBLESHOOT --topic health
+```
+
+The quick start ends here. The remaining sections are reference material for
+configuration, command behavior, API details, exit codes, limitations, and
+design ownership.
+
+## Operator Recipes
+
+### Run The Default Config
+
+Use this when the bench should execute the feature's persistent
+`default.json`.
+
+```text
+cms TEST default beacon --config-name default --preview
+cms TEST default beacon --config-name default --out-dir artifacts
+```
+
+The preview shows the selected config path and hash before submission. The run
+uses the most recently staged firmware, watches until a terminal state, then
+downloads final artifacts by measurement ID when artifacts are available.
+
+### Run One Exact Named Config
+
+Use this when the bench should execute one named config from the persistent
+feature config directory.
+
+```text
+cms TEST default beacon --config-name dcdc --preview
+cms TEST default beacon --config-name dcdc --out-dir artifacts
+```
+
+The client validates and hashes `tests/configs/ble/beacon/dcdc.json`. The daemon
+passes that requested config hash to the bench, and the bench validates the same
+config before starting pytest. If the config is missing, malformed, outside the
+feature directory, or hash-mismatched, the run is rejected before hardware
+execution.
+
+### Attach Or Reconnect
+
+Attach to the currently active measurement:
+
+```text
+cms WATCH
+```
+
+Attach to a known measurement from the beginning of retained events:
+
+```text
+cms WATCH <measurement_id> --cursor 0
+```
+
+Resume after the last event cursor already displayed by a previous client:
+
+```text
+cms WATCH <measurement_id> --cursor <last_cursor>
+```
+
+Show retained stdout, stderr, and lifecycle records while still refreshing the
+structured summary:
+
+```text
+cms WATCH <measurement_id> --cursor <last_cursor> --verbose
+```
+
+Disconnecting the client does not stop the bench measurement. The daemon's
+summary and event cursor endpoints are the reconnect source of truth.
+
+### Cancel The Real Run
+
+Cancel the active measurement:
+
+```text
+cms CANCEL
+```
+
+Then watch until the daemon reports the final cancelled state:
+
+```text
+cms WATCH
+```
+
+Cancellation is sent to the bench-side execution process. The result is not
+complete until the process tree has stopped, output has been drained, and the
+daemon reports a terminal state.
+
+### Download Artifacts By Measurement ID
+
+Download all published artifacts for a completed measurement:
+
+```text
+cms ARTIFACTS <measurement_id> --out-dir artifacts
+```
+
+This always uses the explicit measurement ID. It does not rely on the daemon's
+`last` measurement shortcut.
+
+### Identify Failed Tests For Rerun
+
+List failed jobs from the structured campaign result records:
+
+```text
+cms FAILED <measurement_id>
+```
+
+Emit machine-readable failed-job data for scripts:
+
+```text
+cms FAILED <measurement_id> --json
+```
+
+The command prefers `orchestrator_results.jsonl` because it contains the CMS job
+identity: feature, config, mode, partition, and config hash. Use the printed
+`rerun:` command to rerun an individual failed config after staging firmware.
+
+### Troubleshoot Common Failures
+
+Show all troubleshooting topics:
+
+```text
+cms TROUBLESHOOT
+```
+
+Show one topic:
+
+```text
+cms TROUBLESHOOT --topic daemon
+```
+
+Troubleshooting topics cover:
+
+- health warnings: run `cms health`, inspect failed or warning checks, and fix
+  daemon startup, runtime storage, artifact storage, bench config, tool, board,
+  device, and serial mapping issues before submitting tests.
+- missing hardware mappings: edit bench-local `cms_bench_runtime.json`; do not
+  try to repair hardware mappings through `cms_client_config.json`.
+- stale or missing firmware: run `cms BUILD`, then `cms SEND_FW`; `cms TEST`
+  uses the most recently staged firmware and does not upload firmware by itself.
+- unavailable named configs: run `cms tests`, then
+  `cms TEST <mode> <feature> --config-name <name> --preview`; missing,
+  malformed, out-of-scope, and hash-mismatched configs are rejected before
+  hardware execution.
+- daemon connection failures: verify daemon URL/token configuration and use
+  `cms EXIT_CODES` to distinguish unreachable daemon errors from protocol
+  mismatches.
+- truncated live output: continue watching from the oldest retained cursor;
+  structured counts and failed identities do not depend on retained console
+  text.
+- stalled hardware setup: use `cms WATCH <measurement_id> --verbose` and look
+  for the last lifecycle setup step without a completion record.
+- missing artifacts: wait for a terminal measurement state, then use
+  `cms ARTIFACTS <measurement_id> --out-dir artifacts`; use
+  `cms FAILED <measurement_id>` for rerun identities.
+
 ## What The Client Does
 
 The client performs the parts of a measurement workflow that can happen on a
@@ -48,9 +396,10 @@ developer workstation, CI machine, or other automation host:
    and request ownership.
 9. Send local firmware files to the daemon as base64 payloads with `/firmware`.
 10. Start a remote test using the most recently staged firmware with `/test`.
-11. Poll `/measurement/<measurement_id>` until the run reaches a terminal state.
-12. Download published artifacts from `/artifacts/last` or a specific
-    measurement artifact route.
+11. Watch the structured summary and cursor-based event endpoints until the run
+    reaches a terminal state, preserving the last acknowledged cursor for
+    reconnect.
+12. Download published artifacts by explicit measurement ID.
 13. Request cancellation through `/cancel` or
     `/measurement/<measurement_id>/cancel`.
 
@@ -193,12 +542,15 @@ The current CLI commands are:
 | `cms health` | Print daemon-plus-bench health checks |
 | `cms status` | Print bench state and active measurement ID |
 | `cms tests` | List test modes, BLE features, and config names advertised by the daemon |
+| `cms EXIT_CODES` | Print stable CLI exit-code meanings |
+| `cms TROUBLESHOOT` | Print troubleshooting guidance |
 | `cms BUILD` | Build local firmware through `apps/app_manager.py` |
 | `cms SEND_FW` | Stage firmware and metadata on the daemon |
 | `cms TEST` | Start a remote test using the most recently staged firmware |
 | `cms measurement <id>` | Print status for one measurement |
 | `cms CANCEL` | Cancel the active or last measurement |
-| `cms ARTIFACTS` | Download artifacts from the last completed test |
+| `cms ARTIFACTS` | Download artifacts from an explicit measurement |
+| `cms FAILED` | Show failed test identities and rerun commands |
 
 A typical current workflow is:
 
@@ -217,12 +569,13 @@ cms SEND_FW --request-id cms-dev-001 --requested-by <user>
 3. Run a selected BLE feature using the staged firmware.
 
 ```text
-cms TEST default PAwR_obs --config-name default --request-id cms-dev-001-test
+cms TEST default beacon --config-name default --out-dir artifacts
 ```
 
 4. Polling happens automatically during `cms TEST`.
-5. When the test passes or fails, the client downloads the last artifacts into
-   the configured output directory, defaulting to `artifacts`.
+5. When the test passes or fails, the client downloads artifacts by the
+   submitted measurement's explicit ID into the configured output directory,
+   defaulting to `artifacts`.
 
 ## Remote API Surface
 
@@ -263,19 +616,21 @@ terminal:
 - `failed`
 - `cancelled`
 - `rejected`
+- `interrupted`
 
-The client prints progress whenever the state, percent, or message changes.
-When the final result includes artifacts, the CLI downloads the daemon's last
-published artifacts.
+The client prints concise counts, the current test, and failed test identities
+when structured state changes. `--verbose` also renders timestamped stdout,
+stderr, and lifecycle events. When the final result includes artifacts, the CLI
+downloads artifacts using that measurement's explicit ID.
 
 ## Artifact Download Behavior
 
-The client can download artifacts in two modes:
+The client can download artifacts by explicit measurement ID:
 
 - `download_artifact(measurement_id, artifact_name, out_dir)` fetches one named
   artifact after looking up the measurement artifact list.
-- `download_last_artifacts(out_dir)` fetches every artifact from the daemon's
-  last completed measurement.
+- `download_measurement_artifacts(measurement_id, out_dir)` fetches every
+  published artifact for that measurement.
 
 An artifact can be copied or downloaded from:
 
@@ -286,6 +641,26 @@ An artifact can be copied or downloaded from:
 
 Downloaded artifacts preserve the artifact name under the selected output
 directory.
+
+## CLI Exit Codes
+
+CMS Client commands use stable process exit codes so scripts and future CI can
+distinguish a completed test failure from communication or protocol failures.
+
+| Code | Name | Meaning |
+| ---: | --- | --- |
+| 0 | `SUCCESS` | Command succeeded or the watched measurement passed |
+| 1 | `TEST_FAILED` | The watched measurement completed with failures |
+| 2 | `USAGE_ERROR` | Command-line arguments are invalid |
+| 3 | `TEST_CANCELLED` | The watched measurement was cancelled |
+| 4 | `TEST_REJECTED` | The measurement request was rejected |
+| 5 | `CONNECTION_FAILURE` | The daemon is unreachable or a request timed out |
+| 6 | `PROTOCOL_MISMATCH` | The daemon protocol/version or response shape is incompatible |
+| 7 | `CLIENT_ERROR` | Another daemon, client, configuration, or operational error occurred, including an interrupted run after daemon restart |
+
+Errors are written to stderr. In particular, exit code 1 is reserved for a
+real completed test failure; daemon HTTP errors do not masquerade as failed
+tests.
 
 ## What The Client Does Not Do
 
