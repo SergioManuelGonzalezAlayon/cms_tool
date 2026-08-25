@@ -15,6 +15,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -325,6 +326,34 @@ class CMSClient:
             for artifact in artifacts
         ]
 
+    def failed_tests(self, measurement_id: str) -> list[dict[str, str]]:
+        """Return failed test identities from structured orchestrator results."""
+
+        artifacts = self.list_measurement_artifacts(measurement_id)
+        results_artifact = next(
+            (
+                artifact
+                for artifact in artifacts
+                if Path(artifact.name.replace("\\", "/")).name == "orchestrator_results.jsonl"
+            ),
+            None,
+        )
+        if results_artifact is None:
+            raise RuntimeError(
+                f"measurement has no structured job-result artifact: {measurement_id}"
+            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            results_path = self._download_artifact_payload(
+                artifact_to_dict(results_artifact),
+                Path(temp_dir),
+            )
+            records = [
+                json.loads(line)
+                for line in results_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        return _failed_test_records_from_job_results(records)
+
     def download_last_artifacts(self, out_dir: Path) -> list[Path]:
         """Download every artifact from the last completed remote test."""
         payload = self._request_json("GET", "/artifacts/last")
@@ -548,7 +577,28 @@ def _non_negative_float(value: str) -> float:
 
 
 def build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cms", description="CMS bench client")
+    parser = argparse.ArgumentParser(
+        prog="cms",
+        description="CMS bench client",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Normal workflow:\n"
+            "  1. cms health\n"
+            "  2. cms status\n"
+            "  3. cms tests\n"
+            "  4. cms BUILD\n"
+            "  5. cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n"
+            "  6. cms TEST default beacon --config-name default --preview\n"
+            "  7. cms TEST default beacon --config-name default --out-dir artifacts\n"
+            "  8. cms WATCH <measurement_id> --cursor <last_cursor>\n"
+            "  9. cms CANCEL\n"
+            " 10. cms ARTIFACTS <measurement_id> --out-dir artifacts\n\n"
+            "  cms RECIPES prints copy/paste command recipes for the common workflows.\n\n"
+            "  cms EXIT_CODES documents stable script outcomes.\n\n"
+            "  cms TROUBLESHOOT prints operator diagnostics for common failures.\n\n"
+            "Use cms <command> --help for command-specific examples and next steps."
+        ),
+    )
     parser.add_argument("--config", default=CMS_CLIENT_CONFIG, help="client config JSON path")
     parser.add_argument("--base-url", default="", help="override daemon base URL")
     parser.add_argument("--api-token", default="", help="override daemon API token")
@@ -557,8 +607,66 @@ def build_cli_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("health", help="show daemon and bench health")
     subparsers.add_parser("status", help="show bench status")
     subparsers.add_parser("tests", aliases=["TESTS"], help="list test modes and features")
+    subparsers.add_parser(
+        "exit_codes",
+        aliases=["EXIT_CODES"],
+        help="document stable CLI exit codes",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms EXIT_CODES\n\n"
+            "Use these codes to distinguish a completed test failure from a "
+            "connection failure, protocol mismatch, rejected request, or client usage error."
+        ),
+    )
+    troubleshoot = subparsers.add_parser(
+        "troubleshoot",
+        aliases=["TROUBLESHOOT"],
+        help="print troubleshooting guidance for common CMS Client failures",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Topics:\n"
+            "  health\n"
+            "  hardware-mappings\n"
+            "  firmware\n"
+            "  configs\n"
+            "  daemon\n"
+            "  truncated-output\n"
+            "  stalled-setup\n"
+            "  artifacts\n\n"
+            "Example:\n"
+            "  cms TROUBLESHOOT --topic health"
+        ),
+    )
+    troubleshoot.add_argument(
+        "--topic",
+        default="all",
+        choices=[
+            "all",
+            "health",
+            "hardware-mappings",
+            "firmware",
+            "configs",
+            "daemon",
+            "truncated-output",
+            "stalled-setup",
+            "artifacts",
+        ],
+        help="show one troubleshooting topic instead of all topics",
+    )
 
-    build = subparsers.add_parser("build", aliases=["BUILD"], help="build local firmware with SLC config")
+    build = subparsers.add_parser(
+        "build",
+        aliases=["BUILD"],
+        help="build local firmware with SLC config",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms BUILD\n\n"
+            "Next:\n"
+            "  Run cms SEND_FW to stage the built firmware on the bench."
+        ),
+    )
     build.add_argument("targets", nargs="*", help="optional .slcp targets or app directories")
     build.add_argument("--action", default="build", choices=["generate", "upgrade", "build", "rebuild"])
     build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
@@ -566,7 +674,20 @@ def build_cli_parser() -> argparse.ArgumentParser:
     build.add_argument("--build-root", default="", help="override firmware build root")
     build.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
 
-    send_fw = subparsers.add_parser("send_fw", aliases=["SEND_FW"], help="send firmware and metadata to the bench")
+    send_fw = subparsers.add_parser(
+        "send_fw",
+        aliases=["SEND_FW"],
+        help="send firmware and metadata to the bench",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n\n"
+            "Defaults:\n"
+            "  Firmware images and sl_bt.xapi are discovered from the configured build root.\n\n"
+            "Next:\n"
+            "  Run cms TEST default beacon --config-name default --preview before starting a test."
+        ),
+    )
     send_fw.add_argument("--request-json", help="load the full firmware request from JSON")
     send_fw.add_argument("--request-id", default="", help="firmware staging id")
     send_fw.add_argument("--dut-image", default="", help="DUT firmware path or URL")
@@ -583,7 +704,28 @@ def build_cli_parser() -> argparse.ArgumentParser:
     send_fw.add_argument("--build-root", default="", help="override firmware build root used for provenance")
     send_fw.add_argument("--requested-by", default="", help="request owner")
 
-    test = subparsers.add_parser("test", aliases=["TEST"], help="run a remote test with staged firmware")
+    test = subparsers.add_parser(
+        "test",
+        aliases=["TEST"],
+        help="run a remote test with staged firmware",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms TEST default beacon --config-name default --preview\n"
+            "  cms TEST default beacon --config-name default --out-dir artifacts\n"
+            "  cms TEST default beacon --config-name dcdc --preview\n"
+            "  cms TEST default beacon --config-name dcdc --upload-results-to-database\n\n"
+            "Required arguments:\n"
+            "  mode      debug, default, full_sweep, or diff\n"
+            "  feature   BLE feature name such as beacon\n\n"
+            "Defaults:\n"
+            "  --config-name default\n"
+            "  --out-dir artifacts\n"
+            "  --poll-interval 1.0\n\n"
+            "Next:\n"
+            "  The command watches automatically. Reattach later with cms WATCH <measurement_id>."
+        ),
+    )
     test.add_argument("mode", choices=[mode.value for mode in MeasurementMode])
     test.add_argument("feature")
     test.add_argument("--config-name", default="default", help="test config")
@@ -619,13 +761,36 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
 
 
-    measurement = subparsers.add_parser("measurement", help="show measurement status")
+    measurement = subparsers.add_parser(
+        "measurement",
+        help="show measurement status",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms measurement <measurement_id>\n\n"
+            "Next:\n"
+            "  Use cms WATCH <measurement_id> to follow a running measurement."
+        ),
+    )
     measurement.add_argument("measurement_id")
 
     watch = subparsers.add_parser(
         "watch",
         aliases=["WATCH"],
         help="attach to an active or explicit measurement",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  cms WATCH\n"
+            "  cms WATCH <measurement_id> --cursor 0\n"
+            "  cms WATCH <measurement_id> --cursor <last_cursor> --verbose\n\n"
+            "Defaults:\n"
+            "  measurement_id omitted means attach to the active measurement.\n"
+            "  --cursor 0 starts from the beginning of retained events.\n"
+            "  --poll-interval 1.0\n\n"
+            "Next:\n"
+            "  After completion, run cms ARTIFACTS <measurement_id> --out-dir artifacts."
+        ),
     )
     watch.add_argument("measurement_id", nargs="?", default="")
     watch.add_argument(
@@ -646,15 +811,84 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="seconds between observation polls",
     )
 
-    cancel = subparsers.add_parser("cancel", aliases=["CANCEL"], help="cancel the active test")
+    cancel = subparsers.add_parser(
+        "cancel",
+        aliases=["CANCEL"],
+        help="cancel the active test",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms CANCEL\n\n"
+            "Scope:\n"
+            "  Requests cancellation of the active measurement on the bench.\n\n"
+            "Next:\n"
+            "  Run cms WATCH to observe the final cancelled state."
+        ),
+    )
 
     artifacts = subparsers.add_parser(
         "artifacts",
         aliases=["ARTIFACTS"],
         help="download artifacts from an explicit measurement",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms ARTIFACTS <measurement_id> --out-dir artifacts\n\n"
+            "Required arguments:\n"
+            "  measurement_id   explicit measurement whose artifacts should be downloaded\n\n"
+            "Defaults:\n"
+            "  --out-dir artifacts\n\n"
+            "Next:\n"
+            "  Inspect the downloaded result JSON, JUnit XML, logs, and measurement artifacts."
+        ),
     )
     artifacts.add_argument("measurement_id")
     artifacts.add_argument("--out-dir", default="artifacts")
+
+    failed = subparsers.add_parser(
+        "failed",
+        aliases=["FAILED"],
+        help="show failed test identities and rerun commands",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms FAILED <measurement_id>\n"
+            "  cms FAILED <measurement_id> --json\n\n"
+            "Source:\n"
+            "  Uses structured orchestrator_results.jsonl records when available.\n\n"
+            "Next:\n"
+            "  Use the printed rerun command for each failed config."
+        ),
+    )
+    failed.add_argument("measurement_id")
+    failed.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable failed-test records",
+    )
+
+    recipes = subparsers.add_parser(
+        "recipes",
+        aliases=["RECIPES"],
+        help="print copy/paste recipes for common CMS workflows",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Focused workflows:\n"
+            "  default config\n"
+            "  exact named config\n"
+            "  attach or reconnect from a cursor\n"
+            "  cancel the active measurement\n"
+            "  download artifacts by explicit measurement ID\n\n"
+            "Example:\n"
+            "  cms RECIPES --feature beacon --config-name dcdc --measurement-id <id>"
+        ),
+    )
+    recipes.add_argument("--feature", default="beacon", help="feature used in TEST examples")
+    recipes.add_argument("--config-name", default="dcdc", help="named config used in exact-config examples")
+    recipes.add_argument("--measurement-id", default="<measurement_id>", help="measurement ID used in WATCH and ARTIFACTS examples")
+    recipes.add_argument("--cursor", type=_non_negative_int, default=0, help="cursor used in reconnect examples")
+    recipes.add_argument("--out-dir", default="artifacts", help="artifact output directory used in examples")
     return parser
 
 
@@ -722,6 +956,14 @@ def _main(argv: list[str] | None = None) -> int:
         for feature in payload.get("features", []):
             configs = ", ".join(feature.get("configs", []))
             print(f"{feature.get('feature', '')}: {configs}")
+        return CMSCLIExitCode.SUCCESS
+
+    if args.command in {"exit_codes", "EXIT_CODES"}:
+        _print_exit_codes()
+        return CMSCLIExitCode.SUCCESS
+
+    if args.command in {"troubleshoot", "TROUBLESHOOT"}:
+        _print_troubleshooting(args.topic)
         return CMSCLIExitCode.SUCCESS
 
     if args.command in {"build", "BUILD"}:
@@ -808,6 +1050,15 @@ def _main(argv: list[str] | None = None) -> int:
             Path(args.out_dir),
         ):
             print(path)
+        return CMSCLIExitCode.SUCCESS
+
+    if args.command in {"failed", "FAILED"}:
+        failed_tests = client.failed_tests(args.measurement_id)
+        _print_failed_tests(args.measurement_id, failed_tests, as_json=args.as_json)
+        return CMSCLIExitCode.SUCCESS
+
+    if args.command in {"recipes", "RECIPES"}:
+        _print_operator_recipes(args)
         return CMSCLIExitCode.SUCCESS
 
     return CMSCLIExitCode.USAGE_ERROR
@@ -1092,6 +1343,197 @@ def _print_test_preview(args: argparse.Namespace) -> None:
         print(f"run_name: {args.run_name}")
     destination = "database" if args.upload_results_to_database else "cms_client"
     print(f"results_destination: {destination}")
+
+
+def _failed_test_records_from_job_results(records: list[dict[str, Any]]) -> list[dict[str, str]]:
+    failed: list[dict[str, str]] = []
+    for record in records:
+        if record.get("record_type") != "job_completed":
+            continue
+        if record.get("status") != "failed":
+            continue
+        failed.append(
+            {
+                "job_id": str(record.get("job_id", "")),
+                "feature": str(record.get("feature", "")),
+                "config": str(record.get("config", "")),
+                "mode": str(record.get("mode", "")),
+                "partition": str(record.get("partition", "")),
+                "config_hash": str(record.get("config_hash", "")),
+            }
+        )
+    return failed
+
+
+def _rerun_command(failed_test: dict[str, str]) -> str:
+    feature = failed_test["feature"]
+    config = Path(failed_test["config"]).stem
+    return f"cms TEST default {feature} --config-name {config}"
+
+
+def _print_failed_tests(
+    measurement_id: str,
+    failed_tests: list[dict[str, str]],
+    *,
+    as_json: bool = False,
+) -> None:
+    records = [
+        {
+            **failed_test,
+            "rerun_command": _rerun_command(failed_test),
+        }
+        for failed_test in failed_tests
+    ]
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "measurement_id": measurement_id,
+                    "failed_tests": records,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    print(f"failed tests for {measurement_id}: {len(records)}")
+    if not records:
+        return
+    for index, failed_test in enumerate(records, start=1):
+        partition = failed_test["partition"] or "-"
+        print(
+            f"{index}. {failed_test['feature']} {failed_test['config']} "
+            f"mode={failed_test['mode'] or '-'} partition={partition} "
+            f"hash={failed_test['config_hash'] or '-'}"
+        )
+        print(f"   rerun: {failed_test['rerun_command']}")
+
+
+def _print_operator_recipes(args: argparse.Namespace) -> None:
+    feature = args.feature
+    config_name = args.config_name
+    measurement_id = args.measurement_id
+    cursor = args.cursor
+    out_dir = args.out_dir
+    print("Default config:")
+    print(f"  cms TEST default {feature} --config-name default --preview")
+    print(f"  cms TEST default {feature} --config-name default --out-dir {out_dir}")
+    print()
+    print("Exact named config:")
+    print(f"  cms TEST default {feature} --config-name {config_name} --preview")
+    print(f"  cms TEST default {feature} --config-name {config_name} --out-dir {out_dir}")
+    print()
+    print("Attach or reconnect:")
+    print("  cms WATCH")
+    print(f"  cms WATCH {measurement_id} --cursor 0")
+    print(f"  cms WATCH {measurement_id} --cursor {cursor}")
+    print(f"  cms WATCH {measurement_id} --cursor {cursor} --verbose")
+    print()
+    print("Cancel the real run:")
+    print("  cms CANCEL")
+    print("  cms WATCH")
+    print()
+    print("Find failed tests to rerun:")
+    print(f"  cms FAILED {measurement_id}")
+    print(f"  cms FAILED {measurement_id} --json")
+    print()
+    print("Download artifacts by measurement ID:")
+    print(f"  cms ARTIFACTS {measurement_id} --out-dir {out_dir}")
+
+
+def _print_exit_codes() -> None:
+    descriptions = {
+        CMSCLIExitCode.SUCCESS: "command succeeded or watched measurement passed",
+        CMSCLIExitCode.TEST_FAILED: "completed test failure",
+        CMSCLIExitCode.USAGE_ERROR: "client usage error",
+        CMSCLIExitCode.TEST_CANCELLED: "measurement cancelled",
+        CMSCLIExitCode.TEST_REJECTED: "measurement request rejected",
+        CMSCLIExitCode.CONNECTION_FAILURE: "connection failure",
+        CMSCLIExitCode.PROTOCOL_MISMATCH: "protocol mismatch",
+        CMSCLIExitCode.CLIENT_ERROR: "daemon, client, configuration, or operational error",
+    }
+    for code in CMSCLIExitCode:
+        print(f"{int(code)} {code.name}: {descriptions[code]}")
+
+
+def _troubleshooting_topics() -> dict[str, tuple[str, tuple[str, ...]]]:
+    return {
+        "health": (
+            "health warnings",
+            (
+                "Run cms health first, then read each failed or warning check by name.",
+                "Fix daemon_startup, runtime_storage, artifact_storage, bench_config, and tool checks before submitting tests.",
+                "A runtime filesystem warning on Windows can be expected for hardware-free development.",
+            ),
+        ),
+        "hardware-mappings": (
+            "missing hardware mappings",
+            (
+                "Check cms_bench_runtime.json for board, device, DUT probe, tester probe, serial ports, and Joulescope mapping.",
+                "Run cms health again after editing bench-local mappings.",
+                "Do not try to repair bench hardware mappings from cms_client_config.json.",
+            ),
+        ),
+        "firmware": (
+            "stale or missing firmware",
+            (
+                "Run cms BUILD, then cms SEND_FW before cms TEST.",
+                "If SEND_FW rejects hashes or xapi provenance, rebuild and restage firmware.",
+                "TEST uses the most recently staged firmware; it does not upload firmware by itself.",
+            ),
+        ),
+        "configs": (
+            "unavailable named configs",
+            (
+                "Run cms tests and confirm the feature and config are advertised.",
+                "Run cms TEST <mode> <feature> --config-name <name> --preview before submitting.",
+                "The client and bench reject missing, malformed, path-traversal, and hash-mismatched configs before hardware execution.",
+            ),
+        ),
+        "daemon": (
+            "daemon connection failures",
+            (
+                "Check cms_client_config.json daemon.base_url or pass --base-url.",
+                "Run cms health with the same --base-url and --api-token options you use for TEST.",
+                "Exit code 5 means the daemon is unreachable or timed out; exit code 6 means protocol mismatch.",
+            ),
+        ),
+        "truncated-output": (
+            "truncated live output",
+            (
+                "WATCH continues from the oldest retained cursor when verbose console output is truncated.",
+                "Structured summary, counts, current test, and failed identities do not depend on retained console text.",
+                "Use cms WATCH <measurement_id> --verbose for retained stdout/stderr details.",
+            ),
+        ),
+        "stalled-setup": (
+            "stalled hardware setup",
+            (
+                "Watch lifecycle events with cms WATCH <measurement_id> --verbose.",
+                "Look for the last setup step that started without a completion record.",
+                "The bench execution timeout should report a terminal failure instead of hanging forever.",
+            ),
+        ),
+        "artifacts": (
+            "missing artifacts",
+            (
+                "Use cms ARTIFACTS <measurement_id> --out-dir artifacts; do not rely on last.",
+                "Artifacts are published only after the measurement reaches a terminal state.",
+                "Use cms FAILED <measurement_id> when you need failed test identities for rerun.",
+            ),
+        ),
+    }
+
+
+def _print_troubleshooting(topic: str = "all") -> None:
+    topics = _troubleshooting_topics()
+    selected = topics.items() if topic == "all" else [(topic, topics[topic])]
+    for index, (_key, (title, lines)) in enumerate(selected):
+        if index:
+            print()
+        print(f"{title}:")
+        for line in lines:
+            print(f"  - {line}")
 
 
 def _resolve_watch_measurement_id(client: CMSClient, requested_measurement_id: str) -> str:

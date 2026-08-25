@@ -10,6 +10,7 @@ import cms_client
 from cms_client import (
     CMSClient,
     CMSClientConfig,
+    _failed_test_records_from_job_results,
     _print_measurement_result,
     _request_from_send_fw_args,
     build_cli_parser,
@@ -111,6 +112,168 @@ def test_test_preview_shows_database_destination(capsys, monkeypatch):
     output = capsys.readouterr().out
     assert exit_code == 0
     assert "results_destination: database" in output
+
+
+def test_recipes_command_prints_copy_paste_workflows(capsys):
+    exit_code = cms_client.main(
+        [
+            "RECIPES",
+            "--feature",
+            "beacon",
+            "--config-name",
+            "dcdc",
+            "--measurement-id",
+            "measurement-123",
+            "--cursor",
+            "17",
+            "--out-dir",
+            "downloads",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "cms TEST default beacon --config-name default --preview" in output
+    assert "cms TEST default beacon --config-name dcdc --preview" in output
+    assert "cms WATCH" in output
+    assert "cms WATCH measurement-123 --cursor 17" in output
+    assert "cms CANCEL" in output
+    assert "cms FAILED measurement-123" in output
+    assert "cms ARTIFACTS measurement-123 --out-dir downloads" in output
+
+
+def test_exit_codes_command_prints_stable_cli_outcomes(capsys):
+    exit_code = cms_client.main(["EXIT_CODES"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "0 SUCCESS" in output
+    assert "1 TEST_FAILED" in output
+    assert "completed test failure" in output
+    assert "5 CONNECTION_FAILURE" in output
+    assert "connection failure" in output
+    assert "6 PROTOCOL_MISMATCH" in output
+    assert "protocol mismatch" in output
+
+
+def test_troubleshoot_command_prints_required_topics(capsys):
+    exit_code = cms_client.main(["TROUBLESHOOT"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "health warnings" in output
+    assert "missing hardware mappings" in output
+    assert "stale or missing firmware" in output
+    assert "unavailable named configs" in output
+    assert "daemon connection failures" in output
+    assert "truncated live output" in output
+    assert "stalled hardware setup" in output
+    assert "missing artifacts" in output
+
+
+def test_troubleshoot_command_can_filter_one_topic(capsys):
+    exit_code = cms_client.main(["TROUBLESHOOT", "--topic", "daemon"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "daemon connection failures" in output
+    assert "health warnings" not in output
+
+
+def test_failed_records_prefer_structured_completed_job_results():
+    records = [
+        {
+            "record_type": "job_started",
+            "job_id": "tests/ble.py::test_beacon|default.json",
+            "status": "running",
+            "feature": "beacon",
+            "config": "default.json",
+        },
+        {
+            "record_type": "job_completed",
+            "job_id": "tests/ble.py::test_beacon|dcdc.json",
+            "status": "failed",
+            "feature": "beacon",
+            "config": "dcdc.json",
+            "mode": "one_factor",
+            "partition": "",
+            "config_hash": "hash-dcdc",
+        },
+        {
+            "record_type": "job_completed",
+            "job_id": "tests/ble.py::test_beacon|default.json",
+            "status": "passed",
+            "feature": "beacon",
+            "config": "default.json",
+        },
+    ]
+
+    failed = _failed_test_records_from_job_results(records)
+
+    assert failed == [
+        {
+            "job_id": "tests/ble.py::test_beacon|dcdc.json",
+            "feature": "beacon",
+            "config": "dcdc.json",
+            "mode": "one_factor",
+            "partition": "",
+            "config_hash": "hash-dcdc",
+        }
+    ]
+
+
+def test_failed_command_prints_failed_identities_and_rerun_commands(capsys, monkeypatch):
+    class Client:
+        def failed_tests(self, measurement_id):
+            assert measurement_id == "measurement-123"
+            return [
+                {
+                    "job_id": "tests/ble.py::test_beacon|dcdc.json",
+                    "feature": "beacon",
+                    "config": "dcdc.json",
+                    "mode": "one_factor",
+                    "partition": "",
+                    "config_hash": "hash-dcdc",
+                }
+            ]
+
+    monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
+
+    exit_code = cms_client.main(["FAILED", "measurement-123"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "failed tests for measurement-123" in output
+    assert "beacon dcdc.json" in output
+    assert "hash-dcdc" in output
+    assert "cms TEST default beacon --config-name dcdc" in output
+
+
+def test_failed_command_can_emit_machine_readable_json(capsys, monkeypatch):
+    class Client:
+        def failed_tests(self, measurement_id):
+            return [
+                {
+                    "job_id": "job-1",
+                    "feature": "beacon",
+                    "config": "dcdc.json",
+                    "mode": "one_factor",
+                    "partition": "",
+                    "config_hash": "hash-dcdc",
+                }
+            ]
+
+    monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
+
+    exit_code = cms_client.main(["FAILED", "measurement-123", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["measurement_id"] == "measurement-123"
+    assert payload["failed_tests"][0]["config"] == "dcdc.json"
+    assert payload["failed_tests"][0]["rerun_command"] == (
+        "cms TEST default beacon --config-name dcdc"
+    )
 
 
 def test_measurement_display_includes_run_identity(capsys):
