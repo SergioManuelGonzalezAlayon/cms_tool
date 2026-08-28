@@ -42,6 +42,7 @@ from cms_protocol import (
     measurement_request_to_dict,
     measurement_result_to_dict,
     measurement_identity_to_dict,
+    variable_filters_to_dicts,
 )
 
 CMS_BENCH_CONFIG = "cms_bench_runtime.json"
@@ -497,6 +498,7 @@ class CMSBench:
             xapi_path,
             session.manifest.xapi_file.sha256 or session.manifest.xapi_file_hash,
         )
+        _validate_variable_filtered_campaign(session)
 
     def test_smoke(self, session: BenchSession) -> None:
         """Run a lightweight preflight before spending time on a full run."""
@@ -763,6 +765,7 @@ def resolve_cms_resources_from_hwmux(group_json: dict[str, Any]) -> BenchResourc
 def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) -> dict[str, Path]:
     build_root = session.runtime_dir / "fw_build"
     config_data = _load_requested_test_config(session)
+    selected_config = _write_selected_config_evidence(session)
     firmware = config_data.get("firmware", {})
     dut_project = build_root / Path(str(firmware.get("dut_slcp", session.manifest.dut_img.name))).stem
     tester_project = build_root / Path(str(firmware.get("tester_slcp", session.manifest.tester_img.name))).stem
@@ -788,6 +791,17 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
                 "created_at": "",
             }
         ),
+        "request": {
+            "selector": {
+                "mode": session.request.selector.mode,
+                "feature": session.request.selector.feature,
+                "config": session.request.selector.config,
+                "config_hash": session.request.selector.config_hash,
+                "variable_filters": variable_filters_to_dicts(
+                    session.request.selector.variable_filters
+                ),
+            },
+        },
         "firmware": {
             "build_root": str(build_root),
             "provision_state_root": str(Path("artifacts") / "cmsd" / "provision_state"),
@@ -837,6 +851,8 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
         "build_root": build_root,
         "results_log": session.runtime_dir / "orchestrator_results.jsonl",
         "metadata_path": metadata_path,
+        "selected_config_path": selected_config["snapshot_path"],
+        "selected_config_metadata_path": selected_config["metadata_path"],
         "artifact_since": time.time(),
     }
 
@@ -1105,8 +1121,7 @@ def _run_test_orchestrator(
     if not config_dir.exists():
         raise RuntimeError(f"test config directory does not exist: {config_dir}")
 
-    mode = session.request.mode.value
-    orchestrator_mode = "full_sweep" if mode == "full_sweep" else "default"
+    orchestrator_mode = _orchestrator_mode(session)
     cmd = [
         sys.executable,
         "-u",
@@ -1130,7 +1145,9 @@ def _run_test_orchestrator(
         "w",
     ]
     if session.request.selector.config != "default":
-        cmd.extend(["--cfg", session.request.selector.config])
+        cmd.extend(["--exact-config", session.request.selector.config])
+    for variable_filter in session.request.selector.variable_filters:
+        cmd.extend(["--variable", f"{variable_filter.name}={variable_filter.value}"])
     if session.request.upload_results_to_database:
         cmd.append("--upload-results-to-database")
 
@@ -1144,6 +1161,49 @@ def _run_test_orchestrator(
         timeout_s=session.execution_timeout_s,
         cancel_event=session.cancel_event,
     )
+
+
+def _validate_variable_filtered_campaign(session: BenchSession) -> None:
+    variable_filters = session.request.selector.variable_filters
+    if not variable_filters:
+        return
+    if session.request.selector.config != "default" or session.request.selector.config_hash:
+        raise RuntimeError(
+            "variable filters cannot be combined with an exact config selection"
+        )
+    feature = session.request.selector.feature
+    config_dir = Path("tests") / "configs" / session.request.selector.mode / feature
+    orchestrator_mode = _orchestrator_mode(session)
+    try:
+        from test_orchestrator import build_jobs, validate_variable_filters_for_targets
+
+        validate_variable_filters_for_targets(
+            [config_dir],
+            feature_filters={feature},
+            variable_filters=variable_filters,
+        )
+        jobs = build_jobs(
+            [config_dir],
+            mode=orchestrator_mode,
+            feature_filters={feature},
+            partition_filters=set(),
+            variable_filters=variable_filters,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if not jobs:
+        filters_text = ", ".join(
+            f"{variable_filter.name}={variable_filter.value}"
+            for variable_filter in variable_filters
+        )
+        raise RuntimeError(
+            f"variable filters selected zero configs before execution: {filters_text}"
+        )
+
+
+def _orchestrator_mode(session: BenchSession) -> str:
+    mode = session.request.mode.value
+    return "full_sweep" if mode == "full_sweep" else "default"
 
 
 def _run_diagnostic_artifacts(session: BenchSession) -> list[Path]:
@@ -1170,15 +1230,72 @@ def _load_requested_test_config(session: BenchSession) -> dict[str, Any]:
     config_path = _requested_test_config_path(session)
     if not config_path.exists():
         raise RuntimeError(f"test config does not exist: {config_path}")
-    return json.loads(config_path.read_text(encoding="utf-8-sig"))
+    try:
+        config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"test config is not valid JSON: {config_path}") from exc
+    if not isinstance(config_data, dict):
+        raise RuntimeError(f"test config must be a JSON object: {config_path}")
+    for section in ("firmware", "hw"):
+        if section in config_data and not isinstance(config_data[section], dict):
+            raise RuntimeError(f"test config section must be an object: {section}")
+    return config_data
+
+
+def _write_selected_config_evidence(session: BenchSession) -> dict[str, Path]:
+    config_path = _requested_test_config_path(session)
+    config_dir = _requested_test_config_dir(session)
+    observed_hash = _sha256_text_file_lf_normalized(config_path)
+    snapshot_path = session.runtime_dir / "selected_config.json"
+    metadata_path = session.runtime_dir / "selected_config_metadata.json"
+    session.runtime_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config_path, snapshot_path)
+    metadata = {
+        "mode": session.request.selector.mode,
+        "feature": session.request.selector.feature,
+        "config": session.request.selector.config,
+        "selected_config": config_path.relative_to(config_dir).as_posix(),
+        "requested_config_hash": session.request.selector.config_hash,
+        "observed_config_hash": observed_hash,
+        "source_path": str(config_path),
+        "snapshot_path": str(snapshot_path),
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return {
+        "snapshot_path": snapshot_path,
+        "metadata_path": metadata_path,
+    }
+
+
+def _requested_test_config_dir(session: BenchSession) -> Path:
+    feature = session.request.selector.feature.strip()
+    if not feature:
+        raise RuntimeError("test feature is required")
+    if Path(feature).name != feature or feature in {".", ".."}:
+        raise RuntimeError("test feature must be a single feature name")
+    config_dir = Path("tests") / "configs" / session.request.selector.mode / feature
+    if not config_dir.is_dir():
+        raise RuntimeError(f"test feature config directory does not exist: {config_dir}")
+    return config_dir.resolve()
 
 
 def _requested_test_config_path(session: BenchSession) -> Path:
-    config_dir = Path("tests") / "configs" / session.request.selector.mode / session.request.selector.feature
+    config_dir = _requested_test_config_dir(session)
     config_name = session.request.selector.config or "default"
+    config_name = config_name.strip().replace("\\", "/")
     if config_name.endswith(".json"):
-        return config_dir / config_name
-    return config_dir / f"{config_name}.json"
+        requested = config_name
+    else:
+        requested = f"{config_name}.json"
+    relative = Path(requested)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise RuntimeError("test config must be a single relative config path")
+    resolved = (config_dir / relative).resolve()
+    try:
+        resolved.relative_to(config_dir)
+    except ValueError as exc:
+        raise RuntimeError("test config must stay beneath the selected feature directory") from exc
+    return resolved
 
 
 def _real_test_artifacts(session: BenchSession, *, since: float | None = None) -> list[Path]:
@@ -1221,6 +1338,11 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_text_file_lf_normalized(path: Path) -> str:
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
 
 
 def _append_bounded_log(path: Path, text: str, *, max_bytes: int) -> int:

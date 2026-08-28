@@ -15,33 +15,95 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from cms_colors import COLOR_CHOICES, ColorFormatter, color_formatter, state_role
 from cms_protocol import (
+    CMS_OBSERVATION_PROTOCOL_VERSION,
+    Artifacts,
     BenchHealthReport,
     BenchIdentity,
     BenchState,
     BenchStatus,
     FirmwareImage,
     FirmwareData,
+    EventCursor,
+    MeasurementEventPage,
     MeasurementMode,
     MeasurementRequest,
     MeasurementResult,
     MeasurementState,
+    MeasurementSummary,
     SuiteSelector,
+    VariableFilter,
+    artifact_from_dict,
+    artifact_to_dict,
     bench_health_report_from_dict,
     measurement_request_from_dict,
     measurement_request_to_dict,
     measurement_result_from_dict,
+    measurement_event_page_from_dict,
+    measurement_summary_from_dict,
+)
+from cms_variable_filters import (
+    parse_variable_filters,
+    validate_variable_filters,
+    variable_help_text,
 )
 
 CMS_CLIENT_CONFIG = "cms_client_config.json"
+TERMINAL_MEASUREMENT_STATES = frozenset(
+    {
+        MeasurementState.PASSED,
+        MeasurementState.FAILED,
+        MeasurementState.CANCELLED,
+        MeasurementState.REJECTED,
+        MeasurementState.INTERRUPTED,
+    }
+)
+
+
+class CMSCLIExitCode(IntEnum):
+    """Stable process outcomes for scripts, developers, and future CI."""
+
+    SUCCESS = 0
+    TEST_FAILED = 1
+    USAGE_ERROR = 2
+    TEST_CANCELLED = 3
+    TEST_REJECTED = 4
+    CONNECTION_FAILURE = 5
+    PROTOCOL_MISMATCH = 6
+    CLIENT_ERROR = 7
+
+
+class CMSClientError(RuntimeError):
+    """Base class for classified CMS Client failures."""
+
+
+class CMSConnectionError(CMSClientError):
+    """The daemon could not be reached or stopped responding."""
+
+
+class CMSProtocolMismatchError(CMSClientError):
+    """The daemon response is incompatible with the client protocol."""
+
+
+class CMSDaemonError(CMSClientError):
+    """The daemon rejected or could not complete a valid client request."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(f"CMS daemon returned HTTP {status_code}: {detail}")
+        self.status_code = status_code
+        self.detail = detail
 
 
 @dataclass(slots=True)
@@ -54,6 +116,36 @@ class CMSClientConfig:
     target: dict[str, str] | None = None
     build: dict[str, str] | None = None
     tools: dict[str, str] | None = None
+
+
+@dataclass(slots=True)
+class MeasurementWatchState:
+    """Reconnectable client-side cursor and latest structured summary."""
+
+    measurement_id: str
+    cursor: EventCursor = EventCursor()
+    summary: MeasurementSummary | None = None
+
+    def __post_init__(self) -> None:
+        if not self.measurement_id:
+            raise ValueError("measurement watch requires a measurement id")
+
+    @property
+    def is_terminal(self) -> bool:
+        return (
+            self.summary is not None
+            and self.summary.state in TERMINAL_MEASUREMENT_STATES
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MeasurementWatchUpdate:
+    """One independently fetched summary and cursor-based event page."""
+
+    requested_cursor: EventCursor
+    summary: MeasurementSummary
+    event_page: MeasurementEventPage
+    console_truncated: bool = False
 
 
 class CMSClient:
@@ -115,8 +207,10 @@ class CMSClient:
         config: str = "default",
         upload_results_to_database: bool = False,
         run_name: str = "",
+        variable_filters: tuple[VariableFilter, ...] = (),
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
+        config_hash = _validate_local_test_config(feature, config)
         payload = self._request_json(
             "POST",
             "/test",
@@ -124,6 +218,11 @@ class CMSClient:
                 "mode": mode.value,
                 "feature": feature,
                 "config": config,
+                "config_hash": config_hash,
+                "variable_filters": [
+                    {"name": item.name, "value": item.value}
+                    for item in variable_filters
+                ],
                 "run_name": run_name,
                 "upload_results_to_database": upload_results_to_database,
             },
@@ -133,6 +232,82 @@ class CMSClient:
     def get_measurement(self, measurement_id: str) -> MeasurementResult:
         """Fetch the current state and result summary for one submitted measurement."""
         return measurement_result_from_dict(self._request_json("GET", f"/measurement/{measurement_id}"))
+
+    def get_active_measurement_id(self) -> str | None:
+        """Discover the measurement currently controlled by the daemon."""
+
+        payload = self._request_json("GET", _observation_path("/measurement/active"))
+        _validate_observation_envelope(payload)
+        measurement_id = payload.get("measurement_id")
+        if measurement_id is None:
+            return None
+        if not isinstance(measurement_id, str) or not measurement_id:
+            raise CMSProtocolMismatchError(
+                "active measurement response contains an invalid measurement id"
+            )
+        return measurement_id
+
+    def get_measurement_summary(self, measurement_id: str) -> MeasurementSummary:
+        """Fetch concise authoritative test state for one measurement."""
+
+        encoded_id = urllib.parse.quote(measurement_id, safe="")
+        payload = self._request_json(
+            "GET",
+            _observation_path(f"/measurement/{encoded_id}/summary"),
+        )
+        _validate_observation_envelope(payload, measurement_id)
+        try:
+            return measurement_summary_from_dict(payload)
+        except (TypeError, ValueError) as exc:
+            raise CMSProtocolMismatchError(
+                f"measurement summary response is invalid: {exc}"
+            ) from exc
+
+    def get_measurement_events(
+        self,
+        measurement_id: str,
+        after_cursor: EventCursor = EventCursor(),
+    ) -> MeasurementEventPage:
+        """Fetch retained events strictly after the supplied client cursor."""
+
+        encoded_id = urllib.parse.quote(measurement_id, safe="")
+        path = _observation_path(
+            f"/measurement/{encoded_id}/events",
+            after=str(after_cursor.value),
+        )
+        payload = self._request_json("GET", path)
+        _validate_observation_envelope(payload, measurement_id)
+        try:
+            page = measurement_event_page_from_dict(payload)
+        except (TypeError, ValueError) as exc:
+            raise CMSProtocolMismatchError(
+                f"measurement event response is invalid: {exc}"
+            ) from exc
+        if page.next_cursor < after_cursor:
+            raise CMSProtocolMismatchError(
+                "measurement event response moved the cursor backwards"
+            )
+        if any(event.cursor <= after_cursor for event in page.events):
+            raise CMSProtocolMismatchError(
+                "measurement event response repeated an acknowledged cursor"
+            )
+        return page
+
+    def list_measurement_artifacts(self, measurement_id: str) -> list[Artifacts]:
+        """List published artifacts belonging to an explicit measurement."""
+
+        encoded_id = urllib.parse.quote(measurement_id, safe="")
+        payload = self._request_json(
+            "GET",
+            _observation_path(f"/measurement/{encoded_id}/artifacts"),
+        )
+        _validate_observation_envelope(payload, measurement_id)
+        try:
+            return [artifact_from_dict(artifact) for artifact in payload.get("artifacts", [])]
+        except (TypeError, ValueError) as exc:
+            raise CMSProtocolMismatchError(
+                f"measurement artifact response is invalid: {exc}"
+            ) from exc
 
     def cancel_measurement(self, measurement_id: str) -> MeasurementResult:
         """Request cancellation for the active measurement when the daemon allows it."""
@@ -146,28 +321,51 @@ class CMSClient:
 
     def download_artifact(self, measurement_id: str, artifact_name: str, out_dir: Path) -> Path:
         """Copy one published result artifact from the daemon to the client host."""
-        payload = self._request_json("GET", f"/measurement/{measurement_id}/artifacts")
-        artifacts = payload.get("artifacts", [])
-        artifact = next((item for item in artifacts if item.get("name") == artifact_name), None)
+        artifacts = self.list_measurement_artifacts(measurement_id)
+        artifact = next((item for item in artifacts if item.name == artifact_name), None)
         if artifact is None:
             raise RuntimeError(f"artifact is not available: {artifact_name}")
 
-        out_dir.mkdir(parents=True, exist_ok=True)
-        destination = out_dir / artifact_name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        source_url = str(artifact.get("url", ""))
-        source_path = str(artifact.get("path", ""))
-        if source_path and Path(source_path).exists():
-            shutil.copy2(source_path, destination)
-            return destination
-        if source_url.startswith("http://") or source_url.startswith("https://"):
-            urllib.request.urlretrieve(source_url, destination)
-            return destination
-        if source_url.startswith("/"):
-            with urllib.request.urlopen(f"{self.base_url}{source_url}", timeout=self.timeout_s) as response:
-                destination.write_bytes(response.read())
-            return destination
-        raise RuntimeError(f"artifact has no downloadable location: {artifact_name}")
+        return self._download_artifact_payload(artifact_to_dict(artifact), out_dir)
+
+    def download_measurement_artifacts(self, measurement_id: str, out_dir: Path) -> list[Path]:
+        """Download every published artifact for an explicit measurement."""
+
+        artifacts = self.list_measurement_artifacts(measurement_id)
+        if not artifacts:
+            raise RuntimeError(f"measurement has no published artifacts: {measurement_id}")
+        return [
+            self._download_artifact_payload(artifact_to_dict(artifact), out_dir)
+            for artifact in artifacts
+        ]
+
+    def failed_tests(self, measurement_id: str) -> list[dict[str, str]]:
+        """Return failed test identities from structured orchestrator results."""
+
+        artifacts = self.list_measurement_artifacts(measurement_id)
+        results_artifact = next(
+            (
+                artifact
+                for artifact in artifacts
+                if Path(artifact.name.replace("\\", "/")).name == "orchestrator_results.jsonl"
+            ),
+            None,
+        )
+        if results_artifact is None:
+            raise RuntimeError(
+                f"measurement has no structured job-result artifact: {measurement_id}"
+            )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            results_path = self._download_artifact_payload(
+                artifact_to_dict(results_artifact),
+                Path(temp_dir),
+            )
+            records = [
+                json.loads(line)
+                for line in results_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        return _failed_test_records_from_job_results(records)
 
     def download_last_artifacts(self, out_dir: Path) -> list[Path]:
         """Download every artifact from the last completed remote test."""
@@ -207,12 +405,24 @@ class CMSClient:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-                return json.loads(response.read().decode("utf-8"))
+                response_body = response.read().decode("utf-8")
+                try:
+                    return json.loads(response_body)
+                except json.JSONDecodeError as exc:
+                    raise CMSProtocolMismatchError(
+                        "CMS daemon returned invalid JSON"
+                    ) from exc
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"CMS daemon returned HTTP {exc.code}: {detail}") from exc
+            if _http_error_code(detail) == "incompatible_protocol":
+                raise CMSProtocolMismatchError(
+                    f"CMS daemon rejected the observation protocol: {detail}"
+                ) from exc
+            raise CMSDaemonError(exc.code, detail) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"CMS daemon is unreachable: {exc.reason}") from exc
+            raise CMSConnectionError(f"CMS daemon is unreachable: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise CMSConnectionError("CMS daemon request timed out") from exc
 
     def _download_artifact_payload(self, artifact: dict[str, Any], out_dir: Path) -> Path:
         name = str(artifact.get("name", ""))
@@ -224,14 +434,117 @@ class CMSClient:
         if source_path and Path(source_path).exists():
             shutil.copy2(source_path, destination)
             return destination
-        if source_url.startswith("http://") or source_url.startswith("https://"):
-            urllib.request.urlretrieve(source_url, destination)
-            return destination
-        if source_url.startswith("/"):
-            with urllib.request.urlopen(f"{self.base_url}{source_url}", timeout=self.timeout_s) as response:
-                destination.write_bytes(response.read())
-            return destination
+        try:
+            if source_url.startswith("http://") or source_url.startswith("https://"):
+                urllib.request.urlretrieve(source_url, destination)
+                return destination
+            if source_url.startswith("/"):
+                with urllib.request.urlopen(
+                    f"{self.base_url}{source_url}",
+                    timeout=self.timeout_s,
+                ) as response:
+                    destination.write_bytes(response.read())
+                return destination
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise CMSDaemonError(exc.code, detail) from exc
+        except urllib.error.URLError as exc:
+            raise CMSConnectionError(f"CMS artifact download failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise CMSConnectionError("CMS artifact download timed out") from exc
         raise RuntimeError(f"artifact has no downloadable location: {name}")
+
+
+def _observation_path(path: str, **query: str) -> str:
+    parameters = {
+        **query,
+        "protocol_version": str(CMS_OBSERVATION_PROTOCOL_VERSION),
+    }
+    return f"{path}?{urllib.parse.urlencode(parameters)}"
+
+
+def _validate_observation_envelope(
+    payload: dict[str, Any],
+    expected_measurement_id: str | None = None,
+) -> None:
+    try:
+        protocol_version = int(payload.get("protocol_version", 0))
+    except (TypeError, ValueError) as exc:
+        raise CMSProtocolMismatchError(
+            "observation response contains an invalid protocol version"
+        ) from exc
+    if protocol_version != CMS_OBSERVATION_PROTOCOL_VERSION:
+        raise CMSProtocolMismatchError(
+            "CMS observation protocol mismatch: "
+            f"client={CMS_OBSERVATION_PROTOCOL_VERSION}, daemon={protocol_version}"
+        )
+    if expected_measurement_id is None:
+        return
+    response_measurement_id = payload.get("measurement_id")
+    if response_measurement_id != expected_measurement_id:
+        raise CMSProtocolMismatchError(
+            "observation response measurement id does not match the requested measurement"
+        )
+
+
+def _http_error_code(detail: str) -> str:
+    try:
+        payload = json.loads(detail)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    error_detail = payload.get("detail", {}) if isinstance(payload, dict) else {}
+    return str(error_detail.get("code", "")) if isinstance(error_detail, dict) else ""
+
+
+def poll_measurement_watch(
+    client: CMSClient,
+    state: MeasurementWatchState,
+) -> MeasurementWatchUpdate:
+    """Fetch one summary and one event page, advancing state only on success."""
+
+    requested_cursor = state.cursor
+    summary = client.get_measurement_summary(state.measurement_id)
+    event_page = client.get_measurement_events(state.measurement_id, requested_cursor)
+    console_truncated = (
+        event_page.truncated
+        and event_page.oldest_retained_cursor.value > 0
+        and requested_cursor.value < event_page.oldest_retained_cursor.value - 1
+    )
+    state.summary = summary
+    state.cursor = event_page.next_cursor
+    return MeasurementWatchUpdate(
+        requested_cursor=requested_cursor,
+        summary=summary,
+        event_page=event_page,
+        console_truncated=console_truncated,
+    )
+
+
+def watch_measurement(
+    client: CMSClient,
+    state: MeasurementWatchState,
+    *,
+    poll_interval_s: float = 1.0,
+    on_summary: Callable[[MeasurementSummary], None] | None = None,
+    on_events: Callable[[MeasurementEventPage], None] | None = None,
+    on_truncation: Callable[[EventCursor], None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> MeasurementWatchState:
+    """Watch until terminal state while preserving cursor state for reconnect."""
+
+    if poll_interval_s < 0:
+        raise ValueError("watch poll interval cannot be negative")
+    while True:
+        update = poll_measurement_watch(client, state)
+        if on_summary is not None:
+            on_summary(update.summary)
+        if update.console_truncated and on_truncation is not None:
+            on_truncation(update.event_page.oldest_retained_cursor)
+        if update.event_page.events and on_events is not None:
+            on_events(update.event_page)
+        if state.is_terminal:
+            return state
+        sleep(poll_interval_s)
 
 
 def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
@@ -262,18 +575,123 @@ def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
     )
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed
+
+
 def build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cms", description="CMS bench client")
+    parser = argparse.ArgumentParser(
+        prog="cms",
+        description="CMS bench client",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Normal workflow:\n"
+            "  1. cms health\n"
+            "  2. cms status\n"
+            "  3. cms tests\n"
+            "  4. cms BUILD\n"
+            "  5. cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n"
+            "  6. cms TEST default beacon --config-name default --preview\n"
+            "  7. cms TEST default beacon --config-name default --out-dir artifacts\n"
+            "  8. cms WATCH <measurement_id> --cursor <last_cursor>\n"
+            "  9. cms CANCEL\n"
+            " 10. cms ARTIFACTS <measurement_id> --out-dir artifacts\n\n"
+            "  cms RECIPES prints copy/paste command recipes for the common workflows.\n\n"
+            "  cms EXIT_CODES documents stable script outcomes.\n\n"
+            "  cms TROUBLESHOOT prints operator diagnostics for common failures.\n\n"
+            "Use cms <command> --help for command-specific examples and next steps."
+        ),
+    )
     parser.add_argument("--config", default=CMS_CLIENT_CONFIG, help="client config JSON path")
     parser.add_argument("--base-url", default="", help="override daemon base URL")
     parser.add_argument("--api-token", default="", help="override daemon API token")
+    parser.add_argument(
+        "--color",
+        choices=COLOR_CHOICES,
+        default="auto",
+        help="color human output: auto, always, or never",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("health", help="show daemon and bench health")
-    subparsers.add_parser("status", help="show bench status")
-    subparsers.add_parser("tests", aliases=["TESTS"], help="list test modes and features")
+    health = subparsers.add_parser("health", help="show daemon and bench health")
+    _add_color_argument(health)
+    status = subparsers.add_parser("status", help="show bench status")
+    _add_color_argument(status)
+    tests = subparsers.add_parser("tests", aliases=["TESTS"], help="list test modes and features")
+    _add_color_argument(tests)
+    exit_codes = subparsers.add_parser(
+        "exit_codes",
+        aliases=["EXIT_CODES"],
+        help="document stable CLI exit codes",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms EXIT_CODES\n\n"
+            "Use these codes to distinguish a completed test failure from a "
+            "connection failure, protocol mismatch, rejected request, or client usage error."
+        ),
+    )
+    _add_color_argument(exit_codes)
+    troubleshoot = subparsers.add_parser(
+        "troubleshoot",
+        aliases=["TROUBLESHOOT"],
+        help="print troubleshooting guidance for common CMS Client failures",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Topics:\n"
+            "  health\n"
+            "  hardware-mappings\n"
+            "  firmware\n"
+            "  configs\n"
+            "  daemon\n"
+            "  truncated-output\n"
+            "  stalled-setup\n"
+            "  artifacts\n\n"
+            "Example:\n"
+            "  cms TROUBLESHOOT --topic health"
+        ),
+    )
+    _add_color_argument(troubleshoot)
+    troubleshoot.add_argument(
+        "--topic",
+        default="all",
+        choices=[
+            "all",
+            "health",
+            "hardware-mappings",
+            "firmware",
+            "configs",
+            "daemon",
+            "truncated-output",
+            "stalled-setup",
+            "artifacts",
+        ],
+        help="show one troubleshooting topic instead of all topics",
+    )
 
-    build = subparsers.add_parser("build", aliases=["BUILD"], help="build local firmware with SLC config")
+    build = subparsers.add_parser(
+        "build",
+        aliases=["BUILD"],
+        help="build local firmware with SLC config",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms BUILD\n\n"
+            "Next:\n"
+            "  Run cms SEND_FW to stage the built firmware on the bench."
+        ),
+    )
+    _add_color_argument(build)
     build.add_argument("targets", nargs="*", help="optional .slcp targets or app directories")
     build.add_argument("--action", default="build", choices=["generate", "upgrade", "build", "rebuild"])
     build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
@@ -281,7 +699,21 @@ def build_cli_parser() -> argparse.ArgumentParser:
     build.add_argument("--build-root", default="", help="override firmware build root")
     build.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
 
-    send_fw = subparsers.add_parser("send_fw", aliases=["SEND_FW"], help="send firmware and metadata to the bench")
+    send_fw = subparsers.add_parser(
+        "send_fw",
+        aliases=["SEND_FW"],
+        help="send firmware and metadata to the bench",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n\n"
+            "Defaults:\n"
+            "  Firmware images and sl_bt.xapi are discovered from the configured build root.\n\n"
+            "Next:\n"
+            "  Run cms TEST default beacon --config-name default --preview before starting a test."
+        ),
+    )
+    _add_color_argument(send_fw)
     send_fw.add_argument("--request-json", help="load the full firmware request from JSON")
     send_fw.add_argument("--request-id", default="", help="firmware staging id")
     send_fw.add_argument("--dut-image", default="", help="DUT firmware path or URL")
@@ -298,10 +730,49 @@ def build_cli_parser() -> argparse.ArgumentParser:
     send_fw.add_argument("--build-root", default="", help="override firmware build root used for provenance")
     send_fw.add_argument("--requested-by", default="", help="request owner")
 
-    test = subparsers.add_parser("test", aliases=["TEST"], help="run a remote test with staged firmware")
+    test = subparsers.add_parser(
+        "test",
+        aliases=["TEST"],
+        help="run a remote test with staged firmware",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms TEST default beacon --config-name default --preview\n"
+            "  cms TEST default beacon --config-name default --out-dir artifacts\n"
+            "  cms TEST default beacon --config-name dcdc --preview\n"
+            "  cms TEST default beacon --config-name dcdc --upload-results-to-database\n"
+            "  cms TEST full_sweep beacon --variable phy=2m --preview\n"
+            "  cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
+            "Required arguments:\n"
+            "  mode      debug, default, full_sweep, or diff\n"
+            "  feature   BLE feature name such as beacon\n\n"
+            "Variable filters:\n"
+            "  Use --variable name=value to target generated configs by parameter.\n"
+            "  Names and values come from the selected feature's parameters.json.\n"
+            "  For beacon today, parameters.json declares phy values coded, 1m, 2m.\n"
+            "  Run --preview to print accepted variable names and values before testing.\n\n"
+            "Defaults:\n"
+            "  --config-name default\n"
+            "  --out-dir artifacts\n"
+            "  --poll-interval 1.0\n\n"
+            "Next:\n"
+            "  The command watches automatically. Reattach later with cms WATCH <measurement_id>."
+        ),
+    )
+    _add_color_argument(test)
     test.add_argument("mode", choices=[mode.value for mode in MeasurementMode])
     test.add_argument("feature")
     test.add_argument("--config-name", default="default", help="test config")
+    test.add_argument(
+        "--variable",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help=(
+            "filter generated configs by a parameter declared in parameters.json; "
+            "repeat to intersect filters"
+        ),
+    )
     test.add_argument(
         "--run-name",
         dest="run_name",
@@ -309,6 +780,22 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="human-readable test run name",
     )
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
+    test.add_argument(
+        "--preview",
+        action="store_true",
+        help="show exactly what test would be submitted without starting it",
+    )
+    test.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show live stdout, stderr, and lifecycle events",
+    )
+    test.add_argument(
+        "--poll-interval",
+        type=_non_negative_float,
+        default=1.0,
+        help="seconds between observation polls",
+    )
     test.add_argument(
         "--send-to-database",
         "--upload-results-to-database",
@@ -318,37 +805,211 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
 
 
-    measurement = subparsers.add_parser("measurement", help="show measurement status")
+    measurement = subparsers.add_parser(
+        "measurement",
+        help="show measurement status",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms measurement <measurement_id>\n\n"
+            "Next:\n"
+            "  Use cms WATCH <measurement_id> to follow a running measurement."
+        ),
+    )
+    _add_color_argument(measurement)
     measurement.add_argument("measurement_id")
 
-    cancel = subparsers.add_parser("cancel", aliases=["CANCEL"], help="cancel the active test")
+    watch = subparsers.add_parser(
+        "watch",
+        aliases=["WATCH"],
+        help="attach to an active or explicit measurement",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  cms WATCH\n"
+            "  cms WATCH <measurement_id> --cursor 0\n"
+            "  cms WATCH <measurement_id> --cursor <last_cursor> --verbose\n\n"
+            "Defaults:\n"
+            "  measurement_id omitted means attach to the active measurement.\n"
+            "  --cursor 0 starts from the beginning of retained events.\n"
+            "  --poll-interval 1.0\n\n"
+            "Next:\n"
+            "  After completion, run cms ARTIFACTS <measurement_id> --out-dir artifacts."
+        ),
+    )
+    _add_color_argument(watch)
+    watch.add_argument("measurement_id", nargs="?", default="")
+    watch.add_argument(
+        "--cursor",
+        type=_non_negative_int,
+        default=0,
+        help="resume after this previously acknowledged event cursor",
+    )
+    watch.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show live stdout, stderr, and lifecycle events",
+    )
+    watch.add_argument(
+        "--poll-interval",
+        type=_non_negative_float,
+        default=1.0,
+        help="seconds between observation polls",
+    )
 
-    artifacts = subparsers.add_parser("artifacts", aliases=["ARTIFACTS"], help="download artifacts from the last test")
+    cancel = subparsers.add_parser(
+        "cancel",
+        aliases=["CANCEL"],
+        help="cancel the active test",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms CANCEL\n\n"
+            "Scope:\n"
+            "  Requests cancellation of the active measurement on the bench.\n\n"
+            "Next:\n"
+            "  Run cms WATCH to observe the final cancelled state."
+        ),
+    )
+    _add_color_argument(cancel)
+
+    artifacts = subparsers.add_parser(
+        "artifacts",
+        aliases=["ARTIFACTS"],
+        help="download artifacts from an explicit measurement",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms ARTIFACTS <measurement_id> --out-dir artifacts\n\n"
+            "Required arguments:\n"
+            "  measurement_id   explicit measurement whose artifacts should be downloaded\n\n"
+            "Defaults:\n"
+            "  --out-dir artifacts\n\n"
+            "Next:\n"
+            "  Inspect the downloaded result JSON, JUnit XML, logs, and measurement artifacts."
+        ),
+    )
+    _add_color_argument(artifacts)
+    artifacts.add_argument("measurement_id")
     artifacts.add_argument("--out-dir", default="artifacts")
+
+    failed = subparsers.add_parser(
+        "failed",
+        aliases=["FAILED"],
+        help="show failed test identities and rerun commands",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms FAILED <measurement_id>\n"
+            "  cms FAILED <measurement_id> --json\n\n"
+            "Source:\n"
+            "  Uses structured orchestrator_results.jsonl records when available.\n\n"
+            "Next:\n"
+            "  Use the printed rerun command for each failed config."
+        ),
+    )
+    _add_color_argument(failed)
+    failed.add_argument("measurement_id")
+    failed.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit machine-readable failed-test records",
+    )
+
+    recipes = subparsers.add_parser(
+        "recipes",
+        aliases=["RECIPES"],
+        help="print copy/paste recipes for common CMS workflows",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Focused workflows:\n"
+            "  default config\n"
+            "  exact named config\n"
+            "  attach or reconnect from a cursor\n"
+            "  cancel the active measurement\n"
+            "  download artifacts by explicit measurement ID\n\n"
+            "Example:\n"
+            "  cms RECIPES --feature beacon --config-name dcdc --measurement-id <id>"
+        ),
+    )
+    _add_color_argument(recipes)
+    recipes.add_argument("--feature", default="beacon", help="feature used in TEST examples")
+    recipes.add_argument("--config-name", default="dcdc", help="named config used in exact-config examples")
+    recipes.add_argument("--measurement-id", default="<measurement_id>", help="measurement ID used in WATCH and ARTIFACTS examples")
+    recipes.add_argument("--cursor", type=_non_negative_int, default=0, help="cursor used in reconnect examples")
+    recipes.add_argument("--out-dir", default="artifacts", help="artifact output directory used in examples")
     return parser
 
 
+def _add_color_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--color",
+        choices=COLOR_CHOICES,
+        default=argparse.SUPPRESS,
+        help="color human output: auto, always, or never",
+    )
+
+
+def _measurement_exit_code(
+    state: MeasurementState | None,
+) -> CMSCLIExitCode:
+    return {
+        MeasurementState.PASSED: CMSCLIExitCode.SUCCESS,
+        MeasurementState.FAILED: CMSCLIExitCode.TEST_FAILED,
+        MeasurementState.CANCELLED: CMSCLIExitCode.TEST_CANCELLED,
+        MeasurementState.REJECTED: CMSCLIExitCode.TEST_REJECTED,
+        MeasurementState.INTERRUPTED: CMSCLIExitCode.CLIENT_ERROR,
+    }.get(state, CMSCLIExitCode.CLIENT_ERROR)
+
+
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return int(_main(argv))
+    except CMSConnectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return int(CMSCLIExitCode.CONNECTION_FAILURE)
+    except CMSProtocolMismatchError as exc:
+        print(str(exc), file=sys.stderr)
+        return int(CMSCLIExitCode.PROTOCOL_MISMATCH)
+    except CMSDaemonError as exc:
+        print(str(exc), file=sys.stderr)
+        return int(CMSCLIExitCode.CLIENT_ERROR)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return int(CMSCLIExitCode.CLIENT_ERROR)
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = build_cli_parser().parse_args(argv)
+    colors = color_formatter(args.color)
     client_config = load_client_config(args.config)
     client = CMSClient(base_url=args.base_url, api_token=args.api_token, config_path=args.config)
 
     if args.command == "health":
         report = client.get_health()
-        print(f"{report.state.value}: {report.summary}")
+        print(f"{colors.state(report.state)}: {report.summary}")
         for check in report.checks:
             detail = f" ({check.detail})" if check.detail else ""
-            print(f"{check.status.value} {check.name}: {check.summary}{detail}")
-        return 0 if report.state is not BenchState.ERROR else 1
+            print(f"{colors.state(check.status.value)} {check.name}: {check.summary}{detail}")
+        return (
+            CMSCLIExitCode.SUCCESS
+            if report.state is not BenchState.ERROR
+            else CMSCLIExitCode.CLIENT_ERROR
+        )
 
     if args.command == "status":
         status = client.get_status()
-        print(f"{status.state.value}: {status.identity.bench_id}")
+        print(f"{colors.state(status.state)}: {status.identity.bench_id}")
         if status.active_measurement_id:
             print(f"active_measurement_id: {status.active_measurement_id}")
         if status.detail:
             print(status.detail)
-        return 0 if status.state is not BenchState.ERROR else 1
+        return (
+            CMSCLIExitCode.SUCCESS
+            if status.state is not BenchState.ERROR
+            else CMSCLIExitCode.CLIENT_ERROR
+        )
 
     if args.command in {"tests", "TESTS"}:
         payload = client.list_tests()
@@ -356,50 +1017,118 @@ def main(argv: list[str] | None = None) -> int:
         for feature in payload.get("features", []):
             configs = ", ".join(feature.get("configs", []))
             print(f"{feature.get('feature', '')}: {configs}")
-        return 0
+        return CMSCLIExitCode.SUCCESS
+
+    if args.command in {"exit_codes", "EXIT_CODES"}:
+        _print_exit_codes()
+        return CMSCLIExitCode.SUCCESS
+
+    if args.command in {"troubleshoot", "TROUBLESHOOT"}:
+        _print_troubleshooting(args.topic)
+        return CMSCLIExitCode.SUCCESS
 
     if args.command in {"build", "BUILD"}:
-        return _run_local_build(args, args.config)
+        return (
+            CMSCLIExitCode.SUCCESS
+            if _run_local_build(args, args.config) == 0
+            else CMSCLIExitCode.CLIENT_ERROR
+        )
 
     if args.command in {"send_fw", "SEND_FW"}:
         request = _request_from_send_fw_args(args, client_config)
         result = client.send_firmware(request)
-        _print_measurement_result(result)
-        return 0 if result.state is not MeasurementState.FAILED else 1
+        _print_measurement_result(result, colors=colors)
+        if result.state is MeasurementState.REJECTED:
+            return CMSCLIExitCode.TEST_REJECTED
+        return (
+            CMSCLIExitCode.CLIENT_ERROR
+            if result.state is MeasurementState.FAILED
+            else CMSCLIExitCode.SUCCESS
+        )
 
     if args.command == "measurement":
-        _print_measurement_result(client.get_measurement(args.measurement_id))
-        return 0
+        _print_measurement_result(client.get_measurement(args.measurement_id), colors=colors)
+        return CMSCLIExitCode.SUCCESS
+
+    if args.command in {"watch", "WATCH"}:
+        measurement_id = _resolve_watch_measurement_id(client, args.measurement_id)
+        state = _watch_remote_measurement(
+            client,
+            measurement_id,
+            after_cursor=EventCursor(args.cursor),
+            verbose=args.verbose,
+            poll_interval_s=args.poll_interval,
+            colors=colors,
+        )
+        return _measurement_exit_code(
+            state.summary.state if state.summary is not None else None
+        )
 
     if args.command in {"test", "TEST"}:
+        variable_filters = parse_variable_filters(args.variable)
+        if variable_filters:
+            validate_variable_filters(_local_parameters_path(args.feature), variable_filters)
+        if args.preview:
+            _print_test_preview(args, variable_filters)
+            return CMSCLIExitCode.SUCCESS
         result = client.run_test(
             MeasurementMode(args.mode),
             args.feature,
             config=args.config_name,
             run_name=args.run_name,
             upload_results_to_database=args.upload_results_to_database,
+            variable_filters=variable_filters,
         )
-        if result.measurement_id:
-            result = _poll_test_progress(client, result.measurement_id)
-        else:
-            _print_measurement_result(result)
+        if not result.measurement_id:
+            _print_measurement_result(result, colors=colors)
+            return _measurement_exit_code(result.state)
+        state = _watch_remote_measurement(
+            client,
+            result.measurement_id,
+            verbose=args.verbose,
+            poll_interval_s=args.poll_interval,
+            colors=colors,
+        )
+        result = client.get_measurement(result.measurement_id)
         if result.artifacts:
-            for path in client.download_last_artifacts(Path(args.out_dir)):
+            for path in client.download_measurement_artifacts(
+                result.measurement_id,
+                Path(args.out_dir),
+            ):
                 print(f"saved {path}")
-        if result.state is MeasurementState.PASSED:
-            return 0
-        return 1
+        return _measurement_exit_code(
+            state.summary.state if state.summary is not None else None
+        )
 
     if args.command in {"cancel", "CANCEL"}:
-        _print_measurement_result(client.cancel_active_test())
-        return 0
+        result = client.cancel_active_test()
+        _print_measurement_result(result, colors=colors)
+        if result.state is MeasurementState.REJECTED:
+            return CMSCLIExitCode.TEST_REJECTED
+        return (
+            CMSCLIExitCode.CLIENT_ERROR
+            if result.state is MeasurementState.FAILED
+            else CMSCLIExitCode.SUCCESS
+        )
 
     if args.command in {"artifacts", "ARTIFACTS"}:
-        for path in client.download_last_artifacts(Path(args.out_dir)):
+        for path in client.download_measurement_artifacts(
+            args.measurement_id,
+            Path(args.out_dir),
+        ):
             print(path)
-        return 0
+        return CMSCLIExitCode.SUCCESS
 
-    return 2
+    if args.command in {"failed", "FAILED"}:
+        failed_tests = client.failed_tests(args.measurement_id)
+        _print_failed_tests(args.measurement_id, failed_tests, as_json=args.as_json)
+        return CMSCLIExitCode.SUCCESS
+
+    if args.command in {"recipes", "RECIPES"}:
+        _print_operator_recipes(args)
+        return CMSCLIExitCode.SUCCESS
+
+    return CMSCLIExitCode.USAGE_ERROR
 
 
 def _request_from_send_fw_args(
@@ -600,6 +1329,50 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_text_file_lf_normalized(path: Path) -> str:
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _validate_local_test_config(feature: str, config: str) -> str:
+    config_path = _local_test_config_path(feature, config)
+    if not config_path.exists():
+        raise RuntimeError(f"test config does not exist: {config_path}")
+    try:
+        config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"test config is not valid JSON: {config_path}") from exc
+    if not isinstance(config_data, dict):
+        raise RuntimeError(f"test config must be a JSON object: {config_path}")
+    for section in ("firmware", "hw"):
+        if section in config_data and not isinstance(config_data[section], dict):
+            raise RuntimeError(f"test config section must be an object: {section}")
+    return _sha256_text_file_lf_normalized(config_path)
+
+
+def _local_test_config_path(feature: str, config: str) -> Path:
+    feature_name = feature.strip()
+    if not feature_name:
+        raise RuntimeError("test feature is required")
+    if Path(feature_name).name != feature_name or feature_name in {".", ".."}:
+        raise RuntimeError("test feature must be a single feature name")
+    config_dir = Path("tests") / "configs" / "ble" / feature_name
+    if not config_dir.is_dir():
+        raise RuntimeError(f"test feature config directory does not exist: {config_dir}")
+    config_name = (config or "default").strip().replace("\\", "/")
+    if not config_name.endswith(".json"):
+        config_name = f"{config_name}.json"
+    relative = Path(config_name)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise RuntimeError("test config must be a single relative config path")
+    resolved = (config_dir / relative).resolve()
+    try:
+        resolved.relative_to(config_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError("test config must stay beneath the selected feature directory") from exc
+    return resolved
+
+
 def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
     payloads: dict[str, str] = {}
     for key, image in (("dut_img", request.firmware.dut_img), ("tester_img", request.firmware.tester_img)):
@@ -617,8 +1390,13 @@ def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
     return payloads
 
 
-def _print_measurement_result(result: MeasurementResult) -> None:
-    print(f"{result.measurement_id}: {result.state.value} {result.progress_percent}%")
+def _print_measurement_result(
+    result: MeasurementResult,
+    *,
+    colors: ColorFormatter | None = None,
+) -> None:
+    colors = colors or color_formatter("never")
+    print(f"{result.measurement_id}: {colors.state(result.state)} {result.progress_percent}%")
     if result.identity is not None:
         print(f"run_name: {result.identity.run_name}")
         print(f"created_at: {result.identity.created_at.isoformat()}")
@@ -629,23 +1407,362 @@ def _print_measurement_result(result: MeasurementResult) -> None:
         print(f"artifact {artifact.name}: {location}")
 
 
-def _poll_test_progress(client: CMSClient, measurement_id: str, poll_interval_s: float = 1.0) -> MeasurementResult:
-    terminal_states = {
-        MeasurementState.PASSED,
-        MeasurementState.FAILED,
-        MeasurementState.CANCELLED,
-        MeasurementState.REJECTED,
+def _local_parameters_path(feature: str) -> Path:
+    feature_name = feature.strip()
+    if not feature_name:
+        raise RuntimeError("test feature is required")
+    if Path(feature_name).name != feature_name or feature_name in {".", ".."}:
+        raise RuntimeError("test feature must be a single feature name")
+    parameters_path = Path("tests") / "configs" / "ble" / feature_name / "parameters.json"
+    if not parameters_path.is_file():
+        raise RuntimeError(f"test feature parameters do not exist: {parameters_path}")
+    return parameters_path
+
+
+def _preview_job_count(
+    args: argparse.Namespace,
+    variable_filters: tuple[VariableFilter, ...],
+) -> int:
+    from test_orchestrator import build_jobs
+
+    config_root = Path("tests") / "configs" / "ble" / args.feature
+    exact_config = "" if args.config_name == "default" else args.config_name
+    discovery_mode = "all" if exact_config else args.mode
+    jobs = build_jobs(
+        [config_root],
+        mode=discovery_mode,
+        feature_filters={args.feature},
+        partition_filters=set(),
+        exact_config=exact_config,
+        variable_filters=variable_filters,
+    )
+    return len(jobs)
+
+
+def _print_test_preview(
+    args: argparse.Namespace,
+    variable_filters: tuple[VariableFilter, ...] = (),
+) -> None:
+    config_path = _local_test_config_path(args.feature, args.config_name)
+    config_hash = _validate_local_test_config(args.feature, args.config_name)
+    parameters_path = _local_parameters_path(args.feature)
+    validate_variable_filters(parameters_path, variable_filters)
+    expected_job_count = _preview_job_count(args, variable_filters)
+    print("test preview")
+    print(f"mode: {args.mode}")
+    print(f"feature: {args.feature}")
+    print(f"config: {args.config_name}")
+    print(f"config_path: {config_path}")
+    print(f"config_hash: {config_hash}")
+    if variable_filters:
+        print(
+            "variables: "
+            + ", ".join(f"{item.name}={item.value}" for item in variable_filters)
+        )
+    print(f"expected_jobs: {expected_job_count}")
+    print("available_variables:")
+    for line in variable_help_text(parameters_path).splitlines():
+        print(f"  {line}")
+    if args.run_name:
+        print(f"run_name: {args.run_name}")
+    destination = "database" if args.upload_results_to_database else "cms_client"
+    print(f"results_destination: {destination}")
+
+
+def _failed_test_records_from_job_results(records: list[dict[str, Any]]) -> list[dict[str, str]]:
+    failed: list[dict[str, str]] = []
+    for record in records:
+        if record.get("record_type") != "job_completed":
+            continue
+        if record.get("status") != "failed":
+            continue
+        failed.append(
+            {
+                "job_id": str(record.get("job_id", "")),
+                "feature": str(record.get("feature", "")),
+                "config": str(record.get("config", "")),
+                "mode": str(record.get("mode", "")),
+                "partition": str(record.get("partition", "")),
+                "config_hash": str(record.get("config_hash", "")),
+            }
+        )
+    return failed
+
+
+def _rerun_command(failed_test: dict[str, str]) -> str:
+    feature = failed_test["feature"]
+    config = Path(failed_test["config"]).stem
+    return f"cms TEST default {feature} --config-name {config}"
+
+
+def _print_failed_tests(
+    measurement_id: str,
+    failed_tests: list[dict[str, str]],
+    *,
+    as_json: bool = False,
+) -> None:
+    records = [
+        {
+            **failed_test,
+            "rerun_command": _rerun_command(failed_test),
+        }
+        for failed_test in failed_tests
+    ]
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "measurement_id": measurement_id,
+                    "failed_tests": records,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    print(f"failed tests for {measurement_id}: {len(records)}")
+    if not records:
+        return
+    for index, failed_test in enumerate(records, start=1):
+        partition = failed_test["partition"] or "-"
+        print(
+            f"{index}. {failed_test['feature']} {failed_test['config']} "
+            f"mode={failed_test['mode'] or '-'} partition={partition} "
+            f"hash={failed_test['config_hash'] or '-'}"
+        )
+        print(f"   rerun: {failed_test['rerun_command']}")
+
+
+def _print_operator_recipes(args: argparse.Namespace) -> None:
+    feature = args.feature
+    config_name = args.config_name
+    measurement_id = args.measurement_id
+    cursor = args.cursor
+    out_dir = args.out_dir
+    print("Default config:")
+    print(f"  cms TEST default {feature} --config-name default --preview")
+    print(f"  cms TEST default {feature} --config-name default --out-dir {out_dir}")
+    print()
+    print("Exact named config:")
+    print(f"  cms TEST default {feature} --config-name {config_name} --preview")
+    print(f"  cms TEST default {feature} --config-name {config_name} --out-dir {out_dir}")
+    print()
+    print("Attach or reconnect:")
+    print("  cms WATCH")
+    print(f"  cms WATCH {measurement_id} --cursor 0")
+    print(f"  cms WATCH {measurement_id} --cursor {cursor}")
+    print(f"  cms WATCH {measurement_id} --cursor {cursor} --verbose")
+    print()
+    print("Cancel the real run:")
+    print("  cms CANCEL")
+    print("  cms WATCH")
+    print()
+    print("Find failed tests to rerun:")
+    print(f"  cms FAILED {measurement_id}")
+    print(f"  cms FAILED {measurement_id} --json")
+    print()
+    print("Download artifacts by measurement ID:")
+    print(f"  cms ARTIFACTS {measurement_id} --out-dir {out_dir}")
+
+
+def _print_exit_codes() -> None:
+    descriptions = {
+        CMSCLIExitCode.SUCCESS: "command succeeded or watched measurement passed",
+        CMSCLIExitCode.TEST_FAILED: "completed test failure",
+        CMSCLIExitCode.USAGE_ERROR: "client usage error",
+        CMSCLIExitCode.TEST_CANCELLED: "measurement cancelled",
+        CMSCLIExitCode.TEST_REJECTED: "measurement request rejected",
+        CMSCLIExitCode.CONNECTION_FAILURE: "connection failure",
+        CMSCLIExitCode.PROTOCOL_MISMATCH: "protocol mismatch",
+        CMSCLIExitCode.CLIENT_ERROR: "daemon, client, configuration, or operational error",
     }
-    last_progress = None
-    while True:
-        result = client.get_measurement(measurement_id)
-        progress_key = (result.state, result.progress_percent, result.message)
-        if progress_key != last_progress:
-            _print_measurement_result(result)
-            last_progress = progress_key
-        if result.state in terminal_states:
-            return result
-        time.sleep(poll_interval_s)
+    for code in CMSCLIExitCode:
+        print(f"{int(code)} {code.name}: {descriptions[code]}")
+
+
+def _troubleshooting_topics() -> dict[str, tuple[str, tuple[str, ...]]]:
+    return {
+        "health": (
+            "health warnings",
+            (
+                "Run cms health first, then read each failed or warning check by name.",
+                "Fix daemon_startup, runtime_storage, artifact_storage, bench_config, and tool checks before submitting tests.",
+                "A runtime filesystem warning on Windows can be expected for hardware-free development.",
+            ),
+        ),
+        "hardware-mappings": (
+            "missing hardware mappings",
+            (
+                "Check cms_bench_runtime.json for board, device, DUT probe, tester probe, serial ports, and Joulescope mapping.",
+                "Run cms health again after editing bench-local mappings.",
+                "Do not try to repair bench hardware mappings from cms_client_config.json.",
+            ),
+        ),
+        "firmware": (
+            "stale or missing firmware",
+            (
+                "Run cms BUILD, then cms SEND_FW before cms TEST.",
+                "If SEND_FW rejects hashes or xapi provenance, rebuild and restage firmware.",
+                "TEST uses the most recently staged firmware; it does not upload firmware by itself.",
+            ),
+        ),
+        "configs": (
+            "unavailable named configs",
+            (
+                "Run cms tests and confirm the feature and config are advertised.",
+                "Run cms TEST <mode> <feature> --config-name <name> --preview before submitting.",
+                "The client and bench reject missing, malformed, path-traversal, and hash-mismatched configs before hardware execution.",
+            ),
+        ),
+        "daemon": (
+            "daemon connection failures",
+            (
+                "Check cms_client_config.json daemon.base_url or pass --base-url.",
+                "Run cms health with the same --base-url and --api-token options you use for TEST.",
+                "Exit code 5 means the daemon is unreachable or timed out; exit code 6 means protocol mismatch.",
+            ),
+        ),
+        "truncated-output": (
+            "truncated live output",
+            (
+                "WATCH continues from the oldest retained cursor when verbose console output is truncated.",
+                "Structured summary, counts, current test, and failed identities do not depend on retained console text.",
+                "Use cms WATCH <measurement_id> --verbose for retained stdout/stderr details.",
+            ),
+        ),
+        "stalled-setup": (
+            "stalled hardware setup",
+            (
+                "Watch lifecycle events with cms WATCH <measurement_id> --verbose.",
+                "Look for the last setup step that started without a completion record.",
+                "The bench execution timeout should report a terminal failure instead of hanging forever.",
+            ),
+        ),
+        "artifacts": (
+            "missing artifacts",
+            (
+                "Use cms ARTIFACTS <measurement_id> --out-dir artifacts; do not rely on last.",
+                "Artifacts are published only after the measurement reaches a terminal state.",
+                "Use cms FAILED <measurement_id> when you need failed test identities for rerun.",
+            ),
+        ),
+    }
+
+
+def _print_troubleshooting(topic: str = "all") -> None:
+    topics = _troubleshooting_topics()
+    selected = topics.items() if topic == "all" else [(topic, topics[topic])]
+    for index, (_key, (title, lines)) in enumerate(selected):
+        if index:
+            print()
+        print(f"{title}:")
+        for line in lines:
+            print(f"  - {line}")
+
+
+def _resolve_watch_measurement_id(client: CMSClient, requested_measurement_id: str) -> str:
+    measurement_id = requested_measurement_id.strip()
+    if measurement_id:
+        return measurement_id
+    measurement_id = client.get_active_measurement_id()
+    if measurement_id is None:
+        raise RuntimeError("the CMS daemon has no active measurement")
+    return measurement_id
+
+
+def _measurement_summary_key(summary: MeasurementSummary) -> tuple[Any, ...]:
+    return (
+        summary.state,
+        summary.counts,
+        summary.current_test,
+        summary.failed_tests,
+    )
+
+
+def _print_measurement_summary(
+    summary: MeasurementSummary,
+    *,
+    colors: ColorFormatter | None = None,
+) -> None:
+    colors = colors or color_formatter("never")
+    counts = summary.counts
+    print(f"{summary.measurement_id}: {colors.state(summary.state)}")
+    print(
+        "tests: "
+        f"total={counts.total} completed={counts.completed} "
+        f"passed={colors.color(counts.passed, 'passed')} "
+        f"failed={colors.color(counts.failed, 'failed')} "
+        f"skipped={colors.color(counts.skipped, 'skipped')} "
+        f"remaining={colors.color(counts.remaining, 'running')}"
+    )
+    if summary.current_test is not None:
+        current = summary.current_test
+        print(
+            f"current: {current.ordinal}/{current.total_jobs} "
+            f"{current.feature} {current.config}"
+        )
+    if summary.failed_tests:
+        print("failed tests:")
+        for failed in summary.failed_tests:
+            print(
+                f"  {failed.ordinal}/{failed.total_jobs} "
+                f"{failed.feature} {failed.config}"
+            )
+
+
+def _print_verbose_event_page(
+    page: MeasurementEventPage,
+    *,
+    colors: ColorFormatter | None = None,
+) -> None:
+    colors = colors or color_formatter("never")
+    for event in page.events:
+        timestamp = event.timestamp.isoformat()
+        if event.event_type == "console":
+            source = str(event.details.get("source", "console"))
+            text = str(event.details.get("text", ""))
+            for line in text.splitlines() or [""]:
+                print(f"{colors.color(timestamp, 'dim')} [{source}] {line}")
+            continue
+        state = str(event.details.get("state", event.event_type))
+        print(f"{colors.color(timestamp, 'dim')} [event] {colors.color(state, state_role(state))}")
+
+
+def _watch_remote_measurement(
+    client: CMSClient,
+    measurement_id: str,
+    *,
+    after_cursor: EventCursor = EventCursor(),
+    verbose: bool = False,
+    poll_interval_s: float = 1.0,
+    colors: ColorFormatter | None = None,
+) -> MeasurementWatchState:
+    colors = colors or color_formatter("never")
+    state = MeasurementWatchState(measurement_id, cursor=after_cursor)
+    last_summary_key: tuple[Any, ...] | None = None
+
+    def render_summary(summary: MeasurementSummary) -> None:
+        nonlocal last_summary_key
+        summary_key = _measurement_summary_key(summary)
+        if summary_key != last_summary_key:
+            _print_measurement_summary(summary, colors=colors)
+            last_summary_key = summary_key
+
+    def render_truncation(oldest_retained_cursor: EventCursor) -> None:
+        print(
+            colors.color("warning:", "warning")
+            + " verbose console output was truncated; "
+            f"continuing from cursor {oldest_retained_cursor.value}"
+        )
+
+    return watch_measurement(
+        client,
+        state,
+        poll_interval_s=poll_interval_s,
+        on_summary=render_summary,
+        on_events=(lambda page: _print_verbose_event_page(page, colors=colors)) if verbose else None,
+        on_truncation=render_truncation,
+    )
 
 
 if __name__ == "__main__":
