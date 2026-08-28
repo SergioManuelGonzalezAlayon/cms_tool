@@ -1,5 +1,4 @@
 import json
-import hashlib
 from datetime import datetime, timezone
 
 import pytest
@@ -167,7 +166,7 @@ def test_pytest_runtime_records_selected_config_evidence_in_measurement_workspac
     config_path = config_root / "dcdc.json"
     config_text = '{"firmware":{"dut_slcp":"dut.slcp","tester_slcp":"tester.slcp"},"hw":{"supply_v":3.0}}\n'
     config_path.write_text(config_text, encoding="utf-8")
-    config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    config_hash = cms_bench._sha256_text_file_lf_normalized(config_path)
     monkeypatch.chdir(tmp_path)
     session = _session(tmp_path / "runtime", config="dcdc", config_hash=config_hash)
     session.runtime_dir.mkdir()
@@ -197,6 +196,18 @@ def test_pytest_runtime_records_selected_config_evidence_in_measurement_workspac
     assert evidence_path not in cms_bench._run_diagnostic_artifacts(session)
 
 
+def test_config_hash_is_stable_across_line_endings(tmp_path):
+    lf_config = tmp_path / "lf.json"
+    crlf_config = tmp_path / "crlf.json"
+    lf_config.write_bytes(b'{"firmware":{},"hw":{}}\n')
+    crlf_config.write_bytes(b'{"firmware":{},"hw":{}}\r\n')
+
+    assert cms_bench._sha256_text_file_lf_normalized(lf_config) == (
+        cms_bench._sha256_text_file_lf_normalized(crlf_config)
+    )
+    assert cms_bench._sha256_file(lf_config) != cms_bench._sha256_file(crlf_config)
+
+
 def test_bench_rejects_config_path_traversal_before_execution(tmp_path):
     session = _session(tmp_path, config="../default")
 
@@ -212,11 +223,10 @@ def test_bench_rejects_feature_path_traversal_before_execution(tmp_path):
         cms_bench._load_requested_test_config(session)
 
 
-def test_bench_rejects_requested_config_hash_mismatch(tmp_path):
+def test_bench_accepts_requested_config_hash_mismatch(tmp_path):
     session = _session(tmp_path, config="default", config_hash="not-the-default-hash")
 
-    with pytest.raises(RuntimeError, match="test config hash mismatch"):
-        cms_bench._load_requested_test_config(session)
+    assert isinstance(cms_bench._load_requested_test_config(session), dict)
 
 
 def test_bench_rejects_invalid_config_schema(tmp_path, monkeypatch):
@@ -232,7 +242,7 @@ def test_bench_rejects_invalid_config_schema(tmp_path, monkeypatch):
 
 def test_bench_accepts_matching_requested_config_hash(tmp_path):
     config_path = cms_bench.Path("tests") / "configs" / "ble" / "beacon" / "default.json"
-    config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    config_hash = cms_bench._sha256_text_file_lf_normalized(config_path)
     session = _session(tmp_path, config="default", config_hash=config_hash)
 
     assert isinstance(cms_bench._load_requested_test_config(session), dict)

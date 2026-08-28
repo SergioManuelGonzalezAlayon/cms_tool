@@ -1,0 +1,17 @@
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.slcp text eol=lf
+*.xml text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.xlsx binary
+*.zip binary
+*.s37 binary

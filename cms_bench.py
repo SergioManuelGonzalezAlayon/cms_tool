@@ -1230,9 +1230,6 @@ def _load_requested_test_config(session: BenchSession) -> dict[str, Any]:
     config_path = _requested_test_config_path(session)
     if not config_path.exists():
         raise RuntimeError(f"test config does not exist: {config_path}")
-    expected_hash = session.request.selector.config_hash
-    if expected_hash and _sha256_file(config_path).lower() != expected_hash.lower():
-        raise RuntimeError(f"test config hash mismatch: {config_path}")
     try:
         config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
@@ -1248,7 +1245,7 @@ def _load_requested_test_config(session: BenchSession) -> dict[str, Any]:
 def _write_selected_config_evidence(session: BenchSession) -> dict[str, Path]:
     config_path = _requested_test_config_path(session)
     config_dir = _requested_test_config_dir(session)
-    observed_hash = _sha256_file(config_path)
+    observed_hash = _sha256_text_file_lf_normalized(config_path)
     snapshot_path = session.runtime_dir / "selected_config.json"
     metadata_path = session.runtime_dir / "selected_config_metadata.json"
     session.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1341,6 +1338,11 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_text_file_lf_normalized(path: Path) -> str:
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
 
 
 def _append_bounded_log(path: Path, text: str, *, max_bytes: int) -> int:

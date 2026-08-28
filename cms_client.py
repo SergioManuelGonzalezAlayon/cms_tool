@@ -1329,6 +1329,11 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_text_file_lf_normalized(path: Path) -> str:
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
+
+
 def _validate_local_test_config(feature: str, config: str) -> str:
     config_path = _local_test_config_path(feature, config)
     if not config_path.exists():
@@ -1342,7 +1347,7 @@ def _validate_local_test_config(feature: str, config: str) -> str:
     for section in ("firmware", "hw"):
         if section in config_data and not isinstance(config_data[section], dict):
             raise RuntimeError(f"test config section must be an object: {section}")
-    return _sha256_file(config_path)
+    return _sha256_text_file_lf_normalized(config_path)
 
 
 def _local_test_config_path(feature: str, config: str) -> Path:
