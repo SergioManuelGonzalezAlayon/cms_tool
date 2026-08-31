@@ -104,6 +104,10 @@ config path, config hash, and result destination. It does not contact the daemon
 and does not use the bench. Continue only when the displayed config is exactly
 the one you intend to run.
 
+For CMS Bench runs, result upload is selected by mode. `default`,
+`full_sweep`, and `diff` tests upload results to the configured database by
+default. `debug` tests do not upload results to the database.
+
 7. Run the default config and watch it until completion.
 
 ```text
@@ -235,9 +239,9 @@ This reads structured `orchestrator_results.jsonl` records from the published
 measurement artifacts. It reports the failed feature, config, mode, partition,
 config hash, and a rerun command for each failed job.
 
-The normal result destination is the CMS Client artifact download path. Add
-`--upload-results-to-database` to `cms TEST` only when the measurement results
-should also be sent through the database/data-lake path.
+The normal result destination for non-debug CMS Bench tests is the configured
+database path. `debug` tests keep the result destination local to the CMS Client
+artifact workflow. The selected mode controls the effective upload behavior.
 
 19. Print stable CLI exit codes for scripts and troubleshooting.
 
@@ -724,6 +728,11 @@ using the most recently staged firmware request. The request body contains:
 - optional request ID
 - `upload_results_to_database`
 
+The client sets `upload_results_to_database` to `true` for `default`,
+`full_sweep`, and `diff`, and to `false` for `debug`. The daemon applies the
+same policy again before bench execution, so older clients that omit or send an
+old flag value still follow the bench-side rule.
+
 After the daemon accepts the test, the client polls until the result state is
 terminal:
 
@@ -831,8 +840,9 @@ architecture pieces are still in progress:
 - `send_firmware()` sends local files as base64 JSON payloads, which is simple
   for bringup but not the final large-artifact transfer strategy.
 - `cms TEST` depends on a previous successful `cms SEND_FW`.
-- Database upload is represented as a request flag and passed to the daemon/test
-  flow; the client does not upload results itself.
+- Database upload is mode-based for CMS Bench tests. Non-debug tests request
+  database upload by default; debug tests do not. The client does not upload
+  results itself.
 
 ## Design Rule
 

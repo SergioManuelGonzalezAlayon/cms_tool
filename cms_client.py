@@ -205,7 +205,6 @@ class CMSClient:
         mode: MeasurementMode,
         feature: str,
         config: str = "default",
-        upload_results_to_database: bool = False,
         run_name: str = "",
         variable_filters: tuple[VariableFilter, ...] = (),
     ) -> MeasurementResult:
@@ -224,7 +223,7 @@ class CMSClient:
                     for item in variable_filters
                 ],
                 "run_name": run_name,
-                "upload_results_to_database": upload_results_to_database,
+                "upload_results_to_database": _should_upload_results_to_database(mode),
             },
         )
         return measurement_result_from_dict(payload)
@@ -461,6 +460,11 @@ def _observation_path(path: str, **query: str) -> str:
         "protocol_version": str(CMS_OBSERVATION_PROTOCOL_VERSION),
     }
     return f"{path}?{urllib.parse.urlencode(parameters)}"
+
+
+def _should_upload_results_to_database(mode: MeasurementMode | str) -> bool:
+    measurement_mode = mode if isinstance(mode, MeasurementMode) else MeasurementMode(str(mode))
+    return measurement_mode is not MeasurementMode.DEBUG
 
 
 def _validate_observation_envelope(
@@ -740,12 +744,15 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms TEST default beacon --config-name default --preview\n"
             "  cms TEST default beacon --config-name default --out-dir artifacts\n"
             "  cms TEST default beacon --config-name dcdc --preview\n"
-            "  cms TEST default beacon --config-name dcdc --upload-results-to-database\n"
+            "  cms TEST debug beacon --config-name default --preview\n"
             "  cms TEST full_sweep beacon --variable phy=2m --preview\n"
             "  cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
             "Required arguments:\n"
             "  mode      debug, default, full_sweep, or diff\n"
             "  feature   BLE feature name such as beacon\n\n"
+            "Database policy:\n"
+            "  default, full_sweep, and diff runs upload results to the configured database by default.\n"
+            "  debug runs do not upload results to the database.\n\n"
             "Variable filters:\n"
             "  Use --variable name=value to target generated configs by parameter.\n"
             "  Names and values come from the selected feature's parameters.json.\n"
@@ -796,15 +803,6 @@ def build_cli_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="seconds between observation polls",
     )
-    test.add_argument(
-        "--send-to-database",
-        "--upload-results-to-database",
-        action="store_true",
-        dest="upload_results_to_database",
-        help="also upload generated result JSON files to the configured database/data lake",
-    )
-
-
     measurement = subparsers.add_parser(
         "measurement",
         help="show measurement status",
@@ -1076,7 +1074,6 @@ def _main(argv: list[str] | None = None) -> int:
             args.feature,
             config=args.config_name,
             run_name=args.run_name,
-            upload_results_to_database=args.upload_results_to_database,
             variable_filters=variable_filters,
         )
         if not result.measurement_id:
@@ -1465,7 +1462,7 @@ def _print_test_preview(
         print(f"  {line}")
     if args.run_name:
         print(f"run_name: {args.run_name}")
-    destination = "database" if args.upload_results_to_database else "cms_client"
+    destination = "database" if _should_upload_results_to_database(args.mode) else "cms_client"
     print(f"results_destination: {destination}")
 
 

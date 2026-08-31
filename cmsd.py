@@ -42,6 +42,7 @@ from cms_protocol import (
     BenchState,
     EventCursor,
     MeasurementEventPage,
+    MeasurementMode,
     MeasurementSummary,
     MeasurementState,
     MeasurementRequest,
@@ -77,6 +78,11 @@ PUBLISHABLE_DIAGNOSTIC_NAMES = frozenset(
         "test_stderr.log",
     }
 )
+
+
+def _should_upload_results_to_database(mode: MeasurementMode | str) -> bool:
+    measurement_mode = mode if isinstance(mode, MeasurementMode) else MeasurementMode(str(mode))
+    return measurement_mode is not MeasurementMode.DEBUG
 
 
 def _default_runtime_root() -> Path:
@@ -646,7 +652,7 @@ class CMSDaemon:
         config: str = "default",
         config_hash: str = "",
         run_name: str = "",
-        upload_results_to_database: bool = False,
+        upload_results_to_database: bool = True,
     ) -> MeasurementResult:
         """Run a test using the most recently staged firmware request."""
 
@@ -665,7 +671,7 @@ class CMSDaemon:
         request.selector.feature = feature
         request.selector.config = config
         request.selector.config_hash = config_hash
-        request.upload_results_to_database = upload_results_to_database
+        request.upload_results_to_database = _should_upload_results_to_database(request.mode)
         request.identity = None
         request.request_id = ""
         self._assign_execution_identity(request, run_name)
@@ -682,7 +688,7 @@ class CMSDaemon:
         config_hash: str = "",
         variable_filters: tuple[VariableFilter, ...] = (),
         run_name: str = "",
-        upload_results_to_database: bool = False,
+        upload_results_to_database: bool = True,
     ) -> MeasurementResult:
         """Start a test in the background using the most recently staged firmware."""
 
@@ -703,7 +709,7 @@ class CMSDaemon:
         request.selector.config = config
         request.selector.config_hash = config_hash
         request.selector.variable_filters = variable_filters
-        request.upload_results_to_database = upload_results_to_database
+        request.upload_results_to_database = _should_upload_results_to_database(request.mode)
         request.identity = None
         request.request_id = ""
         identity = self._assign_execution_identity(request, run_name)
@@ -839,6 +845,8 @@ class CMSDaemon:
         identity_assigned: bool = False,
     ) -> MeasurementResult:
         """Run one V1 synchronous measurement path."""
+
+        request.upload_results_to_database = _should_upload_results_to_database(request.mode)
 
         if not identity_assigned:
             requested_run_name = request.request_id
@@ -994,7 +1002,7 @@ class CMSDaemon:
                 config_hash=str(request.get("config_hash", "")),
                 variable_filters=variable_filters_from_dicts(request.get("variable_filters")),
                 run_name=str(request.get("run_name", "")),
-                upload_results_to_database=bool(request.get("upload_results_to_database", False)),
+                upload_results_to_database=bool(request.get("upload_results_to_database", True)),
             )
             return measurement_result_to_dict(result)
 

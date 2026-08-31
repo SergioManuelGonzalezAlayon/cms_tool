@@ -286,7 +286,7 @@ class MeasurementRequest:
     firmware: FirmwareData
     mode: MeasurementMode = MeasurementMode.DEFAULT
     requested_by: str = ""
-    upload_results_to_database: bool = False
+    upload_results_to_database: bool = True
     identity: MeasurementIdentity | None = None
 
 
@@ -728,7 +728,7 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
         firmware=firmware_data_from_dict(data.get("firmware", data)),
         mode=MeasurementMode(str(data.get("mode", MeasurementMode.DEFAULT.value))),
         requested_by=str(data.get("requested_by", "")),
-        upload_results_to_database=bool(data.get("upload_results_to_database", False)),
+        upload_results_to_database=bool(data.get("upload_results_to_database", True)),
         identity=measurement_identity_from_dict(identity_data) if identity_data else None,
     )
 
