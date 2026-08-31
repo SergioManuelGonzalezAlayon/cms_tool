@@ -64,16 +64,20 @@ def _safe_component(value: object, *, default: str = "unknown", allow_empty: boo
     return text
 
 
-def _config_path_protocol_and_case(config_path: object) -> tuple[str | None, str | None]:
+def _config_path_storage_parts(config_path: object) -> tuple[str | None, str | None, str | None]:
     if not config_path:
-        return None, None
+        return None, None, None
     parts = Path(str(config_path)).parts
     if "configs" not in parts:
-        return None, None
+        return None, None, None
     index = parts.index("configs")
     protocol = parts[index + 1] if len(parts) > index + 1 else None
     test_case = parts[index + 2] if len(parts) > index + 2 else None
-    return protocol, test_case
+    partition = None
+    if "full_sweep" in parts:
+        full_sweep_index = parts.index("full_sweep")
+        partition = parts[full_sweep_index + 1] if len(parts) > full_sweep_index + 1 else None
+    return protocol, test_case, partition
 
 
 def _record_upload_location(path: Path) -> tuple[str, str]:
@@ -87,13 +91,21 @@ def _record_upload_location(path: Path) -> tuple[str, str]:
     dataset = data.get("dataset", {})
     test_run = data.get("test_run", {})
     firmware = data.get("firmware", {})
-    protocol_from_path, test_case_from_path = _config_path_protocol_and_case(test_run.get("config_path"))
+    protocol_from_path, test_case_from_path, partition_from_path = _config_path_storage_parts(
+        test_run.get("config_path")
+    )
 
+    cms_bench_id = _safe_component(
+        storage.get("cms_bench_id") or dataset.get("cms_bench_id")
+    )
     protocol = _safe_component(
         storage.get("protocol") or protocol_from_path or dataset.get("wireless_stack")
     )
     test_case = _safe_component(
         storage.get("test_case") or test_case_from_path or test_run.get("test_name")
+    )
+    partition_name = _safe_component(
+        storage.get("partition") or dataset.get("partition") or partition_from_path
     )
     part_number = _safe_component(
         storage.get("part_number")
@@ -113,20 +125,24 @@ def _record_upload_location(path: Path) -> tuple[str, str]:
         storage.get("serial_number") or firmware.get("serial_number"),
         allow_empty=True,
     )
-    test_name = _safe_component(storage.get("test_name") or test_run.get("test_name") or path.stem)
+    config_name = _safe_component(
+        storage.get("config_name") or test_run.get("config_name") or path.stem
+    )
     board_dir = f"{board}_{board_revision}"
 
     partition = "/".join(
         [
             "cms",
-            protocol,
-            test_case,
+            cms_bench_id,
             part_number,
             board_dir,
             serial_number,
+            protocol,
+            partition_name,
+            test_case,
         ]
     )
-    return f"{test_name}{path.suffix}", partition
+    return f"{config_name}{path.suffix}", partition
 
 
 def upload_json_to_data_lake(

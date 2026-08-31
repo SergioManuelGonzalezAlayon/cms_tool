@@ -12,6 +12,8 @@ from cms_protocol import ResultType
 
 log = logging.getLogger(__name__)
 
+CMS_BENCH_ID_ENV_VAR = "CURRENT_MEASUREMENT_CMS_BENCH_ID"
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -45,11 +47,21 @@ def _config_protocol_and_test_case(config_path: Path) -> tuple[str, str]:
 def _result_storage_metadata(
     *,
     test_name: str,
+    config_name: str,
     config_path: Path,
     firmware: dict,
+    bench: dict | None = None,
     slcp_meta: dict,
 ) -> dict:
     protocol, test_case = _config_protocol_and_test_case(config_path)
+    _, partition = _config_mode_and_partition(config_path)
+    bench = bench or {}
+    cms_bench_id = (
+        bench.get("bench_id")
+        or firmware.get("cms_bench_id")
+        or firmware.get("bench_id")
+        or os.environ.get(CMS_BENCH_ID_ENV_VAR)
+    )
     board_revision = (
         firmware.get("board_revision")
         or firmware.get("board_rev")
@@ -62,13 +74,16 @@ def _result_storage_metadata(
     )
     return {
         "prefix": "cms",
+        "cms_bench_id": cms_bench_id,
         "protocol": protocol,
         "test_case": test_case or test_name,
+        "partition": partition,
         "part_number": part_number,
         "board": firmware.get("board"),
         "board_revision": board_revision,
         "serial_number": firmware.get("serial_number"),
         "test_name": test_name,
+        "config_name": config_name,
     }
 
 
@@ -361,6 +376,7 @@ def write_result_json(
     capture_policy = _capture_policy(config_path)
     capture_path = _save_capture_npz(profile, out_dir, artifact_stem) if capture_policy["retained"] else None
     firmware = config_data.get("firmware", {})
+    bench = config_data.get("bench", {})
     advertiser = config_data.get("advertiser", {})
     scanner = config_data.get("scanner", {})
     connection = config_data.get("connection", {})
@@ -370,8 +386,10 @@ def write_result_json(
     analyzer = result_paths["analyzer"] if result_paths["note_path"] is None else None
     storage = _result_storage_metadata(
         test_name=test_name,
+        config_name=config_name,
         config_path=config_path,
         firmware=firmware,
+        bench=bench,
         slcp_meta=slcp_meta,
     )
 
