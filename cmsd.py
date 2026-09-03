@@ -209,6 +209,8 @@ class CMSDaemon:
         """Stage or fetch the requested firmware payloads into the runtime area."""
         _stage_firmware_image(request.firmware.dut_img.url, runtime_dir / request.firmware.dut_img.name)
         _stage_firmware_image(request.firmware.tester_img.url, runtime_dir / request.firmware.tester_img.name)
+        for image in request.firmware.dut_variants.values():
+            _stage_firmware_image(image.url, runtime_dir / image.name)
         if request.firmware.xapi_file is not None:
             _stage_firmware_image(
                 request.firmware.xapi_file.url,
@@ -1587,7 +1589,11 @@ def _copy_staged_firmware(
     staged_runtime_dir: Path,
     runtime_dir: Path,
 ) -> None:
-    images = [request.firmware.dut_img, request.firmware.tester_img]
+    images = [
+        request.firmware.dut_img,
+        request.firmware.tester_img,
+        *request.firmware.dut_variants.values(),
+    ]
     if request.firmware.xapi_file is not None:
         images.append(request.firmware.xapi_file)
     if request.firmware.bootloader_img is not None:
@@ -1610,6 +1616,12 @@ def _write_firmware_payloads(
         "dut_img": request.firmware.dut_img,
         "tester_img": request.firmware.tester_img,
     }
+    targets.update(
+        {
+            f"dut_variant:{name}": image
+            for name, image in request.firmware.dut_variants.items()
+        }
+    )
     if request.firmware.xapi_file is not None:
         targets["xapi_file"] = request.firmware.xapi_file
     if request.firmware.bootloader_img is not None:

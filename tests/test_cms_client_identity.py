@@ -100,10 +100,10 @@ def test_test_preview_shows_exact_submission_without_contacting_daemon(capsys, m
     assert "tests\\configs\\ble\\beacon\\dcdc.json" in output or "tests/configs/ble/beacon/dcdc.json" in output
     assert "config_hash:" in output
     assert "expected_jobs: 1" in output
-    assert "results_destination: cms_client" in output
+    assert "results_destination: database" in output
 
 
-def test_test_preview_shows_database_destination(capsys, monkeypatch):
+def test_test_preview_shows_debug_destination(capsys, monkeypatch):
     class Client:
         def run_test(self, *args, **kwargs):
             raise AssertionError("preview must not submit a test")
@@ -113,16 +113,15 @@ def test_test_preview_shows_database_destination(capsys, monkeypatch):
     exit_code = cms_client.main(
         [
             "test",
-            "default",
+            "debug",
             "beacon",
             "--preview",
-            "--upload-results-to-database",
         ]
     )
 
     output = capsys.readouterr().out
     assert exit_code == 0
-    assert "results_destination: database" in output
+    assert "results_destination: cms_client" in output
 
 
 def test_test_preview_shows_variable_filters_from_parameters_json(capsys, monkeypatch):
@@ -390,8 +389,10 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     runtime = build_root / "runtime"
     runtime.mkdir(parents=True)
     dut_image = tmp_path / "dut.s37"
+    no_dcdc_dut_image = tmp_path / "dut-no-dcdc.s37"
     tester_image = tmp_path / "tester.s37"
     dut_image.write_bytes(b"exact-dut-s37")
+    no_dcdc_dut_image.write_bytes(b"exact-no-dcdc-dut-s37")
     tester_image.write_bytes(b"exact-tester-s37")
     dut_hash = hashlib.sha256(dut_image.read_bytes()).hexdigest()
     tester_hash = hashlib.sha256(tester_image.read_bytes()).hexdigest()
@@ -422,6 +423,8 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
         "cms_client._discover_built_firmware",
         lambda role, firmware_cfg: {
             "dut": dut_image,
+            "dut_dcdc": dut_image,
+            "dut_no_dcdc": no_dcdc_dut_image,
             "tester": tester_image,
         }[role],
     )
@@ -444,6 +447,8 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     assert request.firmware.xapi_file_hash == xapi_hash
     assert request.firmware.dut_img.sha256 == dut_hash
     assert request.firmware.tester_img.sha256 == tester_hash
+    assert request.firmware.dut_variants["dcdc"].url == str(dut_image)
+    assert request.firmware.dut_variants["no_dcdc"].url == str(no_dcdc_dut_image)
 
     args.sisdk_version = "2025.12.3"
     with pytest.raises(RuntimeError, match="does not match the firmware build provenance"):

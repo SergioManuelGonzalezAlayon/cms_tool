@@ -238,6 +238,7 @@ class FirmwareData:
     """Firmware references that the daemon stages before execution."""
     dut_img: FirmwareImage
     tester_img: FirmwareImage
+    dut_variants: dict[str, FirmwareImage] = field(default_factory=dict)
     board: str = ""
     device: str = ""
     dut_img_hash: str = ""
@@ -650,6 +651,10 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
     return {
         "dut_img": firmware_image_to_dict(firmware.dut_img),
         "tester_img": firmware_image_to_dict(firmware.tester_img),
+        "dut_variants": {
+            name: firmware_image_to_dict(image)
+            for name, image in firmware.dut_variants.items()
+        },
         "board": firmware.board,
         "device": firmware.device,
         "dut_img_hash": firmware.dut_img_hash,
@@ -676,9 +681,18 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
             name=str(data.get("tester_image_name", "tester.s37")),
             url=str(data.get("tester_image_url", "")),
         )
+    raw_dut_variants = data.get("dut_variants", {})
+    if not isinstance(raw_dut_variants, dict):
+        raise ValueError("dut_variants must be an object")
+    dut_variants = {
+        str(name): image
+        for name, value in raw_dut_variants.items()
+        if (image := firmware_image_from_dict(value)) is not None
+    }
     return FirmwareData(
         dut_img=dut_img,
         tester_img=tester_img,
+        dut_variants=dut_variants,
         board=str(data.get("board", "")),
         device=str(data.get("device", "")),
         dut_img_hash=str(data.get("dut_img_hash", data.get("dut_image_hash", dut_img.sha256))),

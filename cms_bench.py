@@ -485,6 +485,11 @@ class CMSBench:
         tester_path = session.runtime_dir / session.manifest.tester_img.name
         _validate_firmware_file(dut_path, session.manifest.dut_img.sha256 or session.manifest.dut_img_hash)
         _validate_firmware_file(tester_path, session.manifest.tester_img.sha256 or session.manifest.tester_img_hash)
+        for name, image in session.manifest.dut_variants.items():
+            _validate_firmware_file(
+                session.runtime_dir / image.name,
+                image.sha256,
+            )
         if session.manifest.bootloader_img is not None:
             bootloader_path = session.runtime_dir / session.manifest.bootloader_img.name
             _validate_firmware_file(
@@ -767,13 +772,33 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
     config_data = _load_requested_test_config(session)
     selected_config = _write_selected_config_evidence(session)
     firmware = config_data.get("firmware", {})
-    dut_project = build_root / Path(str(firmware.get("dut_slcp", session.manifest.dut_img.name))).stem
     tester_project = build_root / Path(str(firmware.get("tester_slcp", session.manifest.tester_img.name))).stem
-
-    dut_copied_image = _copy_image_to_project(
-        session.runtime_dir / session.manifest.dut_img.name,
-        dut_project,
-    )
+    dut_copied_images: dict[str, Path] = {}
+    if session.manifest.dut_variants:
+        dut_projects = {
+            "dcdc": build_root / "ncp_ble_dut_dcdc",
+            "no_dcdc": build_root / "ncp_ble_dut",
+        }
+        missing_variants = set(dut_projects) - set(session.manifest.dut_variants)
+        if missing_variants:
+            raise RuntimeError(
+                "staged firmware is missing DUT variants: "
+                + ", ".join(sorted(missing_variants))
+            )
+        for name, project in dut_projects.items():
+            image = session.manifest.dut_variants[name]
+            dut_copied_images[name] = _copy_image_to_project(
+                session.runtime_dir / image.name,
+                project,
+            )
+    else:
+        dut_project = build_root / Path(
+            str(firmware.get("dut_slcp", session.manifest.dut_img.name))
+        ).stem
+        dut_copied_images["default"] = _copy_image_to_project(
+            session.runtime_dir / session.manifest.dut_img.name,
+            dut_project,
+        )
     tester_copied_image = _copy_image_to_project(
         session.runtime_dir / session.manifest.tester_img.name,
         tester_project,
@@ -817,10 +842,23 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
             "tester_image": str(session.runtime_dir / session.manifest.tester_img.name),
             "dut_image_sha256": session.manifest.dut_img.sha256
             or session.manifest.dut_img_hash
-            or _sha256_file(dut_copied_image),
+            or _sha256_file(
+                dut_copied_images["dcdc"]
+                if "dcdc" in dut_copied_images
+                else dut_copied_images["default"]
+            ),
             "tester_image_sha256": session.manifest.tester_img.sha256
             or session.manifest.tester_img_hash
             or _sha256_file(tester_copied_image),
+            "dut_variants": {
+                name: {
+                    "image": str(image),
+                    "sha256": session.manifest.dut_variants[name].sha256
+                    or _sha256_file(image),
+                }
+                for name, image in dut_copied_images.items()
+                if name in session.manifest.dut_variants
+            },
             "dut_slcp": str(firmware.get("dut_slcp", "")),
             "tester_slcp": str(firmware.get("tester_slcp", "")),
             "bootloader_image": str(bootloader_copied_image) if bootloader_copied_image is not None else "",

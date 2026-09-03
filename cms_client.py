@@ -1173,7 +1173,8 @@ def _request_from_send_fw_args(
     dut_image_arg = args.dut_image or str(target_cfg.get("dut_image", ""))
     tester_image_arg = args.tester_image or str(target_cfg.get("tester_image", ""))
     bootloader_image_arg = args.bootloader_image or str(target_cfg.get("bootloader_image", ""))
-    dut_image = _firmware_image_from_arg(dut_image_arg, "dut", firmware_cfg)
+    dut_image = _firmware_image_from_arg(dut_image_arg, "dut_dcdc", firmware_cfg)
+    no_dcdc_dut_image = _firmware_image_from_arg("", "dut_no_dcdc", firmware_cfg)
     tester_image = _firmware_image_from_arg(tester_image_arg, "tester", firmware_cfg)
     bootloader_image = _firmware_image_from_arg(
         bootloader_image_arg,
@@ -1184,6 +1185,11 @@ def _request_from_send_fw_args(
         dut_image,
         requested=args.dut_sha256,
         fallback=str(target_cfg.get("dut_sha256", firmware_cfg.get("dut_app_hash", ""))),
+    )
+    no_dcdc_dut_sha256 = _selected_firmware_sha256(
+        no_dcdc_dut_image,
+        requested="",
+        fallback="",
     )
     tester_sha256 = _selected_firmware_sha256(
         tester_image,
@@ -1223,6 +1229,18 @@ def _request_from_send_fw_args(
                 url=tester_image["url"],
                 sha256=tester_sha256,
             ),
+            dut_variants={
+                "dcdc": FirmwareImage(
+                    name=dut_image["name"],
+                    url=dut_image["url"],
+                    sha256=dut_sha256,
+                ),
+                "no_dcdc": FirmwareImage(
+                    name=no_dcdc_dut_image["name"],
+                    url=no_dcdc_dut_image["url"],
+                    sha256=no_dcdc_dut_sha256,
+                ),
+            },
             bootloader_img=FirmwareImage(
                 name=bootloader_image["name"],
                 url=bootloader_image["url"],
@@ -1280,6 +1298,8 @@ def _discover_built_firmware(role: str, firmware_cfg: dict[str, Any]) -> Path:
     build_root = Path(str(firmware_cfg.get("build_root", ".fw_build")))
     candidates_by_role = {
         "dut": ["ncp_ble_dut_dcdc", "ncp_ble_dut"],
+        "dut_dcdc": ["ncp_ble_dut_dcdc"],
+        "dut_no_dcdc": ["ncp_ble_dut"],
         "tester": ["ncp_ble_tester"],
         "bootloader": ["bootloader-uart-bgapi"],
     }
@@ -1376,6 +1396,10 @@ def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
         path = Path(image.url)
         if path.exists() and path.is_file():
             payloads[key] = base64.b64encode(path.read_bytes()).decode("ascii")
+    for name, image in request.firmware.dut_variants.items():
+        path = Path(image.url)
+        if path.exists() and path.is_file():
+            payloads[f"dut_variant:{name}"] = base64.b64encode(path.read_bytes()).decode("ascii")
     if request.firmware.bootloader_img is not None:
         path = Path(request.firmware.bootloader_img.url)
         if path.exists() and path.is_file():
