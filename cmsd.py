@@ -618,6 +618,7 @@ class CMSDaemon:
             )
             if not self.bench.fw_is_valid(session):
                 raise RuntimeError(_validation_failure_message(session))
+            self.bench.persist_staged_firmware_provenance(session)
             result = MeasurementResult(
                 measurement_id=request.request_id,
                 state=MeasurementState.ACCEPTED,

@@ -248,6 +248,7 @@ class FirmwareData:
     xapi_file: FirmwareImage | None = None
     xapi_file_hash: str = ""
     git_commit: str = ""
+    sisdk_name: str = ""
     sisdk_source: str = ""
     sisdk_version: str = ""
     sisdk_commit: str = ""
@@ -665,6 +666,7 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
         "xapi_file": firmware_image_to_dict(firmware.xapi_file),
         "xapi_file_hash": firmware.xapi_file_hash,
         "git_commit": firmware.git_commit,
+        "sisdk_name": firmware.sisdk_name,
         "sisdk_source": firmware.sisdk_source,
         "sisdk_version": firmware.sisdk_version,
         "sisdk_commit": firmware.sisdk_commit,
@@ -703,6 +705,7 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         xapi_file=firmware_image_from_dict(data.get("xapi_file")),
         xapi_file_hash=str(data.get("xapi_file_hash", "")),
         git_commit=str(data.get("git_commit", "")),
+        sisdk_name=str(data.get("sisdk_name", "")),
         sisdk_source=str(data.get("sisdk_source", "")),
         sisdk_version=str(data.get("sisdk_version", "")),
         sisdk_commit=str(data.get("sisdk_commit", "")),

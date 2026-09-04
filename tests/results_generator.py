@@ -382,6 +382,8 @@ def write_result_json(
     connection = config_data.get("connection", {})
     pawr = config_data.get("pawr", {})
     slcp_meta = _read_slcp_metadata(firmware.get("dut_slcp"))
+    sdk_name = firmware.get("sisdk_name") or slcp_meta["sdk_name"]
+    sdk_version = firmware.get("sisdk_version") or slcp_meta["sdk_version"]
     mode, partition = _config_mode_and_partition(config_path)
     analyzer = result_paths["analyzer"] if result_paths["note_path"] is None else None
     storage = _result_storage_metadata(
@@ -433,8 +435,8 @@ def write_result_json(
             "board_id": firmware.get("board"),
             "board_revision": storage["board_revision"],
             "part_number": storage["part_number"],
-            "sdk_name": slcp_meta["sdk_name"],
-            "sdk_version": slcp_meta["sdk_version"],
+            "sdk_name": sdk_name,
+            "sdk_version": sdk_version,
             "campaign_id": campaign_id,
             "mode": mode,
             "partition": partition,
@@ -459,8 +461,12 @@ def write_result_json(
             "part_number": storage["part_number"],
             "device": firmware.get("device"),
             "serial_number": storage["serial_number"],
-            "dut_sdk_name": slcp_meta["sdk_name"],
-            "dut_sdk_version": slcp_meta["sdk_version"],
+            "dut_sdk_name": sdk_name,
+            "dut_sdk_version": sdk_version,
+            "dut_sdk_source": firmware.get("sisdk_source"),
+            "dut_sdk_commit": firmware.get("sisdk_commit"),
+            "dut_sdk_hash": firmware.get("sisdk_hash"),
+            "dut_xapi_sha256": firmware.get("xapi_file_hash"),
             "dut_chip_id": slcp_meta["chip_id"],
             "tester_sdk_name": None,
             "tester_sdk_version": None,

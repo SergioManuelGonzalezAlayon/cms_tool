@@ -71,7 +71,16 @@ def test_generated_json_declares_current_measurement_result_type(tmp_path, monke
         test_name="beacon",
         config_name="default",
         config_path=config_path,
-        config_data={},
+        config_data={
+            "firmware": {
+                "sisdk_name": "com.silabs.sdk.stack.sisdk",
+                "sisdk_version": "2025.12.3",
+                "sisdk_source": "client_config_package_path",
+                "sisdk_commit": "sdk-commit",
+                "sisdk_hash": "sdk-hash",
+                "xapi_file_hash": "xapi-hash",
+            }
+        },
         result_paths={
             "analyzer": None,
             "note_path": None,
@@ -84,4 +93,9 @@ def test_generated_json_declares_current_measurement_result_type(tmp_path, monke
         supply_v=3.0,
     )
 
-    assert json.loads(result_path.read_text(encoding="utf-8"))["result_type"] == "current_measurement"
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["result_type"] == "current_measurement"
+    assert payload["dataset"]["sdk_name"] == "com.silabs.sdk.stack.sisdk"
+    assert payload["dataset"]["sdk_version"] == "2025.12.3"
+    assert payload["firmware"]["dut_sdk_source"] == "client_config_package_path"
+    assert payload["firmware"]["dut_xapi_sha256"] == "xapi-hash"

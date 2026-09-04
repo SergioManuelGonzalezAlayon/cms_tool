@@ -112,7 +112,18 @@ def Config(request: pytest.FixtureRequest) -> dict:
         if not value:
             pytest.fail(f"Missing firmware metadata. {key}")
         fw[key] = value
-    for key in ("board_rev", "board_revision", "part_number", "serial_number"):
+    for key in (
+        "board_rev",
+        "board_revision",
+        "part_number",
+        "serial_number",
+        "sisdk_name",
+        "sisdk_source",
+        "sisdk_version",
+        "sisdk_commit",
+        "sisdk_hash",
+        "xapi_file_hash",
+    ):
         value = dev_fw.get(key)
         if value:
             fw[key] = value

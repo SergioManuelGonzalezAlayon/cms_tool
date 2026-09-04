@@ -1199,12 +1199,29 @@ def _request_from_send_fw_args(
         if bootloader_image is not None
         else ""
     )
-    xapi_file = Path(str(fw_data.get("build", {}).get("xapi", build_root / "runtime" / "sl_bt.xapi")))
+    sdk_package_path = Path(str(sdk_cfg.get("package_path", "")))
+    if not sdk_package_path.is_dir():
+        raise RuntimeError(
+            "Selected firmware build does not record a usable SiSDK package path: "
+            f"{sdk_package_path}"
+        )
+    sisdk_name = _sisdk_name_from_properties(sdk_package_path)
+    if not sisdk_name:
+        raise RuntimeError(
+            "Selected SiSDK package does not declare an SDK id in .properties: "
+            f"{sdk_package_path}"
+        )
+    xapi_file = sdk_package_path / "bluetooth_le_host" / "api" / "sl_bt.xapi"
     if not xapi_file.is_file():
-        raise RuntimeError(f"Staged sl_bt.xapi from the selected build does not exist: {xapi_file}")
+        raise RuntimeError(
+            "Selected SiSDK BGAPI definition does not exist: "
+            f"{xapi_file}"
+        )
     xapi_hash = _sha256_file(xapi_file)
     if recorded_xapi_hash != xapi_hash:
-        raise RuntimeError("Staged sl_bt.xapi hash does not match the selected build provenance")
+        raise RuntimeError(
+            "Selected SiSDK BGAPI definition hash does not match the firmware build provenance"
+        )
 
     request_id = args.request_id or f"cms-{int(time.time())}"
     return MeasurementRequest(
@@ -1248,6 +1265,7 @@ def _request_from_send_fw_args(
             ),
             xapi_file_hash=xapi_hash,
             git_commit=args.git_commit,
+            sisdk_name=sisdk_name,
             sisdk_source=sdk_source,
             sisdk_version=sdk_version,
             sisdk_commit=sdk_commit,
@@ -1263,6 +1281,17 @@ def _require_matching_build_provenance(label: str, requested: str, built: str) -
             f"Requested {label} '{requested}' does not match the firmware build provenance '{built}'. "
             "Rebuild with the requested SDK selection before sending firmware."
         )
+
+
+def _sisdk_name_from_properties(sdk_package_path: Path) -> str:
+    properties_path = sdk_package_path / ".properties"
+    if not properties_path.is_file():
+        return ""
+    for line in properties_path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "id" and value.strip():
+            return value.strip()
+    return ""
 
 
 def _run_local_build(args: argparse.Namespace, config_path: str) -> int:

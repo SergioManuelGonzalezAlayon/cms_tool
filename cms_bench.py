@@ -505,6 +505,29 @@ class CMSBench:
         )
         _validate_variable_filtered_campaign(session)
 
+    def persist_staged_firmware_provenance(self, session: BenchSession) -> None:
+        """Record the validated client SDK provenance in persistent bench config."""
+
+        config = _load_json_with_trailing_commas(self.config_path)
+        ble = config.setdefault("ble", {})
+        if not isinstance(ble, dict):
+            raise RuntimeError("cms bench runtime config field 'ble' must be an object")
+        firmware = session.request.firmware
+        ble["sdk"] = {
+            "name": firmware.sisdk_name,
+            "source": firmware.sisdk_source,
+            "version": firmware.sisdk_version,
+            "commit": firmware.sisdk_commit,
+            "hash": firmware.sisdk_hash,
+            "xapi_sha256": firmware.xapi_file_hash,
+        }
+        temporary_path = self.config_path.with_name(self.config_path.name + ".tmp")
+        temporary_path.write_text(
+            json.dumps(config, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, self.config_path)
+
     def test_smoke(self, session: BenchSession) -> None:
         """Run a lightweight preflight before spending time on a full run."""
         if not self.initialized:
@@ -842,6 +865,12 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
             "serial_number": resources.serial_number,
             "device": resources.device,
             "sisdk": session.manifest.sisdk_version,
+            "sisdk_name": session.manifest.sisdk_name,
+            "sisdk_source": session.manifest.sisdk_source,
+            "sisdk_version": session.manifest.sisdk_version,
+            "sisdk_commit": session.manifest.sisdk_commit,
+            "sisdk_hash": session.manifest.sisdk_hash,
+            "xapi_file_hash": session.manifest.xapi_file_hash,
             "dut_image": str(session.runtime_dir / session.manifest.dut_img.name),
             "tester_image": str(session.runtime_dir / session.manifest.tester_img.name),
             "dut_image_sha256": session.manifest.dut_img.sha256
