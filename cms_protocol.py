@@ -288,6 +288,7 @@ class MeasurementRequest:
     mode: MeasurementMode = MeasurementMode.DEFAULT
     requested_by: str = ""
     upload_results_to_database: bool = True
+    debug_artifact_streaming: bool = False
     identity: MeasurementIdentity | None = None
 
 
@@ -724,6 +725,7 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
         "mode": request.mode.value,
         "requested_by": request.requested_by,
         "upload_results_to_database": request.upload_results_to_database,
+        "debug_artifact_streaming": request.debug_artifact_streaming,
     }
 
 
@@ -743,6 +745,7 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
         mode=MeasurementMode(str(data.get("mode", MeasurementMode.DEFAULT.value))),
         requested_by=str(data.get("requested_by", "")),
         upload_results_to_database=bool(data.get("upload_results_to_database", True)),
+        debug_artifact_streaming=bool(data.get("debug_artifact_streaming", False)),
         identity=measurement_identity_from_dict(identity_data) if identity_data else None,
     )
 

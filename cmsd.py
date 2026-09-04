@@ -655,6 +655,7 @@ class CMSDaemon:
         config_hash: str = "",
         run_name: str = "",
         upload_results_to_database: bool = True,
+        debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Run a test using the most recently staged firmware request."""
 
@@ -674,6 +675,7 @@ class CMSDaemon:
         request.selector.config = config
         request.selector.config_hash = config_hash
         request.upload_results_to_database = _should_upload_results_to_database(request.mode)
+        request.debug_artifact_streaming = debug_artifact_streaming
         request.identity = None
         request.request_id = ""
         self._assign_execution_identity(request, run_name)
@@ -691,6 +693,7 @@ class CMSDaemon:
         variable_filters: tuple[VariableFilter, ...] = (),
         run_name: str = "",
         upload_results_to_database: bool = True,
+        debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Start a test in the background using the most recently staged firmware."""
 
@@ -712,6 +715,7 @@ class CMSDaemon:
         request.selector.config_hash = config_hash
         request.selector.variable_filters = variable_filters
         request.upload_results_to_database = _should_upload_results_to_database(request.mode)
+        request.debug_artifact_streaming = debug_artifact_streaming
         request.identity = None
         request.request_id = ""
         identity = self._assign_execution_identity(request, run_name)
@@ -1005,6 +1009,7 @@ class CMSDaemon:
                 variable_filters=variable_filters_from_dicts(request.get("variable_filters")),
                 run_name=str(request.get("run_name", "")),
                 upload_results_to_database=bool(request.get("upload_results_to_database", True)),
+                debug_artifact_streaming=bool(request.get("debug_artifact_streaming", False)),
             )
             return measurement_result_to_dict(result)
 

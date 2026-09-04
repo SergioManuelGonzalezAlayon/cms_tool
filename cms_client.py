@@ -207,6 +207,7 @@ class CMSClient:
         config: str = "default",
         run_name: str = "",
         variable_filters: tuple[VariableFilter, ...] = (),
+        debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
         config_hash = "" if feature == "all" else _validate_local_test_config(feature, config)
@@ -224,6 +225,7 @@ class CMSClient:
                 ],
                 "run_name": run_name,
                 "upload_results_to_database": True,
+                "debug_artifact_streaming": debug_artifact_streaming,
             },
         )
         return measurement_result_from_dict(payload)
@@ -793,6 +795,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="human-readable test run name",
     )
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
+    test.add_argument(
+        "--debug",
+        action="store_true",
+        help="retrieve completed test result artifacts while the measurement is running",
+    )
     test.add_argument(
         "--preview",
         action="store_true",
@@ -1474,6 +1481,7 @@ def _run_test_feature(
         config=args.config_name,
         run_name=args.run_name,
         variable_filters=variable_filters,
+        debug_artifact_streaming=args.debug,
     )
     if not result.measurement_id:
         _print_measurement_result(result, colors=colors)
