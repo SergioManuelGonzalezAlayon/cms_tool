@@ -189,78 +189,32 @@ def validate_firmware_config(effective_config: dict) -> dict[str, str]:
     }
 
 
-def list_installed_sisdks() -> list[dict[str, str]]:
-    result = run(["slt", "list", "simplicity-sdk"], cwd=REPO_ROOT)
-    records: list[dict[str, str]] = []
-    current: dict[str, str] | None = None
-
-    for raw_line in result.stdout.splitlines():
-        line = raw_line.strip()
-        if not line:
-            if current and current.get("version") and current.get("path"):
-                records.append(current)
-            current = None
-            continue
-        if line.startswith("Id: "):
-            if current and current.get("version") and current.get("path"):
-                records.append(current)
-            package_id = line.split(":", 1)[1].strip()
-            current = {"id": package_id}
-            continue
-        if current is None or current.get("id") != "simplicity-sdk":
-            continue
-        if line.startswith("Version: "):
-            current["version"] = line.split(":", 1)[1].strip()
-            continue
-        if line.startswith("Installation:"):
-            current["path"] = ""
-            continue
-        if "path" in current and not current["path"]:
-            current["path"] = line
-
-    if current and current.get("version") and current.get("path"):
-        records.append(current)
-
-    return records
-
-
-def resolve_sisdk_path(version: str) -> Path:
-    matches = [record for record in list_installed_sisdks() if record.get("version") == version]
-    if not matches:
-        raise RuntimeError(
-            f"Requested Simplicity SDK version '{version}' is not installed. "
-            "Install it with `slt install simplicity-sdk --version <version>` "
-            "or update cms_client_config.json target.sisdk."
-        )
-    if len(matches) > 1:
-        paths = ", ".join(record["path"] for record in matches)
-        raise RuntimeError(
-            f"Requested Simplicity SDK version '{version}' resolved to multiple installed paths: {paths}. "
-            "Clean up duplicate installs before running app_manager.py."
-        )
-    sdk_path = Path(matches[0]["path"])
-    if not sdk_path.exists():
-        raise RuntimeError(
-            f"Requested Simplicity SDK version '{version}' resolved to a missing path: {sdk_path}"
-        )
-    
-    sl_bt_xapi : Path = sdk_path / SL_BT_XAPI_PATH
-    if not sl_bt_xapi.exists():
-        raise RuntimeError(
-            f"Requested Simplicity SDK version '{version}' cannot find `sl_bt.xapi`: {sl_bt_xapi}"
-        )
-
-    return sdk_path
-
-
 def _validate_sdk_path(path: Path, version: str) -> Path:
     path = path.expanduser().resolve()
     if not path.exists() or not path.is_dir():
         raise RuntimeError(f"SiSDK package path does not exist or is not a directory: {path}")
+    installed_version = _sisdk_version_from_properties(path)
+    if installed_version != version:
+        raise RuntimeError(
+            "Configured SiSDK version does not match the SDK package path: "
+            f"cms_client_config.json target.sisdk={version}, "
+            f"{path / '.properties'} version={installed_version}"
+        )
     xapi_path = path / SL_BT_XAPI_PATH
     if not xapi_path.is_file():
         raise RuntimeError(f"Resolved SiSDK '{version}' cannot find `sl_bt.xapi`: {xapi_path}")
     return path
+
+
+def _sisdk_version_from_properties(sdk_path: Path) -> str:
+    properties_path = sdk_path / ".properties"
+    if not properties_path.is_file():
+        raise RuntimeError(f"SiSDK package path is missing .properties: {properties_path}")
+    for line in properties_path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "version" and value.strip():
+            return value.strip()
+    raise RuntimeError(f"SiSDK package properties are missing version: {properties_path}")
 
 
 def _sdk_git_commit(sdk_path: Path) -> str:
@@ -289,8 +243,11 @@ def resolve_sdk_selection(
         source = "client_config_package_path"
         sdk_path = _validate_sdk_path(Path(config_package_path), version)
     else:
-        source = "slt"
-        sdk_path = _validate_sdk_path(resolve_sisdk_path(version), version)
+        raise RuntimeError(
+            "No SiSDK package path is configured. Set target.sisdk_package_path in "
+            "cms_client_config.json to the unpacked SDK directory, or pass "
+            "--sdk-package-path <path> to this build."
+        )
     xapi_path = sdk_path / SL_BT_XAPI_PATH
     commit = _sdk_git_commit(sdk_path)
     return SDKSelection(

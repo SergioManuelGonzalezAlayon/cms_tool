@@ -79,46 +79,6 @@ def test_validate_firmware_config_uses_effective_config_values() -> None:
     }
 
 
-def test_list_installed_sisdks_only_returns_installed_versions(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        app_manager,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0],
-            0,
-            stdout=(
-                "Packages content:\n"
-                "  Id: simplicity-sdk\n"
-                "  Version: 2025.6.2\n"
-                "  Installer type: conan\n"
-                "  Package type: sdk\n"
-                "  Installation:\n"
-                "    C:\\sdk\\2025.6.2\n"
-                "\n"
-                "  Id: simplicity-sdk\n"
-                "  Version: 2025.12.2\n"
-                "  Installer type: conan\n"
-                "  Package type: sdk\n"
-                "  Installation:\n"
-                "    C:\\sdk\\2025.12.2\n"
-                "\n"
-                "  Id: simplicity-sdk\n"
-                "  Version: 2025.12.3\n"
-                "  Installer type: conan\n"
-                "  Package type: sdk\n"
-            ),
-            stderr="",
-        ),
-    )
-
-    result = app_manager.list_installed_sisdks()
-
-    assert result == [
-        {"id": "simplicity-sdk", "version": "2025.6.2", "path": "C:\\sdk\\2025.6.2"},
-        {"id": "simplicity-sdk", "version": "2025.12.2", "path": "C:\\sdk\\2025.12.2"},
-    ]
-
-
 def test_effective_build_config_cli_overrides_client_config() -> None:
     overrides = app_manager.parse_args([
         "build",
@@ -177,7 +137,7 @@ def test_resolve_bootloader_slcp_accepts_raw_client_config(tmp_path: Path) -> No
     assert result == bootloader
 
 
-def test_resolve_sdk_selection_prefers_cli_then_config_then_slt(
+def test_resolve_sdk_selection_prefers_cli_then_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def make_sdk(name: str) -> Path:
@@ -185,13 +145,15 @@ def test_resolve_sdk_selection_prefers_cli_then_config_then_slt(
         xapi = sdk / app_manager.SL_BT_XAPI_PATH
         xapi.parent.mkdir(parents=True)
         xapi.write_bytes(name.encode())
+        (sdk / ".properties").write_text(
+            "id=com.silabs.sdk.stack.sisdk\nversion=2026.1.0\n",
+            encoding="utf-8",
+        )
         return sdk
 
     cli_sdk = make_sdk("cli")
     config_sdk = make_sdk("config")
-    slt_sdk = make_sdk("slt")
     monkeypatch.setattr(app_manager, "_sdk_git_commit", lambda path: "sdk-commit")
-    monkeypatch.setattr(app_manager, "resolve_sisdk_path", lambda version: slt_sdk)
 
     cli = app_manager.resolve_sdk_selection(
         version="2026.1.0", cli_package_path=str(cli_sdk), config_package_path=str(config_sdk)
@@ -199,33 +161,31 @@ def test_resolve_sdk_selection_prefers_cli_then_config_then_slt(
     configured = app_manager.resolve_sdk_selection(
         version="2026.1.0", config_package_path=str(config_sdk)
     )
-    slt = app_manager.resolve_sdk_selection(version="2026.1.0")
-
     assert (cli.path, cli.source) == (cli_sdk.resolve(), "cli_package_path")
     assert (configured.path, configured.source) == (config_sdk.resolve(), "client_config_package_path")
-    assert (slt.path, slt.source) == (slt_sdk.resolve(), "slt")
     assert cli.commit == cli.sdk_hash == "sdk-commit"
     assert cli.xapi_hash == app_manager._sha256(cli_sdk / app_manager.SL_BT_XAPI_PATH)
 
 
-def test_resolve_sdk_selection_reports_missing_and_ambiguous_sdk(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_resolve_sdk_selection_requires_an_explicit_sdk_path(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="does not exist"):
         app_manager.resolve_sdk_selection(
             version="2026.1.0", cli_package_path=str(tmp_path / "missing")
         )
 
-    monkeypatch.setattr(
-        app_manager,
-        "list_installed_sisdks",
-        lambda: [
-            {"version": "2026.1.0", "path": "first"},
-            {"version": "2026.1.0", "path": "second"},
-        ],
-    )
-    with pytest.raises(RuntimeError, match="multiple installed paths"):
+    with pytest.raises(RuntimeError, match="Set target.sisdk_package_path"):
         app_manager.resolve_sdk_selection(version="2026.1.0")
+
+
+def test_resolve_sdk_selection_rejects_a_properties_version_mismatch(tmp_path: Path) -> None:
+    sdk = tmp_path / "sdk"
+    xapi = sdk / app_manager.SL_BT_XAPI_PATH
+    xapi.parent.mkdir(parents=True)
+    xapi.write_bytes(b"xapi")
+    (sdk / ".properties").write_text("version=2025.12.3\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="target.sisdk=2026.1.0"):
+        app_manager.resolve_sdk_selection(version="2026.1.0", cli_package_path=str(sdk))
 
 
 def test_generate_slcp_passes_explicit_sdk_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -673,7 +633,6 @@ def test_main_clean_skips_firmware_validation_and_sisdk_resolution(
         raise AssertionError("unexpected call during clean action")
 
     monkeypatch.setattr(app_manager, "validate_firmware_config", fail_unexpected)
-    monkeypatch.setattr(app_manager, "resolve_sisdk_path", fail_unexpected)
     monkeypatch.setattr(app_manager, "trust_sisdk", fail_unexpected)
 
     exit_code = app_manager.main(["clean"])

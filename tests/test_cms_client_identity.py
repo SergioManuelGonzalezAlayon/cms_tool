@@ -13,6 +13,7 @@ from cms_client import (
     _failed_test_records_from_job_results,
     _print_measurement_result,
     _request_from_send_fw_args,
+    _run_local_build,
     build_cli_parser,
 )
 from cms_colors import ColorFormatter
@@ -57,6 +58,42 @@ def test_tests_command_hides_debug_mode(capsys, monkeypatch):
 
     assert exit_code == 0
     assert capsys.readouterr().out == "modes: default, full_sweep, diff\n"
+
+
+def test_build_derives_sisdk_version_from_the_selected_package(tmp_path, monkeypatch):
+    sdk_path = tmp_path / "sdk"
+    sdk_path.mkdir()
+    (sdk_path / ".properties").write_text(
+        "id=com.silabs.sdk.stack.sisdk\nversion=2025.12.3\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps({"target": {"sisdk_package_path": str(sdk_path)}}),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(
+        cms_client.subprocess,
+        "run",
+        fake_run,
+    )
+    args = argparse.Namespace(
+        action="build",
+        targets=[],
+        sdk_package_path="",
+        build_root="",
+        bootloader_slcp="",
+    )
+
+    assert _run_local_build(args, str(config_path)) == 0
+    assert json.loads(config_path.read_text(encoding="utf-8"))["target"]["sisdk"] == "2025.12.3"
+    assert "--sisdk-version" not in captured["command"]
 
 
 def test_run_test_sends_requested_run_name_to_daemon():

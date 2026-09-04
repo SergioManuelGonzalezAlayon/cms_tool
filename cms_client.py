@@ -694,7 +694,6 @@ def build_cli_parser() -> argparse.ArgumentParser:
     build.add_argument("targets", nargs="*", help="optional .slcp targets or app directories")
     build.add_argument("--action", default="build", choices=["generate", "upgrade", "build", "rebuild"])
     build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
-    build.add_argument("--sisdk-version", default="", help="override selected SiSDK version")
     build.add_argument("--build-root", default="", help="override firmware build root")
     build.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
 
@@ -1260,11 +1259,11 @@ def _require_matching_build_provenance(label: str, requested: str, built: str) -
 
 
 def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
+    _sync_config_sisdk_version(config_path, args.sdk_package_path)
     cmd = [sys.executable, str(Path("apps") / "app_manager.py"), args.action, *args.targets]
     for option, value in (
         ("--config", config_path),
         ("--sdk-package-path", args.sdk_package_path),
-        ("--sisdk-version", args.sisdk_version),
         ("--build-root", args.build_root),
         ("--bootloader-slcp", args.bootloader_slcp),
     ):
@@ -1272,6 +1271,41 @@ def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
             cmd.extend([option, value])
     result = subprocess.run(cmd, check=False)
     return result.returncode
+
+
+def _sync_config_sisdk_version(config_path: str | Path, sdk_package_path: str = "") -> str:
+    """Record the selected SDK's installed version in persistent client config."""
+
+    path = Path(config_path)
+    if not path.is_file():
+        raise RuntimeError(f"CMS client config does not exist: {path}")
+    config = _read_json_file(path)
+    target = config.get("target")
+    if not isinstance(target, dict):
+        raise RuntimeError("cms_client_config.json must contain a target object")
+    selected_path = sdk_package_path or str(target.get("sisdk_package_path", ""))
+    if not selected_path:
+        raise RuntimeError(
+            "No SiSDK package path is configured. Set target.sisdk_package_path in "
+            "cms_client_config.json or pass --sdk-package-path <path> to cms BUILD."
+        )
+    sdk_path = Path(selected_path).expanduser()
+    if not sdk_path.is_absolute():
+        sdk_path = (path.parent / sdk_path).resolve()
+    properties_path = sdk_path / ".properties"
+    if not properties_path.is_file():
+        raise RuntimeError(f"SiSDK package path is missing .properties: {properties_path}")
+    version = ""
+    for line in properties_path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "version" and value.strip():
+            version = value.strip()
+            break
+    if not version:
+        raise RuntimeError(f"SiSDK package properties are missing version: {properties_path}")
+    target["sisdk"] = version
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return version
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
