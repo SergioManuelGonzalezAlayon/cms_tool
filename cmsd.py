@@ -42,6 +42,7 @@ from cms_protocol import (
     BenchState,
     EventCursor,
     MeasurementEventPage,
+    MeasurementMode,
     MeasurementSummary,
     MeasurementState,
     MeasurementRequest,
@@ -79,14 +80,22 @@ PUBLISHABLE_DIAGNOSTIC_NAMES = frozenset(
 )
 
 
+def _should_upload_results_to_database(mode: MeasurementMode | str) -> bool:
+    measurement_mode = mode if isinstance(mode, MeasurementMode) else MeasurementMode(str(mode))
+    return measurement_mode is not MeasurementMode.DEBUG
+
+
 def _default_runtime_root() -> Path:
     if platform.system() == "Linux":
         return Path("/dev/shm/cmsd")
     return Path(tempfile.gettempdir()) / "cmsd"
 
 
-def _default_execution_timeout_s() -> float:
-    return float(os.getenv("CMSD_EXECUTION_TIMEOUT_S", str(DEFAULT_EXECUTION_TIMEOUT_S)))
+def _default_execution_timeout_s() -> float | None:
+    value = os.getenv("CMSD_EXECUTION_TIMEOUT_S", "").strip().lower()
+    if not value or value in {"0", "none", "off", "unlimited"}:
+        return DEFAULT_EXECUTION_TIMEOUT_S
+    return float(value)
 
 
 @dataclass(slots=True)
@@ -102,7 +111,7 @@ class DaemonConfig:
     expected_runtime_filesystems: tuple[str, ...] = ("tmpfs", "ramfs")
     max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
     max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
-    execution_timeout_s: float = field(default_factory=_default_execution_timeout_s)
+    execution_timeout_s: float | None = field(default_factory=_default_execution_timeout_s)
     completed_measurement_retention: int = 100
 
     def __post_init__(self) -> None:
@@ -118,8 +127,8 @@ class DaemonConfig:
             raise ValueError("max_console_log_bytes must be positive")
         if self.max_console_event_bytes < 512:
             raise ValueError("max_console_event_bytes must be at least 512")
-        if self.execution_timeout_s <= 0:
-            raise ValueError("execution_timeout_s must be positive")
+        if self.execution_timeout_s is not None and self.execution_timeout_s <= 0:
+            raise ValueError("execution_timeout_s must be positive when configured")
         if self.completed_measurement_retention < 1:
             raise ValueError("completed_measurement_retention must be positive")
 
@@ -203,6 +212,8 @@ class CMSDaemon:
         """Stage or fetch the requested firmware payloads into the runtime area."""
         _stage_firmware_image(request.firmware.dut_img.url, runtime_dir / request.firmware.dut_img.name)
         _stage_firmware_image(request.firmware.tester_img.url, runtime_dir / request.firmware.tester_img.name)
+        for image in request.firmware.dut_variants.values():
+            _stage_firmware_image(image.url, runtime_dir / image.name)
         if request.firmware.xapi_file is not None:
             _stage_firmware_image(
                 request.firmware.xapi_file.url,
@@ -610,6 +621,7 @@ class CMSDaemon:
             )
             if not self.bench.fw_is_valid(session):
                 raise RuntimeError(_validation_failure_message(session))
+            self.bench.persist_staged_firmware_provenance(session)
             result = MeasurementResult(
                 measurement_id=request.request_id,
                 state=MeasurementState.ACCEPTED,
@@ -646,7 +658,8 @@ class CMSDaemon:
         config: str = "default",
         config_hash: str = "",
         run_name: str = "",
-        upload_results_to_database: bool = False,
+        upload_results_to_database: bool = True,
+        debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Run a test using the most recently staged firmware request."""
 
@@ -665,7 +678,8 @@ class CMSDaemon:
         request.selector.feature = feature
         request.selector.config = config
         request.selector.config_hash = config_hash
-        request.upload_results_to_database = upload_results_to_database
+        request.upload_results_to_database = _should_upload_results_to_database(request.mode)
+        request.debug_artifact_streaming = debug_artifact_streaming
         request.identity = None
         request.request_id = ""
         self._assign_execution_identity(request, run_name)
@@ -682,7 +696,8 @@ class CMSDaemon:
         config_hash: str = "",
         variable_filters: tuple[VariableFilter, ...] = (),
         run_name: str = "",
-        upload_results_to_database: bool = False,
+        upload_results_to_database: bool = True,
+        debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Start a test in the background using the most recently staged firmware."""
 
@@ -703,7 +718,8 @@ class CMSDaemon:
         request.selector.config = config
         request.selector.config_hash = config_hash
         request.selector.variable_filters = variable_filters
-        request.upload_results_to_database = upload_results_to_database
+        request.upload_results_to_database = _should_upload_results_to_database(request.mode)
+        request.debug_artifact_streaming = debug_artifact_streaming
         request.identity = None
         request.request_id = ""
         identity = self._assign_execution_identity(request, run_name)
@@ -839,6 +855,8 @@ class CMSDaemon:
         identity_assigned: bool = False,
     ) -> MeasurementResult:
         """Run one V1 synchronous measurement path."""
+
+        request.upload_results_to_database = _should_upload_results_to_database(request.mode)
 
         if not identity_assigned:
             requested_run_name = request.request_id
@@ -994,7 +1012,8 @@ class CMSDaemon:
                 config_hash=str(request.get("config_hash", "")),
                 variable_filters=variable_filters_from_dicts(request.get("variable_filters")),
                 run_name=str(request.get("run_name", "")),
-                upload_results_to_database=bool(request.get("upload_results_to_database", False)),
+                upload_results_to_database=bool(request.get("upload_results_to_database", True)),
+                debug_artifact_streaming=bool(request.get("debug_artifact_streaming", False)),
             )
             return measurement_result_to_dict(result)
 
@@ -1579,7 +1598,11 @@ def _copy_staged_firmware(
     staged_runtime_dir: Path,
     runtime_dir: Path,
 ) -> None:
-    images = [request.firmware.dut_img, request.firmware.tester_img]
+    images = [
+        request.firmware.dut_img,
+        request.firmware.tester_img,
+        *request.firmware.dut_variants.values(),
+    ]
     if request.firmware.xapi_file is not None:
         images.append(request.firmware.xapi_file)
     if request.firmware.bootloader_img is not None:
@@ -1602,6 +1625,12 @@ def _write_firmware_payloads(
         "dut_img": request.firmware.dut_img,
         "tester_img": request.firmware.tester_img,
     }
+    targets.update(
+        {
+            f"dut_variant:{name}": image
+            for name, image in request.firmware.dut_variants.items()
+        }
+    )
     if request.firmware.xapi_file is not None:
         targets["xapi_file"] = request.firmware.xapi_file
     if request.firmware.bootloader_img is not None:

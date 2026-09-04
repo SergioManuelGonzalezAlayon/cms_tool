@@ -13,6 +13,7 @@ from cms_client import (
     _failed_test_records_from_job_results,
     _print_measurement_result,
     _request_from_send_fw_args,
+    _run_local_build,
     build_cli_parser,
 )
 from cms_colors import ColorFormatter
@@ -28,13 +29,14 @@ from cms_protocol import (
 def test_test_command_accepts_run_name():
     parser = build_cli_parser()
 
-    named = parser.parse_args(["test", "default", "beacon", "--run-name", "Nightly Run"])
-    colored = parser.parse_args(["--color", "always", "test", "default", "beacon"])
-    colored_after_command = parser.parse_args(["test", "default", "beacon", "--color", "never"])
-    preview = parser.parse_args(["test", "default", "beacon", "--config-name", "dcdc", "--preview"])
+    named = parser.parse_args(["test", "--mode", "default", "--feature", "beacon", "--run-name", "Nightly Run"])
+    colored = parser.parse_args(["--color", "always", "test", "-m", "default", "-f", "beacon"])
+    colored_after_command = parser.parse_args(["test", "--mode", "default", "--feature", "beacon", "--color", "never"])
+    preview = parser.parse_args(["test", "--mode", "default", "--feature", "beacon", "--config-name", "dcdc", "--preview"])
     filtered = parser.parse_args(
-        ["test", "full_sweep", "beacon", "--variable", "phy=2m", "--preview"]
+        ["test", "--mode", "full_sweep", "--feature", "beacon", "--variable", "phy=2m", "--preview"]
     )
+    all_features = parser.parse_args(["test", "-m", "default", "-f", "all"])
 
     assert named.run_name == "Nightly Run"
     assert colored.color == "always"
@@ -42,6 +44,56 @@ def test_test_command_accepts_run_name():
     assert preview.preview is True
     assert preview.config_name == "dcdc"
     assert filtered.variable == ["phy=2m"]
+    assert all_features.feature == "all"
+
+
+def test_tests_command_hides_debug_mode(capsys, monkeypatch):
+    class Client:
+        def list_tests(self):
+            return {"modes": ["debug", "default", "full_sweep", "diff"], "features": []}
+
+    monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
+
+    exit_code = cms_client.main(["tests"])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == "modes: default, full_sweep, diff\n"
+
+
+def test_build_derives_sisdk_version_from_the_selected_package(tmp_path, monkeypatch):
+    sdk_path = tmp_path / "sdk"
+    sdk_path.mkdir()
+    (sdk_path / ".properties").write_text(
+        "id=com.silabs.sdk.stack.sisdk\nversion=2025.12.3\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps({"target": {"sisdk_package_path": str(sdk_path)}}),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(
+        cms_client.subprocess,
+        "run",
+        fake_run,
+    )
+    args = argparse.Namespace(
+        action="build",
+        targets=[],
+        sdk_package_path="",
+        build_root="",
+        bootloader_slcp="",
+    )
+
+    assert _run_local_build(args, str(config_path)) == 0
+    assert json.loads(config_path.read_text(encoding="utf-8"))["target"]["sisdk"] == "2025.12.3"
+    assert "--sisdk-version" not in captured["command"]
 
 
 def test_run_test_sends_requested_run_name_to_daemon():
@@ -66,6 +118,23 @@ def test_run_test_sends_requested_run_name_to_daemon():
     assert result.measurement_id == "generated-id"
 
 
+def test_run_all_features_does_not_send_a_single_config_hash():
+    captured = {}
+    client = CMSClient.__new__(CMSClient)
+
+    def fake_request(method, path, payload):
+        captured.update(payload)
+        return {"measurement_id": "generated-id", "state": "accepted"}
+
+    client._request_json = fake_request
+
+    client.run_test(MeasurementMode.DEFAULT, "all")
+
+    assert captured["feature"] == "all"
+    assert captured["config"] == "default"
+    assert captured["config_hash"] == ""
+
+
 def test_run_test_rejects_unknown_or_unsafe_local_config():
     client = CMSClient.__new__(CMSClient)
     client._request_json = lambda *args, **kwargs: {"measurement_id": "unused", "state": "accepted"}
@@ -88,7 +157,7 @@ def test_test_preview_shows_exact_submission_without_contacting_daemon(capsys, m
     monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
 
     exit_code = cms_client.main(
-        ["test", "default", "beacon", "--config-name", "dcdc", "--preview"]
+        ["test", "--mode", "default", "--feature", "beacon", "--config-name", "dcdc", "--preview"]
     )
 
     output = capsys.readouterr().out
@@ -100,29 +169,34 @@ def test_test_preview_shows_exact_submission_without_contacting_daemon(capsys, m
     assert "tests\\configs\\ble\\beacon\\dcdc.json" in output or "tests/configs/ble/beacon/dcdc.json" in output
     assert "config_hash:" in output
     assert "expected_jobs: 1" in output
-    assert "results_destination: cms_client" in output
-
-
-def test_test_preview_shows_database_destination(capsys, monkeypatch):
-    class Client:
-        def run_test(self, *args, **kwargs):
-            raise AssertionError("preview must not submit a test")
-
-    monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
-
-    exit_code = cms_client.main(
-        [
-            "test",
-            "default",
-            "beacon",
-            "--preview",
-            "--upload-results-to-database",
-        ]
-    )
-
-    output = capsys.readouterr().out
-    assert exit_code == 0
     assert "results_destination: database" in output
+
+
+def test_test_command_rejects_removed_debug_mode():
+    parser = build_cli_parser()
+
+    with pytest.raises(SystemExit) as usage_error:
+        parser.parse_args(["test", "--mode", "debug", "--feature", "beacon"])
+
+    assert usage_error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (
+            ["test", "--mode", "default", "--feature", "all", "--config-name", "dcdc"],
+            "--feature all only supports the default config",
+        ),
+        (
+            ["test", "--mode", "full_sweep", "--feature", "all", "--variable", "phy=2m"],
+            "--feature all cannot be combined with --variable",
+        ),
+    ],
+)
+def test_all_feature_selection_rejects_ambiguous_scopes(argv, message):
+    with pytest.raises(RuntimeError, match=message):
+        cms_client._main(argv)
 
 
 def test_test_preview_shows_variable_filters_from_parameters_json(capsys, monkeypatch):
@@ -133,7 +207,7 @@ def test_test_preview_shows_variable_filters_from_parameters_json(capsys, monkey
     monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
 
     exit_code = cms_client.main(
-        ["test", "full_sweep", "beacon", "--variable", "phy=2m", "--preview"]
+        ["test", "--mode", "full_sweep", "--feature", "beacon", "--variable", "phy=2m", "--preview"]
     )
 
     output = capsys.readouterr().out
@@ -158,7 +232,7 @@ def test_test_command_passes_variable_filters_to_client(monkeypatch):
 
     monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
 
-    exit_code = cms_client.main(["test", "full_sweep", "beacon", "--variable", "phy=2m"])
+    exit_code = cms_client.main(["test", "--mode", "full_sweep", "--feature", "beacon", "--variable", "phy=2m"])
 
     assert exit_code == int(cms_client.CMSCLIExitCode.TEST_REJECTED)
     assert captured["variable_filters"] == (VariableFilter("phy", "2m"),)
@@ -203,8 +277,8 @@ def test_recipes_command_prints_copy_paste_workflows(capsys):
 
     output = capsys.readouterr().out
     assert exit_code == 0
-    assert "cms TEST default beacon --config-name default --preview" in output
-    assert "cms TEST default beacon --config-name dcdc --preview" in output
+    assert "cms TEST --mode default --feature beacon --config-name default --preview" in output
+    assert "cms TEST --mode default --feature beacon --config-name dcdc --preview" in output
     assert "cms WATCH" in output
     assert "cms WATCH measurement-123 --cursor 17" in output
     assert "cms CANCEL" in output
@@ -316,7 +390,7 @@ def test_failed_command_prints_failed_identities_and_rerun_commands(capsys, monk
     assert "failed tests for measurement-123" in output
     assert "beacon dcdc.json" in output
     assert "hash-dcdc" in output
-    assert "cms TEST default beacon --config-name dcdc" in output
+    assert "cms TEST --mode default --feature beacon --config-name dcdc" in output
 
 
 def test_failed_command_can_emit_machine_readable_json(capsys, monkeypatch):
@@ -346,7 +420,7 @@ def test_failed_command_can_emit_machine_readable_json(capsys, monkeypatch):
     assert payload["measurement_id"] == "measurement-123"
     assert payload["failed_tests"][0]["config"] == "dcdc.json"
     assert payload["failed_tests"][0]["rerun_command"] == (
-        "cms TEST default beacon --config-name dcdc"
+        "cms TEST --mode default --feature beacon --config-name dcdc"
     )
 
 
@@ -390,8 +464,10 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     runtime = build_root / "runtime"
     runtime.mkdir(parents=True)
     dut_image = tmp_path / "dut.s37"
+    no_dcdc_dut_image = tmp_path / "dut-no-dcdc.s37"
     tester_image = tmp_path / "tester.s37"
     dut_image.write_bytes(b"exact-dut-s37")
+    no_dcdc_dut_image.write_bytes(b"exact-no-dcdc-dut-s37")
     tester_image.write_bytes(b"exact-tester-s37")
     dut_hash = hashlib.sha256(dut_image.read_bytes()).hexdigest()
     tester_hash = hashlib.sha256(tester_image.read_bytes()).hexdigest()
@@ -422,6 +498,8 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
         "cms_client._discover_built_firmware",
         lambda role, firmware_cfg: {
             "dut": dut_image,
+            "dut_dcdc": dut_image,
+            "dut_no_dcdc": no_dcdc_dut_image,
             "tester": tester_image,
         }[role],
     )
@@ -444,6 +522,8 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     assert request.firmware.xapi_file_hash == xapi_hash
     assert request.firmware.dut_img.sha256 == dut_hash
     assert request.firmware.tester_img.sha256 == tester_hash
+    assert request.firmware.dut_variants["dcdc"].url == str(dut_image)
+    assert request.firmware.dut_variants["no_dcdc"].url == str(no_dcdc_dut_image)
 
     args.sisdk_version = "2025.12.3"
     with pytest.raises(RuntimeError, match="does not match the firmware build provenance"):

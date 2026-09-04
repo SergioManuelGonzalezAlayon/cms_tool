@@ -22,6 +22,7 @@ from cms_protocol import (
 def _session(
     tmp_path,
     *,
+    feature: str = "beacon",
     config: str = "default",
     config_hash: str = "",
     mode: str = "default",
@@ -36,7 +37,7 @@ def _session(
         request_id="measurement-123",
         selector=SuiteSelector(
             mode="ble",
-            feature="beacon",
+            feature=feature,
             config=config,
             config_hash=config_hash,
             variable_filters=variable_filters,
@@ -96,7 +97,6 @@ def test_pytest_runtime_metadata_contains_measurement_identity(tmp_path, monkeyp
     junit_report = junit_dir / "0001-beacon-default.xml"
     junit_report.write_text("<testsuites />\n", encoding="utf-8")
     assert junit_report in cms_bench._run_diagnostic_artifacts(session)
-
     current_result = tmp_path / "beacon_result.json"
     current_result.write_text('{"result_type":"current_measurement"}\n', encoding="utf-8")
     monkeypatch.setattr(
@@ -111,6 +111,32 @@ def test_pytest_runtime_metadata_contains_measurement_identity(tmp_path, monkeyp
     result_types = {artifact.path: artifact.result_type for artifact in result.artifacts}
     assert result_types[junit_report] is ResultType.PYTEST_JUNIT
     assert result_types[current_result] is ResultType.CURRENT_MEASUREMENT
+
+
+def test_pytest_runtime_materializes_named_dut_variants(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    session.manifest.dut_variants = {
+        "dcdc": FirmwareImage(name="dut-dcdc.s37", url="dut-dcdc.s37"),
+        "no_dcdc": FirmwareImage(name="dut-no-dcdc.s37", url="dut-no-dcdc.s37"),
+    }
+    for name in ("dut.s37", "dut-dcdc.s37", "dut-no-dcdc.s37", "tester.s37", "sl_bt.xapi"):
+        (tmp_path / name).write_bytes(name.encode("ascii"))
+    monkeypatch.setattr(
+        cms_bench,
+        "_load_requested_test_config",
+        lambda session: {
+            "firmware": {
+                "dut_slcp": "apps/ncp_ble_dut.slcp",
+                "tester_slcp": "apps/ncp_ble_tester.slcp",
+            }
+        },
+    )
+
+    prepared = cms_bench._prepare_pytest_runtime(session, BenchResources())
+
+    build_root = prepared["build_root"]
+    assert (build_root / "ncp_ble_dut_dcdc" / "cmake_gcc" / "build" / "base" / "dut-dcdc.s37").read_bytes() == b"dut-dcdc.s37"
+    assert (build_root / "ncp_ble_dut" / "cmake_gcc" / "build" / "base" / "dut-no-dcdc.s37").read_bytes() == b"dut-no-dcdc.s37"
 
 
 def test_pytest_runtime_metadata_contains_requested_config_hash(tmp_path, monkeypatch):
@@ -266,6 +292,26 @@ def test_bench_runs_default_config_without_exact_config_override(tmp_path, monke
 
     assert "--exact-config" not in captured["command"]
     assert "--cfg" not in captured["command"]
+
+
+def test_bench_runs_all_features_from_the_ble_config_root(tmp_path, monkeypatch):
+    session = _session(tmp_path, feature="all")
+    captured = {}
+
+    def fake_run_managed_process(command, **kwargs):
+        captured["command"] = command
+        return cms_bench.subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cms_bench, "_run_managed_process", fake_run_managed_process)
+
+    cms_bench._run_test_orchestrator(
+        session,
+        tmp_path / "orchestrator_results.jsonl",
+        tmp_path / "cms_fw_metadata.json",
+    )
+
+    assert cms_bench.Path(captured["command"][3]) == cms_bench.Path("tests") / "configs" / "ble"
+    assert "--feature" not in captured["command"]
 
 
 def test_bench_runs_one_exact_named_config(tmp_path, monkeypatch):

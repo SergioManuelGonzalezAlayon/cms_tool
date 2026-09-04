@@ -27,6 +27,20 @@ def _discovery_scan_phy_for_advertiser(phy: str | int) -> int:
     return discovery_scan_phy_for_advertiser(phy)
 
 
+def _set_advertiser_phy(device, advertising_set: int, primary_phy: int, secondary_phy: int):
+    """Set advertising PHY across BGAPI versions that moved this command.
+
+    SiSDK 2025.12.3's ``bluetooth_le_host/api/sl_bt.xapi`` exposes it as
+    ``extended_advertiser.set_phy``; older xapi files may expose it on
+    ``advertiser`` instead.
+    """
+
+    extended_advertiser = getattr(device.bt, "extended_advertiser", None)
+    if extended_advertiser is not None and hasattr(extended_advertiser, "set_phy"):
+        return extended_advertiser.set_phy(advertising_set, primary_phy, secondary_phy)
+    return device.bt.advertiser.set_phy(advertising_set, primary_phy, secondary_phy)
+
+
 def open_ble_dev(dev,
                  wakeUp=None,
                  *,
@@ -188,7 +202,7 @@ def DUTLegAdvConfig(DUT,
     log.info("DUT Advertiser configured")
 
     DUT.bt.advertiser.set_tx_power(config.set,config.tx_power)
-    DUT.bt.advertiser.set_phy(config.set, config.primary_phy, config.primary_phy)
+    _set_advertiser_phy(DUT, config.set, config.primary_phy, config.primary_phy)
     log.info(
         "DUT legacy advertiser PHY configured: primary=%s",
         advertising_phy_to_str(config.primary_phy),

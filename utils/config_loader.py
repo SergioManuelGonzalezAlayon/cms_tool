@@ -63,6 +63,7 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
     tester = runtime.get("tester", {})
     tools = runtime.get("tools", {})
     ble = runtime.get("ble", {})
+    sdk = ble.get("sdk", {}) if isinstance(ble, dict) else {}
     js = runtime.get("js", {})
     fw_metadata = metadata.get("firmware", {})
 
@@ -103,6 +104,12 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
             "serial_number": fw_metadata.get("serial_number") or devices.get("serial_number"),
             "device": fw_metadata.get("device") or devices.get("device"),
             "sisdk": fw_metadata.get("sisdk"),
+            "sisdk_name": fw_metadata.get("sisdk_name") or sdk.get("name"),
+            "sisdk_source": fw_metadata.get("sisdk_source") or sdk.get("source"),
+            "sisdk_version": fw_metadata.get("sisdk_version") or sdk.get("version"),
+            "sisdk_commit": fw_metadata.get("sisdk_commit") or sdk.get("commit"),
+            "sisdk_hash": fw_metadata.get("sisdk_hash") or sdk.get("hash"),
+            "xapi_file_hash": fw_metadata.get("xapi_file_hash") or sdk.get("xapi_sha256"),
         },
     }
 

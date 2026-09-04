@@ -1,7 +1,9 @@
+import base64
 from pathlib import Path
 
 import pytest
 
+import cmsd
 from cms_bench import MeasurementRuntimePaths
 from cms_protocol import FirmwareData, FirmwareImage, MeasurementRequest, SuiteSelector
 from cmsd import CMSDaemon, DaemonConfig
@@ -64,6 +66,25 @@ def test_daemon_propagates_execution_timeout_to_bench_session(tmp_path: Path) ->
     )
 
     assert session.execution_timeout_s == 123.0
+
+
+def test_daemon_stages_named_dut_variant_payloads(tmp_path: Path) -> None:
+    request = _request("measurement-variants")
+    request.firmware.dut_variants = {
+        "dcdc": FirmwareImage(name="dut-dcdc.s37", url=""),
+        "no_dcdc": FirmwareImage(name="dut-no-dcdc.s37", url=""),
+    }
+    payloads = {
+        "dut_img": base64.b64encode(b"dut").decode("ascii"),
+        "tester_img": base64.b64encode(b"tester").decode("ascii"),
+        "dut_variant:dcdc": base64.b64encode(b"dcdc").decode("ascii"),
+        "dut_variant:no_dcdc": base64.b64encode(b"no-dcdc").decode("ascii"),
+    }
+
+    cmsd._write_firmware_payloads(request, tmp_path, payloads)
+
+    assert (tmp_path / "dut-dcdc.s37").read_bytes() == b"dcdc"
+    assert (tmp_path / "dut-no-dcdc.s37").read_bytes() == b"no-dcdc"
 
 
 def test_daemon_reads_execution_timeout_from_environment(

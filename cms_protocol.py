@@ -238,6 +238,7 @@ class FirmwareData:
     """Firmware references that the daemon stages before execution."""
     dut_img: FirmwareImage
     tester_img: FirmwareImage
+    dut_variants: dict[str, FirmwareImage] = field(default_factory=dict)
     board: str = ""
     device: str = ""
     dut_img_hash: str = ""
@@ -247,6 +248,7 @@ class FirmwareData:
     xapi_file: FirmwareImage | None = None
     xapi_file_hash: str = ""
     git_commit: str = ""
+    sisdk_name: str = ""
     sisdk_source: str = ""
     sisdk_version: str = ""
     sisdk_commit: str = ""
@@ -286,7 +288,8 @@ class MeasurementRequest:
     firmware: FirmwareData
     mode: MeasurementMode = MeasurementMode.DEFAULT
     requested_by: str = ""
-    upload_results_to_database: bool = False
+    upload_results_to_database: bool = True
+    debug_artifact_streaming: bool = False
     identity: MeasurementIdentity | None = None
 
 
@@ -650,6 +653,10 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
     return {
         "dut_img": firmware_image_to_dict(firmware.dut_img),
         "tester_img": firmware_image_to_dict(firmware.tester_img),
+        "dut_variants": {
+            name: firmware_image_to_dict(image)
+            for name, image in firmware.dut_variants.items()
+        },
         "board": firmware.board,
         "device": firmware.device,
         "dut_img_hash": firmware.dut_img_hash,
@@ -659,6 +666,7 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
         "xapi_file": firmware_image_to_dict(firmware.xapi_file),
         "xapi_file_hash": firmware.xapi_file_hash,
         "git_commit": firmware.git_commit,
+        "sisdk_name": firmware.sisdk_name,
         "sisdk_source": firmware.sisdk_source,
         "sisdk_version": firmware.sisdk_version,
         "sisdk_commit": firmware.sisdk_commit,
@@ -676,9 +684,18 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
             name=str(data.get("tester_image_name", "tester.s37")),
             url=str(data.get("tester_image_url", "")),
         )
+    raw_dut_variants = data.get("dut_variants", {})
+    if not isinstance(raw_dut_variants, dict):
+        raise ValueError("dut_variants must be an object")
+    dut_variants = {
+        str(name): image
+        for name, value in raw_dut_variants.items()
+        if (image := firmware_image_from_dict(value)) is not None
+    }
     return FirmwareData(
         dut_img=dut_img,
         tester_img=tester_img,
+        dut_variants=dut_variants,
         board=str(data.get("board", "")),
         device=str(data.get("device", "")),
         dut_img_hash=str(data.get("dut_img_hash", data.get("dut_image_hash", dut_img.sha256))),
@@ -688,6 +705,7 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         xapi_file=firmware_image_from_dict(data.get("xapi_file")),
         xapi_file_hash=str(data.get("xapi_file_hash", "")),
         git_commit=str(data.get("git_commit", "")),
+        sisdk_name=str(data.get("sisdk_name", "")),
         sisdk_source=str(data.get("sisdk_source", "")),
         sisdk_version=str(data.get("sisdk_version", "")),
         sisdk_commit=str(data.get("sisdk_commit", "")),
@@ -710,6 +728,7 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
         "mode": request.mode.value,
         "requested_by": request.requested_by,
         "upload_results_to_database": request.upload_results_to_database,
+        "debug_artifact_streaming": request.debug_artifact_streaming,
     }
 
 
@@ -728,7 +747,8 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
         firmware=firmware_data_from_dict(data.get("firmware", data)),
         mode=MeasurementMode(str(data.get("mode", MeasurementMode.DEFAULT.value))),
         requested_by=str(data.get("requested_by", "")),
-        upload_results_to_database=bool(data.get("upload_results_to_database", False)),
+        upload_results_to_database=bool(data.get("upload_results_to_database", True)),
+        debug_artifact_streaming=bool(data.get("debug_artifact_streaming", False)),
         identity=measurement_identity_from_dict(identity_data) if identity_data else None,
     )
 

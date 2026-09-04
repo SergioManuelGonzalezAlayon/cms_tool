@@ -140,6 +140,20 @@ The test selector chooses:
 - `selector.config`: JSON config name, defaulting to `default`
 - `request.mode`: measurement profile, such as `default` or `full_sweep`
 
+## Result Upload Policy
+
+CMS Bench result upload is mode-based:
+
+- `default`, `full_sweep`, and `diff` runs upload results to the configured
+  database by default.
+- `debug` runs do not upload results to the database.
+
+The daemon enforces this policy before creating the `BenchSession`, and
+`cms_bench.py` forwards `--upload-results-to-database` to `test_orchestrator.py`
+only when the normalized request flag is true. This keeps debug runs local even
+if a request contains an unexpected upload value, and keeps normal bench runs
+database-backed even when the request omits the flag.
+
 ## Execution Flow
 
 The current `measurement_run()` flow is:
@@ -163,7 +177,7 @@ python test_orchestrator.py <config_dir> --mode <default|full_sweep> --feature <
 ```
 
 12. Add `--cfg <selector.config>` when the selected config is not `default`.
-13. Add `--upload-results-to-database` when requested.
+13. Add `--upload-results-to-database` for non-debug CMS Bench runs.
 14. Write `test_stdout.log`, `test_stderr.log`, and `cms_test_run.json`.
 15. Convert the orchestrator return code into `passed` or `failed`.
 16. Collect diagnostic and test artifacts.

@@ -48,7 +48,8 @@ from cms_protocol import (
 CMS_BENCH_CONFIG = "cms_bench_runtime.json"
 DEFAULT_CONSOLE_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_CONSOLE_EVENT_MAX_BYTES = 4 * 1024 * 1024
-DEFAULT_EXECUTION_TIMEOUT_S = 5 * 60
+# CMS measurements may run for days; cancellation is the normal stop mechanism.
+DEFAULT_EXECUTION_TIMEOUT_S: float | None = None
 PROCESS_TERMINATE_GRACE_S = 5.0
 MAX_CONSOLE_EVENT_SEGMENT_BYTES = 64 * 1024
 
@@ -264,7 +265,7 @@ class BenchSession:
     notes: list[str] = field(default_factory=list)
     max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
     max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
-    execution_timeout_s: float = DEFAULT_EXECUTION_TIMEOUT_S
+    execution_timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     event_stream: MeasurementEventStream = field(init=False, repr=False)
 
@@ -485,6 +486,11 @@ class CMSBench:
         tester_path = session.runtime_dir / session.manifest.tester_img.name
         _validate_firmware_file(dut_path, session.manifest.dut_img.sha256 or session.manifest.dut_img_hash)
         _validate_firmware_file(tester_path, session.manifest.tester_img.sha256 or session.manifest.tester_img_hash)
+        for name, image in session.manifest.dut_variants.items():
+            _validate_firmware_file(
+                session.runtime_dir / image.name,
+                image.sha256,
+            )
         if session.manifest.bootloader_img is not None:
             bootloader_path = session.runtime_dir / session.manifest.bootloader_img.name
             _validate_firmware_file(
@@ -499,6 +505,29 @@ class CMSBench:
             session.manifest.xapi_file.sha256 or session.manifest.xapi_file_hash,
         )
         _validate_variable_filtered_campaign(session)
+
+    def persist_staged_firmware_provenance(self, session: BenchSession) -> None:
+        """Record the validated client SDK provenance in persistent bench config."""
+
+        config = _load_json_with_trailing_commas(self.config_path)
+        ble = config.setdefault("ble", {})
+        if not isinstance(ble, dict):
+            raise RuntimeError("cms bench runtime config field 'ble' must be an object")
+        firmware = session.request.firmware
+        ble["sdk"] = {
+            "name": firmware.sisdk_name,
+            "source": firmware.sisdk_source,
+            "version": firmware.sisdk_version,
+            "commit": firmware.sisdk_commit,
+            "hash": firmware.sisdk_hash,
+            "xapi_sha256": firmware.xapi_file_hash,
+        }
+        temporary_path = self.config_path.with_name(self.config_path.name + ".tmp")
+        temporary_path.write_text(
+            json.dumps(config, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, self.config_path)
 
     def test_smoke(self, session: BenchSession) -> None:
         """Run a lightweight preflight before spending time on a full run."""
@@ -764,16 +793,40 @@ def resolve_cms_resources_from_hwmux(group_json: dict[str, Any]) -> BenchResourc
 
 def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) -> dict[str, Path]:
     build_root = session.runtime_dir / "fw_build"
-    config_data = _load_requested_test_config(session)
-    selected_config = _write_selected_config_evidence(session)
-    firmware = config_data.get("firmware", {})
-    dut_project = build_root / Path(str(firmware.get("dut_slcp", session.manifest.dut_img.name))).stem
-    tester_project = build_root / Path(str(firmware.get("tester_slcp", session.manifest.tester_img.name))).stem
-
-    dut_copied_image = _copy_image_to_project(
-        session.runtime_dir / session.manifest.dut_img.name,
-        dut_project,
+    config_data = _campaign_firmware_config(session)
+    selected_config = (
+        _write_selected_config_evidence(session)
+        if session.request.selector.feature != "all"
+        else {}
     )
+    firmware = config_data.get("firmware", {})
+    tester_project = build_root / Path(str(firmware.get("tester_slcp", session.manifest.tester_img.name))).stem
+    dut_copied_images: dict[str, Path] = {}
+    if session.manifest.dut_variants:
+        dut_projects = {
+            "dcdc": build_root / "ncp_ble_dut_dcdc",
+            "no_dcdc": build_root / "ncp_ble_dut",
+        }
+        missing_variants = set(dut_projects) - set(session.manifest.dut_variants)
+        if missing_variants:
+            raise RuntimeError(
+                "staged firmware is missing DUT variants: "
+                + ", ".join(sorted(missing_variants))
+            )
+        for name, project in dut_projects.items():
+            image = session.manifest.dut_variants[name]
+            dut_copied_images[name] = _copy_image_to_project(
+                session.runtime_dir / image.name,
+                project,
+            )
+    else:
+        dut_project = build_root / Path(
+            str(firmware.get("dut_slcp", session.manifest.dut_img.name))
+        ).stem
+        dut_copied_images["default"] = _copy_image_to_project(
+            session.runtime_dir / session.manifest.dut_img.name,
+            dut_project,
+        )
     tester_copied_image = _copy_image_to_project(
         session.runtime_dir / session.manifest.tester_img.name,
         tester_project,
@@ -813,14 +866,33 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
             "serial_number": resources.serial_number,
             "device": resources.device,
             "sisdk": session.manifest.sisdk_version,
+            "sisdk_name": session.manifest.sisdk_name,
+            "sisdk_source": session.manifest.sisdk_source,
+            "sisdk_version": session.manifest.sisdk_version,
+            "sisdk_commit": session.manifest.sisdk_commit,
+            "sisdk_hash": session.manifest.sisdk_hash,
+            "xapi_file_hash": session.manifest.xapi_file_hash,
             "dut_image": str(session.runtime_dir / session.manifest.dut_img.name),
             "tester_image": str(session.runtime_dir / session.manifest.tester_img.name),
             "dut_image_sha256": session.manifest.dut_img.sha256
             or session.manifest.dut_img_hash
-            or _sha256_file(dut_copied_image),
+            or _sha256_file(
+                dut_copied_images["dcdc"]
+                if "dcdc" in dut_copied_images
+                else dut_copied_images["default"]
+            ),
             "tester_image_sha256": session.manifest.tester_img.sha256
             or session.manifest.tester_img_hash
             or _sha256_file(tester_copied_image),
+            "dut_variants": {
+                name: {
+                    "image": str(image),
+                    "sha256": session.manifest.dut_variants[name].sha256
+                    or _sha256_file(image),
+                }
+                for name, image in dut_copied_images.items()
+                if name in session.manifest.dut_variants
+            },
             "dut_slcp": str(firmware.get("dut_slcp", "")),
             "tester_slcp": str(firmware.get("tester_slcp", "")),
             "bootloader_image": str(bootloader_copied_image) if bootloader_copied_image is not None else "",
@@ -847,14 +919,53 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
     }
     metadata_path = session.runtime_dir / "cms_fw_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    return {
+    prepared = {
         "build_root": build_root,
         "results_log": session.runtime_dir / "orchestrator_results.jsonl",
         "metadata_path": metadata_path,
-        "selected_config_path": selected_config["snapshot_path"],
-        "selected_config_metadata_path": selected_config["metadata_path"],
         "artifact_since": time.time(),
     }
+    if selected_config:
+        prepared["selected_config_path"] = selected_config["snapshot_path"]
+        prepared["selected_config_metadata_path"] = selected_config["metadata_path"]
+    return prepared
+
+
+def _campaign_firmware_config(session: BenchSession) -> dict[str, Any]:
+    """Return firmware metadata shared by the selected one- or all-feature campaign."""
+
+    if session.request.selector.feature != "all":
+        return _load_requested_test_config(session)
+
+    config_root = Path("tests") / "configs" / session.request.selector.mode
+    config_paths = sorted(config_root.glob("*/default.json"))
+    if not config_paths:
+        raise RuntimeError(f"no feature default configs exist beneath {config_root}")
+    configs = []
+    for config_path in config_paths:
+        try:
+            config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"test config is not valid JSON: {config_path}") from exc
+        if not isinstance(config_data, dict):
+            raise RuntimeError(f"test config must be a JSON object: {config_path}")
+        firmware = config_data.get("firmware", {})
+        if not isinstance(firmware, dict):
+            raise RuntimeError(f"test config firmware section must be an object: {config_path}")
+        configs.append((config_path, config_data))
+
+    firmware_projects = {
+        (
+            str(config_data["firmware"].get("dut_slcp", "")),
+            str(config_data["firmware"].get("tester_slcp", "")),
+        )
+        for _, config_data in configs
+    }
+    if len(firmware_projects) != 1:
+        raise RuntimeError(
+            "all-feature campaigns require identical DUT and tester firmware projects"
+        )
+    return configs[0][1]
 
 
 def _staged_xapi_path(session: BenchSession) -> Path:
@@ -890,15 +1001,15 @@ def _run_managed_process(
     stderr_path: Path,
     event_stream: MeasurementEventStream | None = None,
     log_max_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES,
-    timeout_s: float = DEFAULT_EXECUTION_TIMEOUT_S,
+    timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S,
     cancel_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a child while draining both output pipes into active runtime logs."""
 
     if log_max_bytes < 1:
         raise ValueError("log_max_bytes must be positive")
-    if timeout_s <= 0:
-        raise ValueError("timeout_s must be positive")
+    if timeout_s is not None and timeout_s <= 0:
+        raise ValueError("timeout_s must be positive when configured")
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     stdout_path.write_text("", encoding="utf-8")
@@ -967,7 +1078,7 @@ def _run_managed_process(
 
     timed_out = False
     cancelled = False
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     while True:
         if cancel_event is not None and cancel_event.is_set():
             cancelled = True
@@ -986,12 +1097,12 @@ def _run_managed_process(
             returncode = process.returncode if process.returncode is not None else -1
             break
 
-        remaining_s = deadline - time.monotonic()
-        if remaining_s <= 0:
+        remaining_s = None if deadline is None else deadline - time.monotonic()
+        if remaining_s is not None and remaining_s <= 0:
             timed_out = True
             break
         try:
-            returncode = process.wait(timeout=min(0.1, remaining_s))
+            returncode = process.wait(timeout=0.1 if remaining_s is None else min(0.1, remaining_s))
             break
         except subprocess.TimeoutExpired:
             continue
@@ -1117,7 +1228,9 @@ def _run_test_orchestrator(
     feature = session.request.selector.feature
     if not feature:
         raise RuntimeError("test feature is required")
-    config_dir = Path("tests") / "configs" / session.request.selector.mode / feature
+    config_dir = Path("tests") / "configs" / session.request.selector.mode
+    if feature != "all":
+        config_dir /= feature
     if not config_dir.exists():
         raise RuntimeError(f"test config directory does not exist: {config_dir}")
 
@@ -1129,8 +1242,6 @@ def _run_test_orchestrator(
         str(config_dir),
         "--mode",
         orchestrator_mode,
-        "--feature",
-        feature,
         "--results-log",
         str(results_log),
         "--cms-runtime-config",
@@ -1144,6 +1255,8 @@ def _run_test_orchestrator(
         "--log-file-mode",
         "w",
     ]
+    if feature != "all":
+        cmd.extend(["--feature", feature])
     if session.request.selector.config != "default":
         cmd.extend(["--exact-config", session.request.selector.config])
     for variable_filter in session.request.selector.variable_filters:
@@ -1301,8 +1414,9 @@ def _requested_test_config_path(session: BenchSession) -> Path:
 def _real_test_artifacts(session: BenchSession, *, since: float | None = None) -> list[Path]:
     feature = session.request.selector.feature
     mode = "full_sweep" if session.request.mode.value == "full_sweep" else "default"
+    feature_root = Path("artifacts") / session.request.selector.mode
     candidates = [
-        Path("artifacts") / session.request.selector.mode / feature / mode,
+        feature_root if feature == "all" else feature_root / feature / mode,
         Path("artifacts") / "orchestrator",
     ]
     artifacts: list[Path] = []

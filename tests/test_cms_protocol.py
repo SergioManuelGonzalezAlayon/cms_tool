@@ -154,6 +154,10 @@ def test_measurement_request_round_trip_preserves_requested_config_hash():
         firmware=FirmwareData(
             dut_img=FirmwareImage(name="dut.s37", url="dut.s37"),
             tester_img=FirmwareImage(name="tester.s37", url="tester.s37"),
+            dut_variants={
+                "dcdc": FirmwareImage(name="dut-dcdc.s37", url="dut-dcdc.s37"),
+                "no_dcdc": FirmwareImage(name="dut-no-dcdc.s37", url="dut-no-dcdc.s37"),
+            },
         ),
         mode=MeasurementMode.DEFAULT,
     )
@@ -162,6 +166,7 @@ def test_measurement_request_round_trip_preserves_requested_config_hash():
 
     assert payload["selector"]["config_hash"] == "sha256:dcdc"
     assert measurement_request_from_dict(payload).selector.config_hash == "sha256:dcdc"
+    assert measurement_request_from_dict(payload).firmware.dut_variants == request.firmware.dut_variants
 
 
 def test_measurement_request_round_trip_preserves_variable_filters():

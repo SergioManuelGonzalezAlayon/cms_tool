@@ -185,12 +185,19 @@ Owns:
 - log capture
 - artifact indexing
 - result publication
+- database publication policy
 
 Suggested directories:
 
 - `artifacts/cmsd/jobs/<job_id>/`
 - `artifacts/cmsd/downloads/`
 - `artifacts/cmsd/published/`
+
+Result publication policy:
+
+- normal CMS Bench test modes (`default`, `full_sweep`, and `diff`) upload results to the configured database by default
+- `debug` mode is the only CMS Bench test mode that does not upload results to the database
+- the daemon enforces this policy before launching the bench execution, so older clients that omit the upload flag still follow the bench-side default
 
 ## Bench Capabilities Model
 
@@ -678,7 +685,7 @@ We can call the daemon useful when all of the following are true:
 - Do we want token auth only for V1, or is office SSO required?
 - Where will firmware artifacts live long term: HTTP server, S3, CI artifacts, or internal package storage?
 - Do we want `cmsd.py` to trigger builds itself, or should that responsibility belong to a separate builder service?
-- Should the bench publish result summaries back to a database now, or only write artifact files first?
+- Which backend should receive the default non-debug result uploads, and what retry/idempotency policy should protect those writes?
 
 ## Recommendation
 

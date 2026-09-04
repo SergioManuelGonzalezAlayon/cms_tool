@@ -205,12 +205,12 @@ class CMSClient:
         mode: MeasurementMode,
         feature: str,
         config: str = "default",
-        upload_results_to_database: bool = False,
         run_name: str = "",
         variable_filters: tuple[VariableFilter, ...] = (),
+        debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
-        config_hash = _validate_local_test_config(feature, config)
+        config_hash = "" if feature == "all" else _validate_local_test_config(feature, config)
         payload = self._request_json(
             "POST",
             "/test",
@@ -224,7 +224,8 @@ class CMSClient:
                     for item in variable_filters
                 ],
                 "run_name": run_name,
-                "upload_results_to_database": upload_results_to_database,
+                "upload_results_to_database": True,
+                "debug_artifact_streaming": debug_artifact_streaming,
             },
         )
         return measurement_result_from_dict(payload)
@@ -601,8 +602,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  3. cms tests\n"
             "  4. cms BUILD\n"
             "  5. cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n"
-            "  6. cms TEST default beacon --config-name default --preview\n"
-            "  7. cms TEST default beacon --config-name default --out-dir artifacts\n"
+            "  6. cms TEST --mode default --feature beacon --config-name default --preview\n"
+            "  7. cms TEST --mode default --feature beacon --config-name default --out-dir artifacts\n"
             "  8. cms WATCH <measurement_id> --cursor <last_cursor>\n"
             "  9. cms CANCEL\n"
             " 10. cms ARTIFACTS <measurement_id> --out-dir artifacts\n\n"
@@ -695,7 +696,6 @@ def build_cli_parser() -> argparse.ArgumentParser:
     build.add_argument("targets", nargs="*", help="optional .slcp targets or app directories")
     build.add_argument("--action", default="build", choices=["generate", "upgrade", "build", "rebuild"])
     build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
-    build.add_argument("--sisdk-version", default="", help="override selected SiSDK version")
     build.add_argument("--build-root", default="", help="override firmware build root")
     build.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
 
@@ -710,7 +710,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "Defaults:\n"
             "  Firmware images and sl_bt.xapi are discovered from the configured build root.\n\n"
             "Next:\n"
-            "  Run cms TEST default beacon --config-name default --preview before starting a test."
+            "  Run cms TEST --mode default --feature beacon --config-name default --preview before starting a test."
         ),
     )
     _add_color_argument(send_fw)
@@ -737,15 +737,16 @@ def build_cli_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
-            "  cms TEST default beacon --config-name default --preview\n"
-            "  cms TEST default beacon --config-name default --out-dir artifacts\n"
-            "  cms TEST default beacon --config-name dcdc --preview\n"
-            "  cms TEST default beacon --config-name dcdc --upload-results-to-database\n"
-            "  cms TEST full_sweep beacon --variable phy=2m --preview\n"
-            "  cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
-            "Required arguments:\n"
-            "  mode      debug, default, full_sweep, or diff\n"
-            "  feature   BLE feature name such as beacon\n\n"
+            "  cms TEST --mode default --feature beacon --config-name default --preview\n"
+            "  cms TEST -m default -f beacon --config-name default --out-dir artifacts\n"
+            "  cms TEST --mode default --feature beacon --config-name dcdc --preview\n"
+            "  cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview\n"
+            "  cms TEST -m full_sweep -f beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
+            "Required options:\n"
+            "  --mode, -m      default, full_sweep, or diff\n"
+            "  --feature, -f  BLE feature name such as beacon, or all\n\n"
+            "Database policy:\n"
+            "  all runs upload results to the configured database.\n\n"
             "Variable filters:\n"
             "  Use --variable name=value to target generated configs by parameter.\n"
             "  Names and values come from the selected feature's parameters.json.\n"
@@ -760,8 +761,22 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_color_argument(test)
-    test.add_argument("mode", choices=[mode.value for mode in MeasurementMode])
-    test.add_argument("feature")
+    test.add_argument(
+        "--mode",
+        "-m",
+        required=True,
+        choices=[
+            MeasurementMode.DEFAULT.value,
+            MeasurementMode.FULL_SWEEP.value,
+            MeasurementMode.DIFF.value,
+        ],
+    )
+    test.add_argument(
+        "--feature",
+        "-f",
+        required=True,
+        help="BLE feature name, or all to select every available feature",
+    )
     test.add_argument("--config-name", default="default", help="test config")
     test.add_argument(
         "--variable",
@@ -781,6 +796,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
     test.add_argument(
+        "--debug",
+        action="store_true",
+        help="retrieve completed test result artifacts while the measurement is running",
+    )
+    test.add_argument(
         "--preview",
         action="store_true",
         help="show exactly what test would be submitted without starting it",
@@ -796,15 +816,6 @@ def build_cli_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="seconds between observation polls",
     )
-    test.add_argument(
-        "--send-to-database",
-        "--upload-results-to-database",
-        action="store_true",
-        dest="upload_results_to_database",
-        help="also upload generated result JSON files to the configured database/data lake",
-    )
-
-
     measurement = subparsers.add_parser(
         "measurement",
         help="show measurement status",
@@ -1013,7 +1024,8 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"tests", "TESTS"}:
         payload = client.list_tests()
-        print("modes: " + ", ".join(payload.get("modes", [])))
+        modes = [mode for mode in payload.get("modes", []) if mode != MeasurementMode.DEBUG.value]
+        print("modes: " + ", ".join(modes))
         for feature in payload.get("features", []):
             configs = ", ".join(feature.get("configs", []))
             print(f"{feature.get('feature', '')}: {configs}")
@@ -1066,39 +1078,16 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"test", "TEST"}:
         variable_filters = parse_variable_filters(args.variable)
+        if args.feature == "all" and args.config_name != "default":
+            raise RuntimeError("--feature all only supports the default config")
+        if args.feature == "all" and variable_filters:
+            raise RuntimeError("--feature all cannot be combined with --variable")
         if variable_filters:
             validate_variable_filters(_local_parameters_path(args.feature), variable_filters)
         if args.preview:
             _print_test_preview(args, variable_filters)
             return CMSCLIExitCode.SUCCESS
-        result = client.run_test(
-            MeasurementMode(args.mode),
-            args.feature,
-            config=args.config_name,
-            run_name=args.run_name,
-            upload_results_to_database=args.upload_results_to_database,
-            variable_filters=variable_filters,
-        )
-        if not result.measurement_id:
-            _print_measurement_result(result, colors=colors)
-            return _measurement_exit_code(result.state)
-        state = _watch_remote_measurement(
-            client,
-            result.measurement_id,
-            verbose=args.verbose,
-            poll_interval_s=args.poll_interval,
-            colors=colors,
-        )
-        result = client.get_measurement(result.measurement_id)
-        if result.artifacts:
-            for path in client.download_measurement_artifacts(
-                result.measurement_id,
-                Path(args.out_dir),
-            ):
-                print(f"saved {path}")
-        return _measurement_exit_code(
-            state.summary.state if state.summary is not None else None
-        )
+        return _run_test_feature(client, args, variable_filters, colors)
 
     if args.command in {"cancel", "CANCEL"}:
         result = client.cancel_active_test()
@@ -1176,7 +1165,8 @@ def _request_from_send_fw_args(
     dut_image_arg = args.dut_image or str(target_cfg.get("dut_image", ""))
     tester_image_arg = args.tester_image or str(target_cfg.get("tester_image", ""))
     bootloader_image_arg = args.bootloader_image or str(target_cfg.get("bootloader_image", ""))
-    dut_image = _firmware_image_from_arg(dut_image_arg, "dut", firmware_cfg)
+    dut_image = _firmware_image_from_arg(dut_image_arg, "dut_dcdc", firmware_cfg)
+    no_dcdc_dut_image = _firmware_image_from_arg("", "dut_no_dcdc", firmware_cfg)
     tester_image = _firmware_image_from_arg(tester_image_arg, "tester", firmware_cfg)
     bootloader_image = _firmware_image_from_arg(
         bootloader_image_arg,
@@ -1187,6 +1177,11 @@ def _request_from_send_fw_args(
         dut_image,
         requested=args.dut_sha256,
         fallback=str(target_cfg.get("dut_sha256", firmware_cfg.get("dut_app_hash", ""))),
+    )
+    no_dcdc_dut_sha256 = _selected_firmware_sha256(
+        no_dcdc_dut_image,
+        requested="",
+        fallback="",
     )
     tester_sha256 = _selected_firmware_sha256(
         tester_image,
@@ -1204,12 +1199,29 @@ def _request_from_send_fw_args(
         if bootloader_image is not None
         else ""
     )
-    xapi_file = Path(str(fw_data.get("build", {}).get("xapi", build_root / "runtime" / "sl_bt.xapi")))
+    sdk_package_path = Path(str(sdk_cfg.get("package_path", "")))
+    if not sdk_package_path.is_dir():
+        raise RuntimeError(
+            "Selected firmware build does not record a usable SiSDK package path: "
+            f"{sdk_package_path}"
+        )
+    sisdk_name = _sisdk_name_from_properties(sdk_package_path)
+    if not sisdk_name:
+        raise RuntimeError(
+            "Selected SiSDK package does not declare an SDK id in .properties: "
+            f"{sdk_package_path}"
+        )
+    xapi_file = sdk_package_path / "bluetooth_le_host" / "api" / "sl_bt.xapi"
     if not xapi_file.is_file():
-        raise RuntimeError(f"Staged sl_bt.xapi from the selected build does not exist: {xapi_file}")
+        raise RuntimeError(
+            "Selected SiSDK BGAPI definition does not exist: "
+            f"{xapi_file}"
+        )
     xapi_hash = _sha256_file(xapi_file)
     if recorded_xapi_hash != xapi_hash:
-        raise RuntimeError("Staged sl_bt.xapi hash does not match the selected build provenance")
+        raise RuntimeError(
+            "Selected SiSDK BGAPI definition hash does not match the firmware build provenance"
+        )
 
     request_id = args.request_id or f"cms-{int(time.time())}"
     return MeasurementRequest(
@@ -1226,6 +1238,18 @@ def _request_from_send_fw_args(
                 url=tester_image["url"],
                 sha256=tester_sha256,
             ),
+            dut_variants={
+                "dcdc": FirmwareImage(
+                    name=dut_image["name"],
+                    url=dut_image["url"],
+                    sha256=dut_sha256,
+                ),
+                "no_dcdc": FirmwareImage(
+                    name=no_dcdc_dut_image["name"],
+                    url=no_dcdc_dut_image["url"],
+                    sha256=no_dcdc_dut_sha256,
+                ),
+            },
             bootloader_img=FirmwareImage(
                 name=bootloader_image["name"],
                 url=bootloader_image["url"],
@@ -1241,6 +1265,7 @@ def _request_from_send_fw_args(
             ),
             xapi_file_hash=xapi_hash,
             git_commit=args.git_commit,
+            sisdk_name=sisdk_name,
             sisdk_source=sdk_source,
             sisdk_version=sdk_version,
             sisdk_commit=sdk_commit,
@@ -1258,12 +1283,23 @@ def _require_matching_build_provenance(label: str, requested: str, built: str) -
         )
 
 
+def _sisdk_name_from_properties(sdk_package_path: Path) -> str:
+    properties_path = sdk_package_path / ".properties"
+    if not properties_path.is_file():
+        return ""
+    for line in properties_path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "id" and value.strip():
+            return value.strip()
+    return ""
+
+
 def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
+    _sync_config_sisdk_version(config_path, args.sdk_package_path)
     cmd = [sys.executable, str(Path("apps") / "app_manager.py"), args.action, *args.targets]
     for option, value in (
         ("--config", config_path),
         ("--sdk-package-path", args.sdk_package_path),
-        ("--sisdk-version", args.sisdk_version),
         ("--build-root", args.build_root),
         ("--bootloader-slcp", args.bootloader_slcp),
     ):
@@ -1271,6 +1307,41 @@ def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
             cmd.extend([option, value])
     result = subprocess.run(cmd, check=False)
     return result.returncode
+
+
+def _sync_config_sisdk_version(config_path: str | Path, sdk_package_path: str = "") -> str:
+    """Record the selected SDK's installed version in persistent client config."""
+
+    path = Path(config_path)
+    if not path.is_file():
+        raise RuntimeError(f"CMS client config does not exist: {path}")
+    config = _read_json_file(path)
+    target = config.get("target")
+    if not isinstance(target, dict):
+        raise RuntimeError("cms_client_config.json must contain a target object")
+    selected_path = sdk_package_path or str(target.get("sisdk_package_path", ""))
+    if not selected_path:
+        raise RuntimeError(
+            "No SiSDK package path is configured. Set target.sisdk_package_path in "
+            "cms_client_config.json or pass --sdk-package-path <path> to cms BUILD."
+        )
+    sdk_path = Path(selected_path).expanduser()
+    if not sdk_path.is_absolute():
+        sdk_path = (path.parent / sdk_path).resolve()
+    properties_path = sdk_path / ".properties"
+    if not properties_path.is_file():
+        raise RuntimeError(f"SiSDK package path is missing .properties: {properties_path}")
+    version = ""
+    for line in properties_path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "version" and value.strip():
+            version = value.strip()
+            break
+    if not version:
+        raise RuntimeError(f"SiSDK package properties are missing version: {properties_path}")
+    target["sisdk"] = version
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return version
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
@@ -1283,6 +1354,8 @@ def _discover_built_firmware(role: str, firmware_cfg: dict[str, Any]) -> Path:
     build_root = Path(str(firmware_cfg.get("build_root", ".fw_build")))
     candidates_by_role = {
         "dut": ["ncp_ble_dut_dcdc", "ncp_ble_dut"],
+        "dut_dcdc": ["ncp_ble_dut_dcdc"],
+        "dut_no_dcdc": ["ncp_ble_dut"],
         "tester": ["ncp_ble_tester"],
         "bootloader": ["bootloader-uart-bgapi"],
     }
@@ -1379,6 +1452,10 @@ def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
         path = Path(image.url)
         if path.exists() and path.is_file():
             payloads[key] = base64.b64encode(path.read_bytes()).decode("ascii")
+    for name, image in request.firmware.dut_variants.items():
+        path = Path(image.url)
+        if path.exists() and path.is_file():
+            payloads[f"dut_variant:{name}"] = base64.b64encode(path.read_bytes()).decode("ascii")
     if request.firmware.bootloader_img is not None:
         path = Path(request.firmware.bootloader_img.url)
         if path.exists() and path.is_file():
@@ -1419,19 +1496,59 @@ def _local_parameters_path(feature: str) -> Path:
     return parameters_path
 
 
+def _run_test_feature(
+    client: CMSClient,
+    args: argparse.Namespace,
+    variable_filters: tuple[VariableFilter, ...],
+    colors: ColorFormatter,
+) -> CMSCLIExitCode:
+    """Submit, observe, and collect artifacts for one feature measurement."""
+
+    result = client.run_test(
+        MeasurementMode(args.mode),
+        args.feature,
+        config=args.config_name,
+        run_name=args.run_name,
+        variable_filters=variable_filters,
+        debug_artifact_streaming=args.debug,
+    )
+    if not result.measurement_id:
+        _print_measurement_result(result, colors=colors)
+        return _measurement_exit_code(result.state)
+    state = _watch_remote_measurement(
+        client,
+        result.measurement_id,
+        verbose=args.verbose,
+        poll_interval_s=args.poll_interval,
+        colors=colors,
+    )
+    result = client.get_measurement(result.measurement_id)
+    if result.artifacts:
+        for path in client.download_measurement_artifacts(
+            result.measurement_id,
+            Path(args.out_dir),
+        ):
+            print(f"saved {path}")
+    return _measurement_exit_code(state.summary.state if state.summary is not None else None)
+
+
 def _preview_job_count(
     args: argparse.Namespace,
     variable_filters: tuple[VariableFilter, ...],
 ) -> int:
     from test_orchestrator import build_jobs
 
-    config_root = Path("tests") / "configs" / "ble" / args.feature
+    config_root = Path("tests") / "configs" / "ble"
+    feature_filters = set()
+    if args.feature != "all":
+        config_root /= args.feature
+        feature_filters.add(args.feature)
     exact_config = "" if args.config_name == "default" else args.config_name
     discovery_mode = "all" if exact_config else args.mode
     jobs = build_jobs(
         [config_root],
         mode=discovery_mode,
-        feature_filters={args.feature},
+        feature_filters=feature_filters,
         partition_filters=set(),
         exact_config=exact_config,
         variable_filters=variable_filters,
@@ -1443,30 +1560,37 @@ def _print_test_preview(
     args: argparse.Namespace,
     variable_filters: tuple[VariableFilter, ...] = (),
 ) -> None:
-    config_path = _local_test_config_path(args.feature, args.config_name)
-    config_hash = _validate_local_test_config(args.feature, args.config_name)
-    parameters_path = _local_parameters_path(args.feature)
-    validate_variable_filters(parameters_path, variable_filters)
+    all_features = args.feature == "all"
+    config_path = (
+        Path("tests") / "configs" / "ble"
+        if all_features
+        else _local_test_config_path(args.feature, args.config_name)
+    )
+    config_hash = "" if all_features else _validate_local_test_config(args.feature, args.config_name)
+    parameters_path = None if all_features else _local_parameters_path(args.feature)
+    if parameters_path is not None:
+        validate_variable_filters(parameters_path, variable_filters)
     expected_job_count = _preview_job_count(args, variable_filters)
     print("test preview")
     print(f"mode: {args.mode}")
     print(f"feature: {args.feature}")
     print(f"config: {args.config_name}")
     print(f"config_path: {config_path}")
-    print(f"config_hash: {config_hash}")
+    if config_hash:
+        print(f"config_hash: {config_hash}")
     if variable_filters:
         print(
             "variables: "
             + ", ".join(f"{item.name}={item.value}" for item in variable_filters)
         )
     print(f"expected_jobs: {expected_job_count}")
-    print("available_variables:")
-    for line in variable_help_text(parameters_path).splitlines():
-        print(f"  {line}")
+    if parameters_path is not None:
+        print("available_variables:")
+        for line in variable_help_text(parameters_path).splitlines():
+            print(f"  {line}")
     if args.run_name:
         print(f"run_name: {args.run_name}")
-    destination = "database" if args.upload_results_to_database else "cms_client"
-    print(f"results_destination: {destination}")
+    print("results_destination: database")
 
 
 def _failed_test_records_from_job_results(records: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -1492,7 +1616,7 @@ def _failed_test_records_from_job_results(records: list[dict[str, Any]]) -> list
 def _rerun_command(failed_test: dict[str, str]) -> str:
     feature = failed_test["feature"]
     config = Path(failed_test["config"]).stem
-    return f"cms TEST default {feature} --config-name {config}"
+    return f"cms TEST --mode default --feature {feature} --config-name {config}"
 
 
 def _print_failed_tests(
@@ -1540,12 +1664,12 @@ def _print_operator_recipes(args: argparse.Namespace) -> None:
     cursor = args.cursor
     out_dir = args.out_dir
     print("Default config:")
-    print(f"  cms TEST default {feature} --config-name default --preview")
-    print(f"  cms TEST default {feature} --config-name default --out-dir {out_dir}")
+    print(f"  cms TEST --mode default --feature {feature} --config-name default --preview")
+    print(f"  cms TEST --mode default --feature {feature} --config-name default --out-dir {out_dir}")
     print()
     print("Exact named config:")
-    print(f"  cms TEST default {feature} --config-name {config_name} --preview")
-    print(f"  cms TEST default {feature} --config-name {config_name} --out-dir {out_dir}")
+    print(f"  cms TEST --mode default --feature {feature} --config-name {config_name} --preview")
+    print(f"  cms TEST --mode default --feature {feature} --config-name {config_name} --out-dir {out_dir}")
     print()
     print("Attach or reconnect:")
     print("  cms WATCH")
@@ -1610,7 +1734,7 @@ def _troubleshooting_topics() -> dict[str, tuple[str, tuple[str, ...]]]:
             "unavailable named configs",
             (
                 "Run cms tests and confirm the feature and config are advertised.",
-                "Run cms TEST <mode> <feature> --config-name <name> --preview before submitting.",
+                "Run cms TEST --mode <mode> --feature <feature> --config-name <name> --preview before submitting.",
                 "The client and bench reject missing, malformed, path-traversal, and hash-mismatched configs before hardware execution.",
             ),
         ),

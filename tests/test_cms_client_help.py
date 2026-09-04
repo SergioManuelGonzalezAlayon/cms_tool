@@ -27,7 +27,7 @@ def test_top_level_help_shows_normal_workflow(capsys):
     assert "Normal workflow:" in text
     assert "cms health" in text
     assert "cms SEND_FW" in text
-    assert "cms TEST default beacon --config-name default" in text
+    assert "cms TEST --mode default --feature beacon --config-name default" in text
     assert "cms WATCH <measurement_id> --cursor <last_cursor>" in text
     assert "cms ARTIFACTS <measurement_id>" in text
 
@@ -50,12 +50,12 @@ def test_test_help_explains_config_preview_watch_and_results(capsys):
     assert "--config-name" in text
     assert "--variable" in text
     assert "parameters.json" in text
-    assert "cms TEST full_sweep beacon --variable phy=2m --preview" in text
+    assert "cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview" in text
     assert "phy values coded, 1m, 2m" in text
     assert "--preview" in text
     assert "--upload-results-to-database" in text
     assert "Example:" in text
-    assert "cms TEST default beacon --config-name dcdc --preview" in text
+    assert "cms TEST --mode default --feature beacon --config-name dcdc --preview" in text
     assert "Next:" in text
 
 
@@ -149,7 +149,7 @@ def test_variable_filter_docs_use_declared_beacon_parameter_spelling():
     assert "tests/configs/ble/beacon/parameters.json" in docs
     assert "`phy` with accepted values `coded`, `1m`, and `2m`" in docs
     assert "`dcdc` with values `On` and `Off`" in docs
-    assert "cms TEST full_sweep beacon --variable phy=2m --preview" in docs
-    assert "cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --preview" in docs
+    assert "cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview" in docs
+    assert "cms TEST --mode full_sweep --feature beacon --variable phy=2m --variable dcdc=On --preview" in docs
     assert "cms FAILED <measurement_id> --json" in docs
     assert "--color auto|always|never" in docs

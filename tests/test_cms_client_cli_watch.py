@@ -49,7 +49,7 @@ def test_cli_accepts_explicit_or_active_watch_and_explicit_artifacts() -> None:
     )
     active = parser.parse_args(["watch"])
     artifacts = parser.parse_args(["artifacts", MEASUREMENT_ID, "--out-dir", "downloads"])
-    submitted = parser.parse_args(["test", "default", "beacon", "--verbose"])
+    submitted = parser.parse_args(["test", "--mode", "default", "--feature", "beacon", "--verbose"])
 
     assert explicit.measurement_id == MEASUREMENT_ID
     assert explicit.cursor == 17
@@ -218,12 +218,45 @@ def test_test_command_reuses_watch_and_downloads_by_submitted_measurement_id(
     )
 
     exit_code = cms_client.main(
-        ["test", "default", "beacon", "--out-dir", str(tmp_path)]
+        ["test", "--mode", "default", "--feature", "beacon", "--out-dir", str(tmp_path)]
     )
 
     assert exit_code == 0
     assert watched[0][0] == MEASUREMENT_ID
     assert client.downloads == [(MEASUREMENT_ID, tmp_path)]
+
+
+def test_all_feature_selection_submits_one_campaign(monkeypatch) -> None:
+    class Client:
+        def __init__(self):
+            self.submitted_features = []
+
+        def run_test(self, mode, feature, **kwargs):
+            self.submitted_features.append(feature)
+            return MeasurementResult(
+                measurement_id="measurement-all",
+                state=MeasurementState.ACCEPTED,
+            )
+
+        def get_measurement(self, measurement_id):
+            return MeasurementResult(measurement_id=measurement_id, state=MeasurementState.PASSED)
+
+    client = Client()
+    watched = []
+    monkeypatch.setattr(cms_client, "CMSClient", lambda **kwargs: client)
+    monkeypatch.setattr(
+        cms_client,
+        "_watch_remote_measurement",
+        lambda client, measurement_id, **kwargs: (
+            watched.append(measurement_id) or _terminal_watch_state()
+        ),
+    )
+
+    exit_code = cms_client.main(["test", "--mode", "default", "--feature", "all"])
+
+    assert exit_code == 0
+    assert client.submitted_features == ["all"]
+    assert watched == ["measurement-all"]
 
 
 def test_artifacts_command_never_uses_last_measurement(tmp_path: Path, monkeypatch) -> None:
