@@ -769,8 +769,12 @@ def resolve_cms_resources_from_hwmux(group_json: dict[str, Any]) -> BenchResourc
 
 def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) -> dict[str, Path]:
     build_root = session.runtime_dir / "fw_build"
-    config_data = _load_requested_test_config(session)
-    selected_config = _write_selected_config_evidence(session)
+    config_data = _campaign_firmware_config(session)
+    selected_config = (
+        _write_selected_config_evidence(session)
+        if session.request.selector.feature != "all"
+        else {}
+    )
     firmware = config_data.get("firmware", {})
     tester_project = build_root / Path(str(firmware.get("tester_slcp", session.manifest.tester_img.name))).stem
     dut_copied_images: dict[str, Path] = {}
@@ -885,14 +889,53 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
     }
     metadata_path = session.runtime_dir / "cms_fw_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    return {
+    prepared = {
         "build_root": build_root,
         "results_log": session.runtime_dir / "orchestrator_results.jsonl",
         "metadata_path": metadata_path,
-        "selected_config_path": selected_config["snapshot_path"],
-        "selected_config_metadata_path": selected_config["metadata_path"],
         "artifact_since": time.time(),
     }
+    if selected_config:
+        prepared["selected_config_path"] = selected_config["snapshot_path"]
+        prepared["selected_config_metadata_path"] = selected_config["metadata_path"]
+    return prepared
+
+
+def _campaign_firmware_config(session: BenchSession) -> dict[str, Any]:
+    """Return firmware metadata shared by the selected one- or all-feature campaign."""
+
+    if session.request.selector.feature != "all":
+        return _load_requested_test_config(session)
+
+    config_root = Path("tests") / "configs" / session.request.selector.mode
+    config_paths = sorted(config_root.glob("*/default.json"))
+    if not config_paths:
+        raise RuntimeError(f"no feature default configs exist beneath {config_root}")
+    configs = []
+    for config_path in config_paths:
+        try:
+            config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"test config is not valid JSON: {config_path}") from exc
+        if not isinstance(config_data, dict):
+            raise RuntimeError(f"test config must be a JSON object: {config_path}")
+        firmware = config_data.get("firmware", {})
+        if not isinstance(firmware, dict):
+            raise RuntimeError(f"test config firmware section must be an object: {config_path}")
+        configs.append((config_path, config_data))
+
+    firmware_projects = {
+        (
+            str(config_data["firmware"].get("dut_slcp", "")),
+            str(config_data["firmware"].get("tester_slcp", "")),
+        )
+        for _, config_data in configs
+    }
+    if len(firmware_projects) != 1:
+        raise RuntimeError(
+            "all-feature campaigns require identical DUT and tester firmware projects"
+        )
+    return configs[0][1]
 
 
 def _staged_xapi_path(session: BenchSession) -> Path:
@@ -1155,7 +1198,9 @@ def _run_test_orchestrator(
     feature = session.request.selector.feature
     if not feature:
         raise RuntimeError("test feature is required")
-    config_dir = Path("tests") / "configs" / session.request.selector.mode / feature
+    config_dir = Path("tests") / "configs" / session.request.selector.mode
+    if feature != "all":
+        config_dir /= feature
     if not config_dir.exists():
         raise RuntimeError(f"test config directory does not exist: {config_dir}")
 
@@ -1167,8 +1212,6 @@ def _run_test_orchestrator(
         str(config_dir),
         "--mode",
         orchestrator_mode,
-        "--feature",
-        feature,
         "--results-log",
         str(results_log),
         "--cms-runtime-config",
@@ -1182,6 +1225,8 @@ def _run_test_orchestrator(
         "--log-file-mode",
         "w",
     ]
+    if feature != "all":
+        cmd.extend(["--feature", feature])
     if session.request.selector.config != "default":
         cmd.extend(["--exact-config", session.request.selector.config])
     for variable_filter in session.request.selector.variable_filters:
@@ -1339,8 +1384,9 @@ def _requested_test_config_path(session: BenchSession) -> Path:
 def _real_test_artifacts(session: BenchSession, *, since: float | None = None) -> list[Path]:
     feature = session.request.selector.feature
     mode = "full_sweep" if session.request.mode.value == "full_sweep" else "default"
+    feature_root = Path("artifacts") / session.request.selector.mode
     candidates = [
-        Path("artifacts") / session.request.selector.mode / feature / mode,
+        feature_root if feature == "all" else feature_root / feature / mode,
         Path("artifacts") / "orchestrator",
     ]
     artifacts: list[Path] = []

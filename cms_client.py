@@ -209,7 +209,7 @@ class CMSClient:
         variable_filters: tuple[VariableFilter, ...] = (),
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
-        config_hash = _validate_local_test_config(feature, config)
+        config_hash = "" if feature == "all" else _validate_local_test_config(feature, config)
         payload = self._request_json(
             "POST",
             "/test",
@@ -223,7 +223,7 @@ class CMSClient:
                     for item in variable_filters
                 ],
                 "run_name": run_name,
-                "upload_results_to_database": _should_upload_results_to_database(mode),
+                "upload_results_to_database": True,
             },
         )
         return measurement_result_from_dict(payload)
@@ -462,11 +462,6 @@ def _observation_path(path: str, **query: str) -> str:
     return f"{path}?{urllib.parse.urlencode(parameters)}"
 
 
-def _should_upload_results_to_database(mode: MeasurementMode | str) -> bool:
-    measurement_mode = mode if isinstance(mode, MeasurementMode) else MeasurementMode(str(mode))
-    return measurement_mode is not MeasurementMode.DEBUG
-
-
 def _validate_observation_envelope(
     payload: dict[str, Any],
     expected_measurement_id: str | None = None,
@@ -605,8 +600,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  3. cms tests\n"
             "  4. cms BUILD\n"
             "  5. cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n"
-            "  6. cms TEST default beacon --config-name default --preview\n"
-            "  7. cms TEST default beacon --config-name default --out-dir artifacts\n"
+            "  6. cms TEST --mode default --feature beacon --config-name default --preview\n"
+            "  7. cms TEST --mode default --feature beacon --config-name default --out-dir artifacts\n"
             "  8. cms WATCH <measurement_id> --cursor <last_cursor>\n"
             "  9. cms CANCEL\n"
             " 10. cms ARTIFACTS <measurement_id> --out-dir artifacts\n\n"
@@ -714,7 +709,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "Defaults:\n"
             "  Firmware images and sl_bt.xapi are discovered from the configured build root.\n\n"
             "Next:\n"
-            "  Run cms TEST default beacon --config-name default --preview before starting a test."
+            "  Run cms TEST --mode default --feature beacon --config-name default --preview before starting a test."
         ),
     )
     _add_color_argument(send_fw)
@@ -741,18 +736,16 @@ def build_cli_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
-            "  cms TEST default beacon --config-name default --preview\n"
-            "  cms TEST default beacon --config-name default --out-dir artifacts\n"
-            "  cms TEST default beacon --config-name dcdc --preview\n"
-            "  cms TEST debug beacon --config-name default --preview\n"
-            "  cms TEST full_sweep beacon --variable phy=2m --preview\n"
-            "  cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
-            "Required arguments:\n"
-            "  mode      debug, default, full_sweep, or diff\n"
-            "  feature   BLE feature name such as beacon\n\n"
+            "  cms TEST --mode default --feature beacon --config-name default --preview\n"
+            "  cms TEST -m default -f beacon --config-name default --out-dir artifacts\n"
+            "  cms TEST --mode default --feature beacon --config-name dcdc --preview\n"
+            "  cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview\n"
+            "  cms TEST -m full_sweep -f beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
+            "Required options:\n"
+            "  --mode, -m      default, full_sweep, or diff\n"
+            "  --feature, -f  BLE feature name such as beacon, or all\n\n"
             "Database policy:\n"
-            "  default, full_sweep, and diff runs upload results to the configured database by default.\n"
-            "  debug runs do not upload results to the database.\n\n"
+            "  all runs upload results to the configured database.\n\n"
             "Variable filters:\n"
             "  Use --variable name=value to target generated configs by parameter.\n"
             "  Names and values come from the selected feature's parameters.json.\n"
@@ -767,8 +760,22 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_color_argument(test)
-    test.add_argument("mode", choices=[mode.value for mode in MeasurementMode])
-    test.add_argument("feature")
+    test.add_argument(
+        "--mode",
+        "-m",
+        required=True,
+        choices=[
+            MeasurementMode.DEFAULT.value,
+            MeasurementMode.FULL_SWEEP.value,
+            MeasurementMode.DIFF.value,
+        ],
+    )
+    test.add_argument(
+        "--feature",
+        "-f",
+        required=True,
+        help="BLE feature name, or all to select every available feature",
+    )
     test.add_argument("--config-name", default="default", help="test config")
     test.add_argument(
         "--variable",
@@ -1011,7 +1018,8 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"tests", "TESTS"}:
         payload = client.list_tests()
-        print("modes: " + ", ".join(payload.get("modes", [])))
+        modes = [mode for mode in payload.get("modes", []) if mode != MeasurementMode.DEBUG.value]
+        print("modes: " + ", ".join(modes))
         for feature in payload.get("features", []):
             configs = ", ".join(feature.get("configs", []))
             print(f"{feature.get('feature', '')}: {configs}")
@@ -1064,38 +1072,16 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"test", "TEST"}:
         variable_filters = parse_variable_filters(args.variable)
+        if args.feature == "all" and args.config_name != "default":
+            raise RuntimeError("--feature all only supports the default config")
+        if args.feature == "all" and variable_filters:
+            raise RuntimeError("--feature all cannot be combined with --variable")
         if variable_filters:
             validate_variable_filters(_local_parameters_path(args.feature), variable_filters)
         if args.preview:
             _print_test_preview(args, variable_filters)
             return CMSCLIExitCode.SUCCESS
-        result = client.run_test(
-            MeasurementMode(args.mode),
-            args.feature,
-            config=args.config_name,
-            run_name=args.run_name,
-            variable_filters=variable_filters,
-        )
-        if not result.measurement_id:
-            _print_measurement_result(result, colors=colors)
-            return _measurement_exit_code(result.state)
-        state = _watch_remote_measurement(
-            client,
-            result.measurement_id,
-            verbose=args.verbose,
-            poll_interval_s=args.poll_interval,
-            colors=colors,
-        )
-        result = client.get_measurement(result.measurement_id)
-        if result.artifacts:
-            for path in client.download_measurement_artifacts(
-                result.measurement_id,
-                Path(args.out_dir),
-            ):
-                print(f"saved {path}")
-        return _measurement_exit_code(
-            state.summary.state if state.summary is not None else None
-        )
+        return _run_test_feature(client, args, variable_filters, colors)
 
     if args.command in {"cancel", "CANCEL"}:
         result = client.cancel_active_test()
@@ -1440,19 +1426,58 @@ def _local_parameters_path(feature: str) -> Path:
     return parameters_path
 
 
+def _run_test_feature(
+    client: CMSClient,
+    args: argparse.Namespace,
+    variable_filters: tuple[VariableFilter, ...],
+    colors: ColorFormatter,
+) -> CMSCLIExitCode:
+    """Submit, observe, and collect artifacts for one feature measurement."""
+
+    result = client.run_test(
+        MeasurementMode(args.mode),
+        args.feature,
+        config=args.config_name,
+        run_name=args.run_name,
+        variable_filters=variable_filters,
+    )
+    if not result.measurement_id:
+        _print_measurement_result(result, colors=colors)
+        return _measurement_exit_code(result.state)
+    state = _watch_remote_measurement(
+        client,
+        result.measurement_id,
+        verbose=args.verbose,
+        poll_interval_s=args.poll_interval,
+        colors=colors,
+    )
+    result = client.get_measurement(result.measurement_id)
+    if result.artifacts:
+        for path in client.download_measurement_artifacts(
+            result.measurement_id,
+            Path(args.out_dir),
+        ):
+            print(f"saved {path}")
+    return _measurement_exit_code(state.summary.state if state.summary is not None else None)
+
+
 def _preview_job_count(
     args: argparse.Namespace,
     variable_filters: tuple[VariableFilter, ...],
 ) -> int:
     from test_orchestrator import build_jobs
 
-    config_root = Path("tests") / "configs" / "ble" / args.feature
+    config_root = Path("tests") / "configs" / "ble"
+    feature_filters = set()
+    if args.feature != "all":
+        config_root /= args.feature
+        feature_filters.add(args.feature)
     exact_config = "" if args.config_name == "default" else args.config_name
     discovery_mode = "all" if exact_config else args.mode
     jobs = build_jobs(
         [config_root],
         mode=discovery_mode,
-        feature_filters={args.feature},
+        feature_filters=feature_filters,
         partition_filters=set(),
         exact_config=exact_config,
         variable_filters=variable_filters,
@@ -1464,30 +1489,37 @@ def _print_test_preview(
     args: argparse.Namespace,
     variable_filters: tuple[VariableFilter, ...] = (),
 ) -> None:
-    config_path = _local_test_config_path(args.feature, args.config_name)
-    config_hash = _validate_local_test_config(args.feature, args.config_name)
-    parameters_path = _local_parameters_path(args.feature)
-    validate_variable_filters(parameters_path, variable_filters)
+    all_features = args.feature == "all"
+    config_path = (
+        Path("tests") / "configs" / "ble"
+        if all_features
+        else _local_test_config_path(args.feature, args.config_name)
+    )
+    config_hash = "" if all_features else _validate_local_test_config(args.feature, args.config_name)
+    parameters_path = None if all_features else _local_parameters_path(args.feature)
+    if parameters_path is not None:
+        validate_variable_filters(parameters_path, variable_filters)
     expected_job_count = _preview_job_count(args, variable_filters)
     print("test preview")
     print(f"mode: {args.mode}")
     print(f"feature: {args.feature}")
     print(f"config: {args.config_name}")
     print(f"config_path: {config_path}")
-    print(f"config_hash: {config_hash}")
+    if config_hash:
+        print(f"config_hash: {config_hash}")
     if variable_filters:
         print(
             "variables: "
             + ", ".join(f"{item.name}={item.value}" for item in variable_filters)
         )
     print(f"expected_jobs: {expected_job_count}")
-    print("available_variables:")
-    for line in variable_help_text(parameters_path).splitlines():
-        print(f"  {line}")
+    if parameters_path is not None:
+        print("available_variables:")
+        for line in variable_help_text(parameters_path).splitlines():
+            print(f"  {line}")
     if args.run_name:
         print(f"run_name: {args.run_name}")
-    destination = "database" if _should_upload_results_to_database(args.mode) else "cms_client"
-    print(f"results_destination: {destination}")
+    print("results_destination: database")
 
 
 def _failed_test_records_from_job_results(records: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -1513,7 +1545,7 @@ def _failed_test_records_from_job_results(records: list[dict[str, Any]]) -> list
 def _rerun_command(failed_test: dict[str, str]) -> str:
     feature = failed_test["feature"]
     config = Path(failed_test["config"]).stem
-    return f"cms TEST default {feature} --config-name {config}"
+    return f"cms TEST --mode default --feature {feature} --config-name {config}"
 
 
 def _print_failed_tests(
@@ -1561,12 +1593,12 @@ def _print_operator_recipes(args: argparse.Namespace) -> None:
     cursor = args.cursor
     out_dir = args.out_dir
     print("Default config:")
-    print(f"  cms TEST default {feature} --config-name default --preview")
-    print(f"  cms TEST default {feature} --config-name default --out-dir {out_dir}")
+    print(f"  cms TEST --mode default --feature {feature} --config-name default --preview")
+    print(f"  cms TEST --mode default --feature {feature} --config-name default --out-dir {out_dir}")
     print()
     print("Exact named config:")
-    print(f"  cms TEST default {feature} --config-name {config_name} --preview")
-    print(f"  cms TEST default {feature} --config-name {config_name} --out-dir {out_dir}")
+    print(f"  cms TEST --mode default --feature {feature} --config-name {config_name} --preview")
+    print(f"  cms TEST --mode default --feature {feature} --config-name {config_name} --out-dir {out_dir}")
     print()
     print("Attach or reconnect:")
     print("  cms WATCH")
@@ -1631,7 +1663,7 @@ def _troubleshooting_topics() -> dict[str, tuple[str, tuple[str, ...]]]:
             "unavailable named configs",
             (
                 "Run cms tests and confirm the feature and config are advertised.",
-                "Run cms TEST <mode> <feature> --config-name <name> --preview before submitting.",
+                "Run cms TEST --mode <mode> --feature <feature> --config-name <name> --preview before submitting.",
                 "The client and bench reject missing, malformed, path-traversal, and hash-mismatched configs before hardware execution.",
             ),
         ),

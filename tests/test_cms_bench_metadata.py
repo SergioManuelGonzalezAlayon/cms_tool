@@ -22,6 +22,7 @@ from cms_protocol import (
 def _session(
     tmp_path,
     *,
+    feature: str = "beacon",
     config: str = "default",
     config_hash: str = "",
     mode: str = "default",
@@ -36,7 +37,7 @@ def _session(
         request_id="measurement-123",
         selector=SuiteSelector(
             mode="ble",
-            feature="beacon",
+            feature=feature,
             config=config,
             config_hash=config_hash,
             variable_filters=variable_filters,
@@ -291,6 +292,26 @@ def test_bench_runs_default_config_without_exact_config_override(tmp_path, monke
 
     assert "--exact-config" not in captured["command"]
     assert "--cfg" not in captured["command"]
+
+
+def test_bench_runs_all_features_from_the_ble_config_root(tmp_path, monkeypatch):
+    session = _session(tmp_path, feature="all")
+    captured = {}
+
+    def fake_run_managed_process(command, **kwargs):
+        captured["command"] = command
+        return cms_bench.subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cms_bench, "_run_managed_process", fake_run_managed_process)
+
+    cms_bench._run_test_orchestrator(
+        session,
+        tmp_path / "orchestrator_results.jsonl",
+        tmp_path / "cms_fw_metadata.json",
+    )
+
+    assert cms_bench.Path(captured["command"][3]) == cms_bench.Path("tests") / "configs" / "ble"
+    assert "--feature" not in captured["command"]
 
 
 def test_bench_runs_one_exact_named_config(tmp_path, monkeypatch):
