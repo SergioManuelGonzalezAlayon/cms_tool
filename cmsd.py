@@ -91,8 +91,11 @@ def _default_runtime_root() -> Path:
     return Path(tempfile.gettempdir()) / "cmsd"
 
 
-def _default_execution_timeout_s() -> float:
-    return float(os.getenv("CMSD_EXECUTION_TIMEOUT_S", str(DEFAULT_EXECUTION_TIMEOUT_S)))
+def _default_execution_timeout_s() -> float | None:
+    value = os.getenv("CMSD_EXECUTION_TIMEOUT_S", "").strip().lower()
+    if not value or value in {"0", "none", "off", "unlimited"}:
+        return DEFAULT_EXECUTION_TIMEOUT_S
+    return float(value)
 
 
 @dataclass(slots=True)
@@ -108,7 +111,7 @@ class DaemonConfig:
     expected_runtime_filesystems: tuple[str, ...] = ("tmpfs", "ramfs")
     max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
     max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
-    execution_timeout_s: float = field(default_factory=_default_execution_timeout_s)
+    execution_timeout_s: float | None = field(default_factory=_default_execution_timeout_s)
     completed_measurement_retention: int = 100
 
     def __post_init__(self) -> None:
@@ -124,8 +127,8 @@ class DaemonConfig:
             raise ValueError("max_console_log_bytes must be positive")
         if self.max_console_event_bytes < 512:
             raise ValueError("max_console_event_bytes must be at least 512")
-        if self.execution_timeout_s <= 0:
-            raise ValueError("execution_timeout_s must be positive")
+        if self.execution_timeout_s is not None and self.execution_timeout_s <= 0:
+            raise ValueError("execution_timeout_s must be positive when configured")
         if self.completed_measurement_retention < 1:
             raise ValueError("completed_measurement_retention must be positive")
 

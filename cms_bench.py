@@ -48,7 +48,8 @@ from cms_protocol import (
 CMS_BENCH_CONFIG = "cms_bench_runtime.json"
 DEFAULT_CONSOLE_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_CONSOLE_EVENT_MAX_BYTES = 4 * 1024 * 1024
-DEFAULT_EXECUTION_TIMEOUT_S = 5 * 60
+# CMS measurements may run for days; cancellation is the normal stop mechanism.
+DEFAULT_EXECUTION_TIMEOUT_S: float | None = None
 PROCESS_TERMINATE_GRACE_S = 5.0
 MAX_CONSOLE_EVENT_SEGMENT_BYTES = 64 * 1024
 
@@ -264,7 +265,7 @@ class BenchSession:
     notes: list[str] = field(default_factory=list)
     max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
     max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
-    execution_timeout_s: float = DEFAULT_EXECUTION_TIMEOUT_S
+    execution_timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     event_stream: MeasurementEventStream = field(init=False, repr=False)
 
@@ -1000,15 +1001,15 @@ def _run_managed_process(
     stderr_path: Path,
     event_stream: MeasurementEventStream | None = None,
     log_max_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES,
-    timeout_s: float = DEFAULT_EXECUTION_TIMEOUT_S,
+    timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S,
     cancel_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a child while draining both output pipes into active runtime logs."""
 
     if log_max_bytes < 1:
         raise ValueError("log_max_bytes must be positive")
-    if timeout_s <= 0:
-        raise ValueError("timeout_s must be positive")
+    if timeout_s is not None and timeout_s <= 0:
+        raise ValueError("timeout_s must be positive when configured")
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     stdout_path.write_text("", encoding="utf-8")
@@ -1077,7 +1078,7 @@ def _run_managed_process(
 
     timed_out = False
     cancelled = False
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     while True:
         if cancel_event is not None and cancel_event.is_set():
             cancelled = True
@@ -1096,12 +1097,12 @@ def _run_managed_process(
             returncode = process.returncode if process.returncode is not None else -1
             break
 
-        remaining_s = deadline - time.monotonic()
-        if remaining_s <= 0:
+        remaining_s = None if deadline is None else deadline - time.monotonic()
+        if remaining_s is not None and remaining_s <= 0:
             timed_out = True
             break
         try:
-            returncode = process.wait(timeout=min(0.1, remaining_s))
+            returncode = process.wait(timeout=0.1 if remaining_s is None else min(0.1, remaining_s))
             break
         except subprocess.TimeoutExpired:
             continue
