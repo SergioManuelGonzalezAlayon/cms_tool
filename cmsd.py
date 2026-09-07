@@ -732,6 +732,23 @@ class CMSDaemon:
                     )
         return artifacts
 
+    def retain_differential_plan_artifact(
+        self, staged_runtime_dir: Path, execution_runtime_dir: Path
+    ) -> Artifacts:
+        """Retain the exact paired plan after the staging workspace is gone."""
+
+        source = staged_runtime_dir / "firmware" / "paired_default_plan.json"
+        if not source.is_file():
+            raise RuntimeError("differential paired plan is missing from staged firmware")
+        destination = execution_runtime_dir / "results" / "paired_default_plan.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        return Artifacts(
+            name="results/paired_default_plan.json",
+            path=destination,
+            result_type=ResultType.CAMPAIGN,
+        )
+
     def run_staged_test(
         self,
         *,
@@ -1107,6 +1124,9 @@ class CMSDaemon:
                     )
             campaign_path = self.bench.record_differential_campaign_order(runtime_dir)
             artifacts.append(Artifacts(name="results/differential_campaign.json", path=campaign_path, result_type=ResultType.DIAGNOSTIC))
+            artifacts.append(
+                self.retain_differential_plan_artifact(staging.runtime_dir, runtime_dir)
+            )
             state = MeasurementState.PASSED if all(item.state is MeasurementState.PASSED for item in pass_results) else MeasurementState.FAILED
             result = MeasurementResult(
                 measurement_id=request.request_id,

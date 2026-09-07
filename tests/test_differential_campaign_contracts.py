@@ -12,6 +12,7 @@ from cms_protocol import (
     MeasurementRequest,
     MeasurementResult,
     MeasurementState,
+    ResultType,
     SuiteSelector,
 )
 from cmsd import CMSDaemon, DaemonConfig
@@ -82,6 +83,28 @@ def test_daemon_lists_parent_and_child_artifacts_without_cross_variant_loss(tmp_
         "results/parent/parent.json",
         "results/child/child.json",
     ]
+
+
+def test_daemon_retains_paired_plan_as_a_completed_measurement_artifact(tmp_path: Path) -> None:
+    staged_runtime = tmp_path / "staged"
+    execution_runtime = tmp_path / "execution"
+    source = staged_runtime / "firmware" / "paired_default_plan.json"
+    source.parent.mkdir(parents=True)
+    source.write_text('{"jobs": []}\n', encoding="utf-8")
+    daemon = CMSDaemon(
+        DaemonConfig(
+            runtime_root=tmp_path / "runtime",
+            artifacts_root=tmp_path / "artifacts",
+            bench_config=tmp_path / "bench.json",
+        )
+    )
+
+    artifact = daemon.retain_differential_plan_artifact(staged_runtime, execution_runtime)
+
+    assert artifact.name == "results/paired_default_plan.json"
+    assert artifact.result_type is ResultType.CAMPAIGN
+    assert artifact.path == execution_runtime / "results" / "paired_default_plan.json"
+    assert artifact.path.read_text(encoding="utf-8") == '{"jobs": []}\n'
 
 
 def test_activate_differential_variant_materializes_a_normal_isolated_session(tmp_path: Path) -> None:

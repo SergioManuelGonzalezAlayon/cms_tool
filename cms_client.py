@@ -27,6 +27,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from cms_colors import COLOR_CHOICES, ColorFormatter, color_formatter, state_role
+from cms_diff_comparison import (
+    ComparisonStatus,
+    DifferentialPairingError,
+    create_diff_comparison_report,
+    pair_downloaded_differential_results,
+    prepare_comparison_inputs,
+    render_diff_comparison_table,
+    write_diff_comparison_report,
+)
 from cms_protocol import (
     CMS_OBSERVATION_PROTOCOL_VERSION,
     Artifacts,
@@ -83,6 +92,8 @@ class CMSCLIExitCode(IntEnum):
     CONNECTION_FAILURE = 5
     PROTOCOL_MISMATCH = 6
     CLIENT_ERROR = 7
+    COMPARISON_DATA_FAILURE = 8
+    THRESHOLD_REGRESSION = 9
 
 
 class CMSClientError(RuntimeError):
@@ -1579,13 +1590,62 @@ def _run_test_feature(
         colors=colors,
     )
     result = client.get_measurement(result.measurement_id)
+    downloaded_paths: list[Path] = []
     if result.artifacts:
-        for path in client.download_measurement_artifacts(
+        downloaded_paths = client.download_measurement_artifacts(
             result.measurement_id,
             Path(args.out_dir),
-        ):
+        )
+        for path in downloaded_paths:
             print(f"saved {path}")
-    return _measurement_exit_code(state.summary.state if state.summary is not None else None)
+    execution_state = state.summary.state if state.summary is not None else result.state
+    execution_exit = _measurement_exit_code(execution_state)
+    if execution_exit is not CMSCLIExitCode.SUCCESS:
+        return execution_exit
+    if args.mode == MeasurementMode.DIFF.value:
+        return _create_and_render_diff_comparison(Path(args.out_dir), downloaded_paths)
+    return execution_exit
+
+
+def _create_and_render_diff_comparison(
+    out_dir: Path, downloaded_paths: list[Path]
+) -> CMSCLIExitCode:
+    """Create client-side differential output only after physical execution passed."""
+
+    plan_path = out_dir / "results" / "paired_default_plan.json"
+    parent_root = out_dir / "results" / "parent"
+    child_root = out_dir / "results" / "child"
+    required = (plan_path, parent_root, child_root)
+    if not all(path.exists() for path in required):
+        missing = ", ".join(str(path) for path in required if not path.exists())
+        print(f"differential comparison data is incomplete: missing {missing}", file=sys.stderr)
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
+    if not any(path == plan_path or plan_path in path.parents for path in downloaded_paths):
+        print("differential comparison data did not include paired_default_plan.json", file=sys.stderr)
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
+
+    try:
+        pairing = pair_downloaded_differential_results(parent_root, child_root, plan_path)
+        inputs = prepare_comparison_inputs(pairing)
+        report = create_diff_comparison_report(pairing, inputs)
+        report_path = write_diff_comparison_report(report, out_dir / "diff_comparison.json")
+        print(f"saved {report_path}")
+        saved_report = json.loads(report_path.read_text(encoding="utf-8"))
+        print(render_diff_comparison_table(saved_report))
+    except (DifferentialPairingError, ValueError, OSError) as exc:
+        print(f"differential comparison data is invalid: {exc}", file=sys.stderr)
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
+
+    if report["diagnostics"]:
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
+    statuses = {
+        metric.get("status")
+        for pair in report["pairs"]
+        for metric in pair["metrics"]
+    }
+    if ComparisonStatus.FAIL.value in statuses:
+        return CMSCLIExitCode.THRESHOLD_REGRESSION
+    return CMSCLIExitCode.SUCCESS
 
 
 def _preview_job_count(
@@ -1755,6 +1815,8 @@ def _print_exit_codes() -> None:
         CMSCLIExitCode.CONNECTION_FAILURE: "connection failure",
         CMSCLIExitCode.PROTOCOL_MISMATCH: "protocol mismatch",
         CMSCLIExitCode.CLIENT_ERROR: "daemon, client, configuration, or operational error",
+        CMSCLIExitCode.COMPARISON_DATA_FAILURE: "differential comparison data failure",
+        CMSCLIExitCode.THRESHOLD_REGRESSION: "differential comparison threshold regression",
     }
     for code in CMSCLIExitCode:
         print(f"{int(code)} {code.name}: {descriptions[code]}")

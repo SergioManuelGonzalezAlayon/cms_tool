@@ -58,6 +58,7 @@ class Job:
     measurement_id: str = ""
     run_name: str = ""
     measurement_created_at: str = ""
+    variant: str = ""
     variable_filters: tuple[VariableFilter, ...] = ()
 
     @property
@@ -253,6 +254,7 @@ def build_jobs(
                     measurement_id=str(measurement_identity.get("measurement_id", "")),
                     run_name=str(measurement_identity.get("run_name", "")),
                     measurement_created_at=str(measurement_identity.get("created_at", "")),
+                    variant=str(cms_firmware.get("variant", "")),
                     variable_filters=variable_filters,
                 )
             )
@@ -456,6 +458,7 @@ def load_job_plan(plan_path: Path) -> list[Job]:
                 supply_v=record["supply_v"],
                 config_hash=str(record["config_hash"]),
                 requested_config_hash=str(record.get("requested_config_hash", "")),
+                variant=str(record.get("variant", "")),
                 variable_filters=filters,
             )
         except (KeyError, TypeError, ValueError) as exc:
