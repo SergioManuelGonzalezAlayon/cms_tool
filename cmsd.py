@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from cms_bench import (
+    DifferentialCampaignSession,
     DEFAULT_CONSOLE_EVENT_MAX_BYTES,
     DEFAULT_CONSOLE_LOG_MAX_BYTES,
     DEFAULT_EXECUTION_TIMEOUT_S,
@@ -712,6 +713,25 @@ class CMSDaemon:
 
         return self.staged_differential_firmware.get(staging_id)
 
+    def differential_result_artifacts(self, runtime_dir: Path) -> list[Artifacts]:
+        """Expose retained parent and child raw evidence independently."""
+
+        artifacts: list[Artifacts] = []
+        for variant in ("parent", "child"):
+            result_root = runtime_dir / "results" / variant
+            if not result_root.is_dir():
+                continue
+            for path in sorted(result_root.rglob("*")):
+                if path.is_file():
+                    artifacts.append(
+                        Artifacts(
+                            name=(Path("results") / variant / path.relative_to(result_root)).as_posix(),
+                            path=path,
+                            result_type=ResultType.DIAGNOSTIC,
+                        )
+                    )
+        return artifacts
+
     def run_staged_test(
         self,
         *,
@@ -760,10 +780,34 @@ class CMSDaemon:
         run_name: str = "",
         upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
+        staging_id: str = "",
     ) -> MeasurementResult:
-        """Start a test in the background using the most recently staged firmware."""
+        """Start a test in the background using explicitly selected staged firmware."""
 
-        if self.last_firmware_request is None:
+        measurement_mode = MeasurementMode(mode)
+        differential_staging: StagedDifferentialFirmware | None = None
+        if measurement_mode is MeasurementMode.DIFF:
+            staging_id = staging_id.strip()
+            if not staging_id:
+                return _staged_test_failure("cms TEST --mode diff requires --staging-id")
+            differential_staging = self.get_staged_firmware(staging_id)
+            if differential_staging is None:
+                return _staged_test_failure(
+                    f"differential firmware staging ID is unknown: {staging_id}"
+                )
+            plan_builder = self.bench or CMSBench(config_path=self.config.bench_config)
+            plan_builder.build_differential_plan(
+                differential_staging.request,
+                differential_staging.runtime_dir,
+            )
+            request = measurement_request_from_dict(
+                measurement_request_to_dict(differential_staging.request)
+            )
+        elif staging_id.strip():
+            return _staged_test_failure(
+                "--staging-id is only valid with cms TEST --mode diff"
+            )
+        elif self.last_firmware_request is None:
             return MeasurementResult(
                 measurement_id="",
                 state=MeasurementState.FAILED,
@@ -772,9 +816,11 @@ class CMSDaemon:
                 current_step=MeasurementState.FAILED.value,
                 message="no firmware has been staged; run SEND_FW first",
             )
-
-        request = measurement_request_from_dict(measurement_request_to_dict(self.last_firmware_request))
-        request.mode = request.mode.__class__(mode)
+        else:
+            request = measurement_request_from_dict(
+                measurement_request_to_dict(self.last_firmware_request)
+            )
+        request.mode = measurement_mode
         request.selector.mode = "ble"
         request.selector.feature = feature
         request.selector.config = config
@@ -802,7 +848,12 @@ class CMSDaemon:
             target=self.execute_measurement,
             args=(request,),
             kwargs={
-                "staged_runtime_dir": self.last_firmware_runtime_dir,
+                "staged_runtime_dir": (
+                    differential_staging.runtime_dir
+                    if differential_staging is not None
+                    else self.last_firmware_runtime_dir
+                ),
+                "differential_staging": differential_staging,
                 "identity_assigned": True,
             },
             daemon=True,
@@ -914,9 +965,18 @@ class CMSDaemon:
         self,
         request: MeasurementRequest,
         staged_runtime_dir: Path | None = None,
+        differential_staging: StagedDifferentialFirmware | None = None,
         identity_assigned: bool = False,
     ) -> MeasurementResult:
         """Run one V1 synchronous measurement path."""
+
+        if differential_staging is not None:
+            if request.mode is not MeasurementMode.DIFF:
+                raise ValueError("differential staging requires diff measurement mode")
+            if request.differential_firmware is None:
+                raise ValueError("differential staging requires parent and child firmware")
+            if staged_runtime_dir != differential_staging.runtime_dir:
+                raise ValueError("differential staging runtime workspace does not match selection")
 
         request.upload_results_to_database = _should_upload_results_to_database(request.mode)
 
@@ -929,6 +989,12 @@ class CMSDaemon:
             self._assign_execution_identity(request)
         self.measurement_accept(request)
         runtime_dir = self.create_runtime_workspace(request.request_id)
+        if differential_staging is not None:
+            return self._execute_differential_measurement(
+                request,
+                runtime_dir,
+                differential_staging,
+            )
         try:
             self._update_measurement(
                 request.request_id,
@@ -987,6 +1053,88 @@ class CMSDaemon:
                 current_step=state.value,
                 message=str(exc),
                 identity=request.identity,
+            )
+        return self.publish_results(result)
+
+    def _execute_differential_measurement(
+        self,
+        request: MeasurementRequest,
+        runtime_dir: Path,
+        staging: StagedDifferentialFirmware,
+    ) -> MeasurementResult:
+        """Run parent then child through the normal Bench runner with isolated evidence."""
+
+        started_at = self.measurements[request.request_id].started_at
+        artifacts: list[Artifacts] = []
+        pass_results: list[MeasurementResult] = []
+        try:
+            if self.bench is None:
+                self.bench = CMSBench(config_path=self.config.bench_config)
+                self.bench.initialize()
+            self.bench.validate_differential_firmware(staging.request, staging.runtime_dir)
+            self._update_measurement(request.request_id, MeasurementState.RUNNING, 50, "running parent differential pass")
+            for index, variant in enumerate(("parent", "child"), start=1):
+                self._raise_if_cancelled(request.request_id)
+                self._update_differential_status(
+                    request.request_id,
+                    current_variant=variant,
+                    completed_variants=index - 1,
+                )
+                campaign = DifferentialCampaignSession(
+                    measurement_id=request.request_id,
+                    staged_runtime_dir=staging.runtime_dir,
+                    execution_runtime_dir=runtime_dir,
+                )
+                session = self.bench.activate_differential_variant(
+                    request,
+                    campaign,
+                    variant,
+                    cancel_event=self.cancellation_events[request.request_id],
+                )
+                pass_result = self.bench.measurement_run(session, active_root=campaign.active_root)
+                pass_results.append(pass_result)
+                for artifact in pass_result.artifacts:
+                    artifact.name = (Path("results") / variant / artifact.name).as_posix()
+                    artifacts.append(artifact)
+                if index == 1:
+                    self._update_measurement(request.request_id, MeasurementState.RUNNING, 75, "running child differential pass")
+                    self._update_differential_status(
+                        request.request_id,
+                        current_variant="child",
+                        completed_variants=1,
+                        passed_count=sum(item.state is MeasurementState.PASSED for item in pass_results),
+                        failed_count=sum(item.state is not MeasurementState.PASSED for item in pass_results),
+                    )
+            campaign_path = self.bench.record_differential_campaign_order(runtime_dir)
+            artifacts.append(Artifacts(name="results/differential_campaign.json", path=campaign_path, result_type=ResultType.DIAGNOSTIC))
+            state = MeasurementState.PASSED if all(item.state is MeasurementState.PASSED for item in pass_results) else MeasurementState.FAILED
+            result = MeasurementResult(
+                measurement_id=request.request_id,
+                state=state,
+                started_at=started_at,
+                finished_at=datetime.utcnow(),
+                progress_percent=100,
+                current_step=state.value,
+                message="differential parent and child passes completed",
+                identity=request.identity,
+                artifacts=artifacts,
+                mode=MeasurementMode.DIFF.value,
+                completed_variants=2,
+                total_variants=2,
+                passed_count=sum(item.state is MeasurementState.PASSED for item in pass_results),
+                failed_count=sum(item.state is not MeasurementState.PASSED for item in pass_results),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            result = MeasurementResult(
+                measurement_id=request.request_id,
+                state=MeasurementState.FAILED,
+                started_at=started_at,
+                finished_at=datetime.utcnow(),
+                progress_percent=100,
+                current_step=MeasurementState.FAILED.value,
+                message=str(exc),
+                identity=request.identity,
+                artifacts=artifacts,
             )
         return self.publish_results(result)
 
@@ -1076,6 +1224,7 @@ class CMSDaemon:
                 run_name=str(request.get("run_name", "")),
                 upload_results_to_database=bool(request.get("upload_results_to_database", True)),
                 debug_artifact_streaming=bool(request.get("debug_artifact_streaming", False)),
+                staging_id=str(request.get("staging_id", "")),
             )
             return measurement_result_to_dict(result)
 
@@ -1260,6 +1409,50 @@ class CMSDaemon:
         result.progress_percent = progress_percent
         result.current_step = state.value
         result.message = message
+
+    def _update_differential_status(
+        self,
+        measurement_id: str,
+        *,
+        current_variant: str,
+        completed_variants: int,
+        current_test: str = "",
+        passed_count: int = 0,
+        failed_count: int = 0,
+    ) -> None:
+        """Publish paired-campaign truth through the main measurement stream."""
+
+        result = self.measurements[measurement_id]
+        result.mode = MeasurementMode.DIFF.value
+        result.current_variant = current_variant
+        result.completed_variants = completed_variants
+        result.total_variants = 2
+        result.current_test = current_test
+        result.passed_count = passed_count
+        result.failed_count = failed_count
+        runtime_dir = self._runtime_workspace_path(measurement_id)
+        stream = MeasurementEventStream(
+            measurement_id,
+            MeasurementRuntimePaths.from_root(runtime_dir),
+            max_console_bytes=self.config.max_console_event_bytes,
+        )
+        payload = {
+            "mode": result.mode,
+            "current_variant": current_variant,
+            "completed_variants": completed_variants,
+            "total_variants": 2,
+            "current_test": current_test,
+            "passed_count": passed_count,
+            "failed_count": failed_count,
+        }
+        stream.replace_status({
+            "state": result.state.value,
+            "progress_percent": result.progress_percent,
+            "current_step": result.current_step,
+            "message": result.message,
+            **payload,
+        })
+        stream.append_lifecycle("differential_status", **payload)
 
     def _assign_execution_identity(
         self,
@@ -1653,6 +1846,19 @@ def _is_publishable_final_artifact(artifact: Artifacts) -> bool:
     if artifact.result_type is ResultType.DIAGNOSTIC:
         return artifact_name in PUBLISHABLE_DIAGNOSTIC_NAMES
     return False
+
+
+def _staged_test_failure(message: str) -> MeasurementResult:
+    """Return a rejected staged-test request before any bench work begins."""
+
+    return MeasurementResult(
+        measurement_id="",
+        state=MeasurementState.FAILED,
+        finished_at=datetime.utcnow(),
+        progress_percent=100,
+        current_step=MeasurementState.FAILED.value,
+        message=message,
+    )
 
 
 def _copy_staged_firmware(

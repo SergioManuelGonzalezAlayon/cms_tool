@@ -357,6 +357,57 @@ def test_bench_passes_variable_filters_to_orchestrator(tmp_path, monkeypatch):
     assert _option_values(captured["command"], "--variable") == ["phy=2m", "dcdc=On"]
 
 
+def test_bench_passes_frozen_plan_and_variant_to_generic_orchestrator(tmp_path, monkeypatch):
+    session = _session(tmp_path, feature="all")
+    session.variant = "parent"
+    session.job_plan_path = tmp_path / "paired_default_plan.json"
+    captured = {}
+
+    def fake_run_managed_process(command, **kwargs):
+        captured["command"] = command
+        return cms_bench.subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cms_bench, "_run_managed_process", fake_run_managed_process)
+
+    cms_bench._run_test_orchestrator(
+        session,
+        tmp_path / "orchestrator_results.jsonl",
+        tmp_path / "cms_fw_metadata.json",
+    )
+
+    assert _option_value(captured["command"], "--job-plan") == str(session.job_plan_path)
+    assert _option_value(captured["command"], "--variant") == "parent"
+
+
+def test_generic_runner_passes_campaign_active_root_to_runtime_preparation(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    bench = CMSBench()
+    bench.initialized = True
+    captured = {}
+    monkeypatch.setattr(bench, "test_smoke", lambda session: None)
+    monkeypatch.setattr(
+        cms_bench,
+        "_prepare_pytest_runtime",
+        lambda session, resources, *, active_root=None: captured.setdefault("prepared", {
+            "results_log": tmp_path / "results.jsonl",
+            "metadata_path": tmp_path / "metadata.json",
+            "artifact_since": 0,
+            "active_root": active_root,
+        }),
+    )
+    monkeypatch.setattr(
+        cms_bench,
+        "_run_test_orchestrator",
+        lambda *args: cms_bench.subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(bench, "collect_artifacts", lambda session, result, **kwargs: result)
+
+    active_root = tmp_path / "active"
+    bench.measurement_run(session, active_root=active_root)
+
+    assert captured["prepared"]["active_root"] == active_root
+
+
 def test_bench_rejects_variable_filters_with_exact_config(tmp_path):
     session = _session(
         tmp_path,

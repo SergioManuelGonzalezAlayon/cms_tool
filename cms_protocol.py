@@ -342,6 +342,13 @@ class MeasurementResult:
     current_step: str = ""
     message: str = ""
     identity: MeasurementIdentity | None = None
+    mode: str = ""
+    current_variant: str = ""
+    completed_variants: int = 0
+    total_variants: int = 0
+    current_test: str = ""
+    passed_count: int = 0
+    failed_count: int = 0
 
 
 @dataclass(slots=True)
@@ -895,6 +902,13 @@ def measurement_result_to_dict(result: MeasurementResult) -> dict[str, Any]:
         "progress_percent": result.progress_percent,
         "current_step": result.current_step,
         "message": result.message,
+        "mode": result.mode,
+        "current_variant": result.current_variant,
+        "completed_variants": result.completed_variants,
+        "total_variants": result.total_variants,
+        "current_test": result.current_test,
+        "passed_count": result.passed_count,
+        "failed_count": result.failed_count,
     }
 
 
@@ -909,6 +923,13 @@ def measurement_result_from_dict(data: dict[str, Any]) -> MeasurementResult:
         progress_percent=int(data.get("progress_percent", 0)),
         current_step=str(data.get("current_step", "")),
         message=str(data.get("message", "")),
+        mode=str(data.get("mode", "")),
+        current_variant=str(data.get("current_variant", "")),
+        completed_variants=int(data.get("completed_variants", 0)),
+        total_variants=int(data.get("total_variants", 0)),
+        current_test=str(data.get("current_test", "")),
+        passed_count=int(data.get("passed_count", 0)),
+        failed_count=int(data.get("failed_count", 0)),
         identity=measurement_identity_from_dict(identity_data) if identity_data else None,
     )
 

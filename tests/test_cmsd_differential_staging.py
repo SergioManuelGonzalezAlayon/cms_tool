@@ -128,3 +128,67 @@ def test_differential_staging_is_not_retained_without_its_manifest(tmp_path: Pat
         daemon._retain_staged_differential_firmware(request, runtime_dir)
 
     assert daemon.get_staged_firmware(request.request_id) is None
+
+
+def test_diff_test_resolves_explicit_staging_id_without_single_variant_pointer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, payloads = _request_and_payloads()
+    daemon = CMSDaemon(
+        DaemonConfig(
+            runtime_root=tmp_path / "runtime-root",
+            artifacts_root=tmp_path / "artifacts",
+            bench_config=tmp_path / "bench.json",
+        )
+    )
+    runtime_dir = daemon.create_runtime_workspace(request.request_id)
+    _write_differential_firmware_payloads(request, runtime_dir, payloads)
+    daemon._retain_staged_differential_firmware(request, runtime_dir)
+    captured = {}
+
+    class ImmediateThread:
+        def __init__(self, *, target, args, kwargs, daemon):
+            captured["target"] = target
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr("cmsd.threading.Thread", ImmediateThread)
+
+    result = daemon.start_staged_test(
+        mode="diff",
+        feature="beacon",
+        staging_id=request.request_id,
+    )
+
+    assert result.state.value == "accepted"
+    assert captured["kwargs"]["differential_staging"].runtime_dir == runtime_dir
+    assert captured["kwargs"]["staged_runtime_dir"] == runtime_dir
+    assert captured["args"][0].differential_firmware is not None
+    plan = json.loads(
+        (runtime_dir / "firmware" / "paired_default_plan.json").read_text(encoding="utf-8")
+    )
+    assert plan["scope"] == "all_default_features"
+    assert plan["jobs"]
+
+
+def test_diff_test_rejects_unknown_staging_id_before_starting(tmp_path: Path) -> None:
+    daemon = CMSDaemon(
+        DaemonConfig(
+            runtime_root=tmp_path / "runtime-root",
+            artifacts_root=tmp_path / "artifacts",
+            bench_config=tmp_path / "bench.json",
+        )
+    )
+
+    result = daemon.start_staged_test(
+        mode="diff",
+        feature="beacon",
+        staging_id="missing-stage",
+    )
+
+    assert result.state.value == "failed"
+    assert "unknown" in result.message

@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -266,6 +266,8 @@ class BenchSession:
     max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
     max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
     execution_timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S
+    variant: str = ""
+    job_plan_path: Path | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     event_stream: MeasurementEventStream = field(init=False, repr=False)
 
@@ -279,6 +281,29 @@ class BenchSession:
     @property
     def runtime_paths(self) -> MeasurementRuntimePaths:
         return MeasurementRuntimePaths.from_root(self.runtime_dir)
+
+
+@dataclass(frozen=True, slots=True)
+class DifferentialCampaignSession:
+    """Paired-campaign workspace; normal BenchSession remains single-variant."""
+
+    measurement_id: str
+    staged_runtime_dir: Path
+    execution_runtime_dir: Path
+    run_order: tuple[str, ...] = ("parent", "child")
+
+    def __post_init__(self) -> None:
+        if self.run_order != ("parent", "child"):
+            raise ValueError("differential campaign run order must be parent then child")
+
+    @property
+    def active_root(self) -> Path:
+        return self.execution_runtime_dir / "active"
+
+    def result_root(self, variant: str) -> Path:
+        if variant not in self.run_order:
+            raise ValueError(f"unknown differential firmware variant: {variant}")
+        return self.execution_runtime_dir / "results" / variant
 
 
 @dataclass(slots=True)
@@ -552,6 +577,184 @@ class CMSBench:
             if observed_hash != request.selector.config_hash:
                 raise RuntimeError("selected config hash does not match the requested differential campaign")
 
+    def build_differential_plan(self, request: MeasurementRequest, runtime_dir: Path) -> Path:
+        """Create one deterministic all-default plan to be reused by both SDK variants."""
+
+        if request.differential_firmware is None:
+            raise RuntimeError("differential plan requires differential firmware")
+        from test_orchestrator import build_job_plan, build_jobs
+
+        jobs = build_jobs(
+            [Path("tests") / "configs" / "ble"],
+            mode="default",
+            feature_filters=set(),
+            partition_filters=set(),
+        )
+        if not jobs:
+            raise RuntimeError("differential all-default plan selected zero jobs")
+        plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
+        plan = build_job_plan(jobs)
+        for job_record in plan["jobs"]:
+            dut_project = Path(str(job_record["dut_slcp"])).stem
+            job_record["firmware_role"] = (
+                "dcdc" if dut_project == "ncp_ble_dut_dcdc" else "no_dcdc"
+            )
+        plan["scope"] = "all_default_features"
+        plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+        return plan_path
+
+    def prepare_differential_variant_metadata(
+        self,
+        request: MeasurementRequest,
+        runtime_dir: Path,
+        variant: str,
+    ) -> Path:
+        """Create fresh per-pass metadata while retaining the one shared paired plan."""
+
+        if variant not in {"child", "parent"}:
+            raise RuntimeError(f"unknown differential firmware variant: {variant}")
+        plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
+        if not plan_path.is_file():
+            raise RuntimeError("differential paired plan is missing")
+        metadata_root = runtime_dir / "results" / variant
+        metadata_root.mkdir(parents=True, exist_ok=True)
+        metadata_path = metadata_root / "cms_fw_metadata.json"
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "variant": variant,
+                    "paired_plan_path": str(plan_path),
+                    "firmware_root": str(runtime_dir / "firmware" / variant),
+                    "request": measurement_request_to_dict(request),
+                },
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        return metadata_path
+
+    def differential_variant_result_root(self, runtime_dir: Path, variant: str) -> Path:
+        """Return the isolated result root for one side of a paired campaign."""
+
+        if variant not in {"child", "parent"}:
+            raise RuntimeError(f"unknown differential firmware variant: {variant}")
+        result_root = runtime_dir / "results" / variant
+        result_root.mkdir(parents=True, exist_ok=True)
+        return result_root
+
+    def activate_differential_variant(
+        self,
+        request: MeasurementRequest,
+        campaign: DifferentialCampaignSession,
+        variant: str,
+        *,
+        cancel_event: threading.Event,
+    ) -> BenchSession:
+        """Materialize one staged firmware set for the normal generic runner."""
+
+        if variant not in {"parent", "child"}:
+            raise RuntimeError(f"unknown differential firmware variant: {variant}")
+        differential = request.differential_firmware
+        if differential is None:
+            raise RuntimeError("differential variant activation requires parent and child firmware")
+        firmware = getattr(differential, variant)
+        role_images = {item.project_name: item for item in firmware.role_images}
+        required_projects = {"ncp_ble_dut_dcdc", "ncp_ble_dut", "ncp_ble_tester"}
+        missing_projects = required_projects - set(role_images)
+        if missing_projects:
+            raise RuntimeError(
+                "differential firmware is missing required roles: "
+                + ", ".join(sorted(missing_projects))
+            )
+
+        result_root = campaign.result_root(variant)
+        result_root.mkdir(parents=True, exist_ok=True)
+        active_root = campaign.active_root
+        if active_root.exists():
+            shutil.rmtree(active_root)
+        active_root.mkdir(parents=True, exist_ok=True)
+        staged_variant_root = campaign.staged_runtime_dir / "firmware" / variant
+        for role_image in firmware.role_images:
+            source = (
+                staged_variant_root
+                / "roles"
+                / role_image.role
+                / role_image.project_name
+                / role_image.image.name
+            )
+            if not source.is_file():
+                raise RuntimeError(f"staged differential firmware image is missing: {source}")
+            shutil.copy2(source, active_root / role_image.image.name)
+        if firmware.xapi_file is None:
+            raise RuntimeError(f"{variant} sl_bt.xapi was not supplied")
+        xapi_source = staged_variant_root / "xapi" / firmware.xapi_file.name
+        if not xapi_source.is_file():
+            raise RuntimeError(f"staged differential XAPI is missing: {xapi_source}")
+        shutil.copy2(xapi_source, active_root / firmware.xapi_file.name)
+        if firmware.bootloader_img is not None:
+            bootloader_source = staged_variant_root / "bootloader" / firmware.bootloader_img.name
+            if not bootloader_source.is_file():
+                raise RuntimeError(f"staged differential bootloader is missing: {bootloader_source}")
+            shutil.copy2(bootloader_source, active_root / firmware.bootloader_img.name)
+
+        active_firmware = replace(
+            firmware,
+            dut_img=role_images["ncp_ble_dut"].image,
+            tester_img=role_images["ncp_ble_tester"].image,
+            dut_variants={
+                "dcdc": role_images["ncp_ble_dut_dcdc"].image,
+                "no_dcdc": role_images["ncp_ble_dut"].image,
+            },
+        )
+        active_request = replace(request, firmware=active_firmware)
+        return BenchSession(
+            measurement_id=request.request_id,
+            runtime_dir=result_root,
+            manifest=active_firmware,
+            request=active_request,
+            variant=variant,
+            job_plan_path=campaign.staged_runtime_dir / "firmware" / "paired_default_plan.json",
+            cancel_event=cancel_event,
+        )
+
+    def record_differential_job(
+        self, runtime_dir: Path, variant: str, record: dict[str, Any]
+    ) -> Path:
+        """Append one variant-labelled terminal job record without sharing output files."""
+
+        result_root = self.differential_variant_result_root(runtime_dir, variant)
+        record_path = result_root / "orchestrator_results.jsonl"
+        payload = {"variant": variant, **record}
+        with record_path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(payload, sort_keys=True) + "\n")
+        return record_path
+
+    def record_differential_campaign_order(
+        self, runtime_dir: Path, order: tuple[str, ...] = ("parent", "child")
+    ) -> Path:
+        """Retain the paired-pass order and bench identity for reproducibility."""
+
+        if set(order) != {"parent", "child"}:
+            raise RuntimeError("differential campaign order must contain parent and child exactly once")
+        path = runtime_dir / "results" / "differential_campaign.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_order": list(order),
+                    "bench": {
+                        "board": self.resources.board if self.resources else "",
+                        "device": self.resources.device if self.resources else "",
+                    },
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                },
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
     def persist_staged_firmware_provenance(self, session: BenchSession) -> None:
         """Record the validated client SDK provenance in persistent bench config."""
 
@@ -583,13 +786,22 @@ class CMSBench:
             raise RuntimeError(f"bench is not runnable from state {self.state.value}")
         self.test_prepare(session)
 
-    def measurement_run(self, session: BenchSession) -> MeasurementResult:
+    def measurement_run(
+        self,
+        session: BenchSession,
+        *,
+        active_root: Path | None = None,
+    ) -> MeasurementResult:
         """Run the requested measurement flow and return structured results."""
         started_at = datetime.utcnow()
         self.state = BenchState.TESTING
         try:
             self.test_smoke(session)
-            prepared = _prepare_pytest_runtime(session, self.resources or BenchResources())
+            prepared = _prepare_pytest_runtime(
+                session,
+                self.resources or BenchResources(),
+                active_root=active_root,
+            )
             completed = _run_test_orchestrator(session, prepared["results_log"], prepared["metadata_path"])
             result = MeasurementResult(
                 measurement_id=session.measurement_id,
@@ -837,8 +1049,16 @@ def resolve_cms_resources_from_hwmux(group_json: dict[str, Any]) -> BenchResourc
     )
 
 
-def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) -> dict[str, Path]:
-    build_root = session.runtime_dir / "fw_build"
+def _prepare_pytest_runtime(
+    session: BenchSession,
+    resources: BenchResources,
+    *,
+    active_root: Path | None = None,
+) -> dict[str, Path]:
+    """Prepare one run; active firmware/build data may live apart from evidence."""
+
+    active_root = active_root or session.runtime_dir
+    build_root = active_root / "fw_build"
     config_data = _campaign_firmware_config(session)
     selected_config = (
         _write_selected_config_evidence(session)
@@ -862,7 +1082,7 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
         for name, project in dut_projects.items():
             image = session.manifest.dut_variants[name]
             dut_copied_images[name] = _copy_image_to_project(
-                session.runtime_dir / image.name,
+                active_root / image.name,
                 project,
             )
     else:
@@ -870,15 +1090,15 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
             str(firmware.get("dut_slcp", session.manifest.dut_img.name))
         ).stem
         dut_copied_images["default"] = _copy_image_to_project(
-            session.runtime_dir / session.manifest.dut_img.name,
+            active_root / session.manifest.dut_img.name,
             dut_project,
         )
     tester_copied_image = _copy_image_to_project(
-        session.runtime_dir / session.manifest.tester_img.name,
+        active_root / session.manifest.tester_img.name,
         tester_project,
     )
-    bootloader_copied_image = _copy_bootloader_image(session, build_root)
-    xapi_path = _staged_xapi_path(session)
+    bootloader_copied_image = _copy_bootloader_image(session, build_root, active_root)
+    xapi_path = _staged_xapi_path(session, active_root)
 
     metadata = {
         "identity": (
@@ -918,8 +1138,9 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
             "sisdk_commit": session.manifest.sisdk_commit,
             "sisdk_hash": session.manifest.sisdk_hash,
             "xapi_file_hash": session.manifest.xapi_file_hash,
-            "dut_image": str(session.runtime_dir / session.manifest.dut_img.name),
-            "tester_image": str(session.runtime_dir / session.manifest.tester_img.name),
+            "variant": session.variant,
+            "dut_image": str(active_root / session.manifest.dut_img.name),
+            "tester_image": str(active_root / session.manifest.tester_img.name),
             "dut_image_sha256": session.manifest.dut_img.sha256
             or session.manifest.dut_img_hash
             or _sha256_file(
@@ -1014,10 +1235,10 @@ def _campaign_firmware_config(session: BenchSession) -> dict[str, Any]:
     return configs[0][1]
 
 
-def _staged_xapi_path(session: BenchSession) -> Path:
+def _staged_xapi_path(session: BenchSession, active_root: Path | None = None) -> Path:
     if session.manifest.xapi_file is None:
         raise RuntimeError("sl_bt.xapi was not supplied by the CMS client")
-    xapi_path = session.runtime_dir / session.manifest.xapi_file.name
+    xapi_path = (active_root or session.runtime_dir) / session.manifest.xapi_file.name
     if not xapi_path.exists():
         raise RuntimeError(f"staged sl_bt.xapi is missing: {xapi_path}")
     return xapi_path
@@ -1032,10 +1253,14 @@ def _copy_image_to_project(source: Path, project_dir: Path) -> Path:
     return destination
 
 
-def _copy_bootloader_image(session: BenchSession, build_root: Path) -> Path | None:
+def _copy_bootloader_image(
+    session: BenchSession,
+    build_root: Path,
+    active_root: Path | None = None,
+) -> Path | None:
     if session.manifest.bootloader_img is None:
         return None
-    source = session.runtime_dir / session.manifest.bootloader_img.name
+    source = (active_root or session.runtime_dir) / session.manifest.bootloader_img.name
     return _copy_image_to_project(source, build_root / "bootloader-uart-bgapi")
 
 
@@ -1309,6 +1534,10 @@ def _run_test_orchestrator(
         cmd.extend(["--variable", f"{variable_filter.name}={variable_filter.value}"])
     if session.request.upload_results_to_database:
         cmd.append("--upload-results-to-database")
+    if session.job_plan_path is not None:
+        cmd.extend(["--job-plan", str(session.job_plan_path)])
+    if session.variant:
+        cmd.extend(["--variant", session.variant])
 
     return _run_managed_process(
         cmd,

@@ -209,8 +209,15 @@ class CMSClient:
         run_name: str = "",
         variable_filters: tuple[VariableFilter, ...] = (),
         debug_artifact_streaming: bool = False,
+        staging_id: str = "",
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
+
+        staging_id = staging_id.strip()
+        if mode is MeasurementMode.DIFF and not staging_id:
+            raise RuntimeError("cms TEST --mode diff requires --staging-id")
+        if mode is not MeasurementMode.DIFF and staging_id:
+            raise RuntimeError("--staging-id is only valid with cms TEST --mode diff")
         config_hash = "" if feature == "all" else _validate_local_test_config(feature, config)
         payload = self._request_json(
             "POST",
@@ -227,6 +234,7 @@ class CMSClient:
                 "run_name": run_name,
                 "upload_results_to_database": True,
                 "debug_artifact_streaming": debug_artifact_streaming,
+                "staging_id": staging_id,
             },
         )
         return measurement_result_from_dict(payload)
@@ -751,6 +759,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms TEST --mode default --feature beacon --config-name dcdc --preview\n"
             "  cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview\n"
             "  cms TEST -m full_sweep -f beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
+            "  cms TEST --mode diff --feature all --staging-id <staging_id>\n\n"
             "Required options:\n"
             "  --mode, -m      default, full_sweep, or diff\n"
             "  --feature, -f  BLE feature name such as beacon, or all\n\n"
@@ -787,6 +796,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="BLE feature name, or all to select every available feature",
     )
     test.add_argument("--config-name", default="default", help="test config")
+    test.add_argument(
+        "--staging-id",
+        default="",
+        help="validated differential firmware staging ID; required with --mode diff",
+    )
     test.add_argument(
         "--variable",
         action="append",
@@ -1087,6 +1101,10 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"test", "TEST"}:
         variable_filters = parse_variable_filters(args.variable)
+        if args.mode == MeasurementMode.DIFF.value and not args.staging_id.strip():
+            raise RuntimeError("cms TEST --mode diff requires --staging-id")
+        if args.mode != MeasurementMode.DIFF.value and args.staging_id.strip():
+            raise RuntimeError("--staging-id is only valid with cms TEST --mode diff")
         if args.feature == "all" and args.config_name != "default":
             raise RuntimeError("--feature all only supports the default config")
         if args.feature == "all" and variable_filters:
@@ -1548,6 +1566,7 @@ def _run_test_feature(
         run_name=args.run_name,
         variable_filters=variable_filters,
         debug_artifact_streaming=args.debug,
+        staging_id=args.staging_id,
     )
     if not result.measurement_id:
         _print_measurement_result(result, colors=colors)

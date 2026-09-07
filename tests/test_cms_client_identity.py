@@ -159,6 +159,25 @@ def test_run_test_sends_requested_run_name_to_daemon():
     assert result.measurement_id == "generated-id"
 
 
+def test_run_diff_test_requires_and_sends_explicit_staging_id_to_daemon():
+    captured = {}
+    client = CMSClient.__new__(CMSClient)
+
+    def fake_request(method, path, payload):
+        captured.update(payload)
+        return {"measurement_id": "generated-id", "state": "accepted"}
+
+    client._request_json = fake_request
+
+    with pytest.raises(RuntimeError, match="requires --staging-id"):
+        client.run_test(MeasurementMode.DIFF, "all")
+
+    client.run_test(MeasurementMode.DIFF, "all", staging_id="diff-stage-001")
+
+    assert captured["mode"] == "diff"
+    assert captured["staging_id"] == "diff-stage-001"
+
+
 def test_run_all_features_does_not_send_a_single_config_hash():
     captured = {}
     client = CMSClient.__new__(CMSClient)
