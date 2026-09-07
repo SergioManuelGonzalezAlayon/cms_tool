@@ -31,6 +31,8 @@ from cms_protocol import (
     BenchHealthReport,
     BenchIdentity,
     BenchState,
+    CommanderProbeEvidence as HealthCommanderProbeEvidence,
+    DetectedTargetIdentity,
     DeviceState,
     EventCursor,
     Artifacts,
@@ -420,7 +422,10 @@ class CMSBench:
         if self.identity is None or self.resources is None:
             self.initialize()
 
-        identity = self.identity or BenchIdentity(bench_id=platform.node(), hostname=platform.node())
+        configured_identity = self.identity or BenchIdentity(
+            bench_id=platform.node(), hostname=platform.node()
+        )
+        identity = configured_identity
         checks: list[BenchCheckResult] = []
 
         if self.startup_error:
@@ -442,10 +447,58 @@ class CMSBench:
             )
 
         resources = self.resources or BenchResources()
+        detected_identity: DetectedTargetIdentity | None = None
+        commander_probe: HealthCommanderProbeEvidence | None = None
+        identity_check: BenchCheckResult
+        if resources.commander_path and resources.dut_probe_sn:
+            try:
+                probe_result = _probe_dut_identity(
+                    resources.commander_path,
+                    resources.dut_probe_sn,
+                )
+                detected_identity = _health_detected_target_identity(probe_result.identity)
+                commander_probe = _health_commander_probe_evidence(probe_result.evidence)
+                identity = replace(
+                    configured_identity,
+                    board=detected_identity.radio_board_part_number,
+                    device=detected_identity.target_device,
+                )
+                identity_check = BenchCheckResult(
+                    name="dut_identity",
+                    status=BenchCheckStatus.PASS,
+                    summary="DUT identity detected by Commander",
+                    detail=(
+                        f"radio_board={detected_identity.radio_board_part_number}; "
+                        f"revision={detected_identity.radio_board_revision}; "
+                        f"device_raw={detected_identity.target_device}; "
+                        f"device_canonical={detected_identity.canonical_target_device}"
+                    ),
+                )
+            except CommanderProbeError as exc:
+                commander_probe = _health_commander_probe_evidence(exc.evidence)
+                identity = replace(configured_identity, board="", device="")
+                identity_check = BenchCheckResult(
+                    name="dut_identity",
+                    status=BenchCheckStatus.FAIL,
+                    summary="Commander could not establish DUT identity",
+                    detail=str(exc),
+                )
+        else:
+            commander_probe = HealthCommanderProbeEvidence(
+                command=[],
+                returncode=None,
+                error="Commander path and DUT probe serial must be configured",
+            )
+            identity = replace(configured_identity, board="", device="")
+            identity_check = BenchCheckResult(
+                name="dut_identity",
+                status=BenchCheckStatus.FAIL,
+                summary="Commander probe is not configured for DUT identity",
+                detail=commander_probe.error,
+            )
+        checks.append(identity_check)
         checks.extend(
             [
-                _presence_check("board", resources.board, "board configured"),
-                _presence_check("device", resources.device, "device configured"),
                 _presence_check("dut_probe", resources.dut_probe_sn, "DUT probe configured"),
                 _presence_check("tester_probe", resources.tester_probe_sn, "tester probe configured"),
                 _presence_check(
@@ -493,6 +546,8 @@ class CMSBench:
             else DeviceState.ERROR,
             summary=_health_summary(state, checks),
             checks=checks,
+            detected_identity=detected_identity,
+            commander_probe=commander_probe,
         )
 
     def inspect(self, measurement_id: str) -> None:
@@ -1991,6 +2046,28 @@ def _probe_dut_identity(
             evidence,
         )
     return CommanderProbeResult(evidence=evidence, identity=identity)
+
+
+def _health_detected_target_identity(identity: CommanderProbeIdentity) -> DetectedTargetIdentity:
+    return DetectedTargetIdentity(
+        radio_board_part_number=identity.radio_board_part_number,
+        radio_board_revision=identity.radio_board_revision,
+        radio_board_serial_number=identity.radio_board_serial_number,
+        target_device=identity.target_device,
+        canonical_target_device=identity.canonical_target_device,
+        dut_jlink_serial=identity.dut_jlink_serial,
+        vcom_supported=identity.vcom_supported,
+    )
+
+
+def _health_commander_probe_evidence(evidence: CommanderProbeEvidence) -> HealthCommanderProbeEvidence:
+    return HealthCommanderProbeEvidence(
+        command=list(evidence.command),
+        returncode=evidence.returncode,
+        stdout=evidence.stdout,
+        stderr=evidence.stderr,
+        error=evidence.error,
+    )
 
 
 def _commander_board_list_entries(output: str) -> list[dict[str, str]]:

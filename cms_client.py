@@ -1034,6 +1034,26 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "health":
         report = client.get_health()
         print(f"{colors.state(report.state)}: {report.summary}")
+        print(f"endpoint: {client.base_url}")
+        print(f"bench_id: {report.identity.bench_id}")
+        if report.detected_identity is None:
+            print("detected_dut_identity: unavailable")
+        else:
+            detected = report.detected_identity
+            revision = f" Rev. {detected.radio_board_revision}" if detected.radio_board_revision else ""
+            vcom = "unknown" if detected.vcom_supported is None else str(detected.vcom_supported).lower()
+            print(
+                "detected_radio_board: "
+                f"{detected.radio_board_part_number}{revision} "
+                f"(serial {detected.radio_board_serial_number})"
+            )
+            print(
+                "detected_target_device: "
+                f"{detected.target_device} "
+                f"(canonical {detected.canonical_target_device})"
+            )
+            print(f"detected_dut_jlink_serial: {detected.dut_jlink_serial}")
+            print(f"detected_vcom_supported: {vcom}")
         for check in report.checks:
             detail = f" ({check.detail})" if check.detail else ""
             print(f"{colors.state(check.status.value)} {check.name}: {check.summary}{detail}")

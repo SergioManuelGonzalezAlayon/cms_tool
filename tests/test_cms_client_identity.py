@@ -18,6 +18,10 @@ from cms_client import (
 )
 from cms_colors import ColorFormatter
 from cms_protocol import (
+    BenchHealthReport,
+    BenchIdentity,
+    BenchState,
+    DetectedTargetIdentity,
     MeasurementIdentity,
     MeasurementMode,
     MeasurementResult,
@@ -58,6 +62,41 @@ def test_tests_command_hides_debug_mode(capsys, monkeypatch):
 
     assert exit_code == 0
     assert capsys.readouterr().out == "modes: default, full_sweep, diff\n"
+
+
+def test_health_command_prints_endpoint_and_detected_dut_identity(capsys, monkeypatch):
+    report = BenchHealthReport(
+        state=BenchState.IDLE,
+        identity=BenchIdentity(bench_id="cms-bench-001"),
+        summary="bench ready",
+        detected_identity=DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+            vcom_supported=True,
+        ),
+    )
+
+    class Client:
+        base_url = "http://cms-bench-001:8000"
+
+        def get_health(self):
+            return report
+
+    monkeypatch.setattr("cms_client.CMSClient", lambda **_kwargs: Client())
+
+    assert cms_client.main(["--color", "never", "health"]) == 0
+
+    output = capsys.readouterr().out
+    assert "endpoint: http://cms-bench-001:8000" in output
+    assert "bench_id: cms-bench-001" in output
+    assert "detected_radio_board: BRD4182A Rev. B06 (serial 212300218)" in output
+    assert "detected_target_device: EFR32MG22C224F512IM40-C" in output
+    assert "detected_dut_jlink_serial: 440365029" in output
+    assert "detected_vcom_supported: true" in output
 
 
 def test_build_derives_sisdk_version_from_the_selected_package(tmp_path, monkeypatch):

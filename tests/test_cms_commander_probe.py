@@ -2,6 +2,7 @@ import subprocess
 
 import cms_bench
 import pytest
+from cms_protocol import BenchIdentity
 
 
 _COMMANDER_PROBE_OUTPUT = """\
@@ -163,6 +164,124 @@ def test_validated_commander_probe_rejects_jlink_serial_mismatch(
 
     with pytest.raises(cms_bench.CommanderProbeError, match="does not match"):
         cms_bench._probe_dut_identity("commander", "440365029")
+
+
+def test_health_check_uses_a_fresh_commander_probe_each_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    bench = cms_bench.CMSBench(
+        identity=BenchIdentity(bench_id="cms-bench-001"),
+        resources=cms_bench.BenchResources(
+            board="brd4182a",
+            device="EFR32MG22C224F512IM40",
+            dut_probe_sn="440365029",
+            tester_probe_sn="440365030",
+            dut_serial_port="/dev/ttyACM0",
+            tester_serial_port="/dev/ttyACM1",
+            commander_path="commander",
+        ),
+    )
+    calls: list[tuple[str, str]] = []
+    result = cms_bench.CommanderProbeResult(
+        evidence=cms_bench.CommanderProbeEvidence(
+            command=("commander", "adapter", "probe", "-s", "440365029"),
+            returncode=0,
+            stdout=_COMMANDER_PROBE_OUTPUT,
+        ),
+        identity=cms_bench._parse_commander_probe_identity(_COMMANDER_PROBE_OUTPUT),
+    )
+
+    def fake_probe(commander_path: str, dut_probe_sn: str):
+        calls.append((commander_path, dut_probe_sn))
+        return result
+
+    monkeypatch.setattr(cms_bench, "_probe_dut_identity", fake_probe)
+
+    first = bench.health_check()
+    second = bench.health_check()
+
+    assert calls == [("commander", "440365029"), ("commander", "440365029")]
+    assert first.identity.board == "BRD4182A"
+    assert first.identity.device == "EFR32MG22C224F512IM40-C"
+    assert first.detected_identity is not None
+    assert first.detected_identity.target_device == "EFR32MG22C224F512IM40-C"
+    assert first.commander_probe is not None
+    assert second.commander_probe is not None
+
+
+def test_health_check_reports_failed_identity_without_configured_identity_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = cms_bench.CMSBench(
+        identity=BenchIdentity(
+            bench_id="cms-bench-001",
+            board="configured-board",
+            device="CONFIGURED-DEVICE",
+        ),
+        resources=cms_bench.BenchResources(
+            board="configured-board",
+            device="CONFIGURED-DEVICE",
+            dut_probe_sn="440365029",
+            tester_probe_sn="440365030",
+            dut_serial_port="/dev/ttyACM0",
+            tester_serial_port="/dev/ttyACM1",
+            commander_path="commander",
+        ),
+    )
+    evidence = cms_bench.CommanderProbeEvidence(
+        command=("commander", "adapter", "probe", "-s", "440365029"),
+        returncode=1,
+        stderr="No debug adapter found",
+    )
+
+    def fake_probe(*_args, **_kwargs):
+        raise cms_bench.CommanderProbeError("Commander DUT probe failed with exit code 1", evidence)
+
+    monkeypatch.setattr(cms_bench, "_probe_dut_identity", fake_probe)
+
+    report = bench.health_check()
+    identity_check = next(check for check in report.checks if check.name == "dut_identity")
+
+    assert report.identity.board == ""
+    assert report.identity.device == ""
+    assert report.detected_identity is None
+    assert report.commander_probe is not None
+    assert report.commander_probe.returncode == 1
+    assert identity_check.status.value == "fail"
+    assert "could not establish" in identity_check.summary
+
+
+def test_health_check_reports_connectivity_mappings_separately_from_dut_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bench = cms_bench.CMSBench(
+        identity=BenchIdentity(bench_id="cms-bench-001"),
+        resources=cms_bench.BenchResources(
+            board="legacy-configured-board",
+            device="LEGACY-CONFIGURED-DEVICE",
+            dut_probe_sn="440365029",
+            tester_probe_sn="440365030",
+            dut_serial_port="/dev/ttyACM0",
+            tester_serial_port="/dev/ttyACM1",
+            joulescope_serial="JS220-0001",
+            commander_path="commander",
+        ),
+    )
+    result = cms_bench.CommanderProbeResult(
+        evidence=cms_bench.CommanderProbeEvidence(
+            command=("commander", "adapter", "probe", "-s", "440365029"),
+            returncode=0,
+            stdout=_COMMANDER_PROBE_OUTPUT,
+        ),
+        identity=cms_bench._parse_commander_probe_identity(_COMMANDER_PROBE_OUTPUT),
+    )
+    monkeypatch.setattr(cms_bench, "_probe_dut_identity", lambda *_args, **_kwargs: result)
+
+    report = bench.health_check()
+    checks = {check.name: check for check in report.checks}
+
+    assert {"commander", "dut_probe", "tester_probe", "dut_serial_port", "tester_serial_port", "joulescope"} <= checks.keys()
+    assert checks["dut_identity"].status.value == "pass"
+    assert "board" not in checks
+    assert "device" not in checks
 
 
 def test_commander_probe_captures_raw_process_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
