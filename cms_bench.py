@@ -506,6 +506,52 @@ class CMSBench:
         )
         _validate_variable_filtered_campaign(session)
 
+    def validate_differential_firmware(self, request: MeasurementRequest, runtime_dir: Path) -> None:
+        """Validate both isolated staged firmware variants before differential execution."""
+
+        if self.resources is None:
+            raise RuntimeError("bench resources are not initialized")
+        differential = request.differential_firmware
+        if differential is None:
+            raise RuntimeError("differential firmware was not supplied")
+        for variant_name, firmware in (("child", differential.child), ("parent", differential.parent)):
+            if firmware.board and firmware.board != self.resources.board:
+                raise RuntimeError(
+                    f"{variant_name} firmware board {firmware.board} does not match bench board {self.resources.board}"
+                )
+            if firmware.device and firmware.device != self.resources.device:
+                raise RuntimeError(
+                    f"{variant_name} firmware device {firmware.device} does not match bench device {self.resources.device}"
+                )
+            variant_root = runtime_dir / "firmware" / variant_name
+            for role_image in firmware.role_images:
+                _validate_firmware_file(
+                    variant_root / "roles" / role_image.role / role_image.project_name / role_image.image.name,
+                    role_image.image.sha256,
+                )
+            if firmware.xapi_file is None:
+                raise RuntimeError(f"{variant_name} sl_bt.xapi was not supplied")
+            _validate_firmware_file(
+                variant_root / "xapi" / firmware.xapi_file.name,
+                firmware.xapi_file.sha256 or firmware.xapi_file_hash,
+            )
+            if firmware.bootloader_img is not None:
+                _validate_firmware_file(
+                    variant_root / "bootloader" / firmware.bootloader_img.name,
+                    firmware.bootloader_img.sha256 or firmware.bootloader_img_hash,
+                )
+        if request.selector.config_hash:
+            session = BenchSession(
+                measurement_id=request.request_id,
+                runtime_dir=runtime_dir,
+                manifest=differential.child,
+                request=request,
+            )
+            config_path = _requested_test_config_path(session)
+            observed_hash = _sha256_text_file_lf_normalized(config_path)
+            if observed_hash != request.selector.config_hash:
+                raise RuntimeError("selected config hash does not match the requested differential campaign")
+
     def persist_staged_firmware_provenance(self, session: BenchSession) -> None:
         """Record the validated client SDK provenance in persistent bench config."""
 

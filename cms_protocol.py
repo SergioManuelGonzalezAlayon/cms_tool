@@ -233,6 +233,21 @@ class FirmwareImage:
     sha256: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class FirmwareRoleImage:
+    """One explicitly named firmware role within a complete firmware variant."""
+
+    role: str
+    project_name: str
+    image: FirmwareImage
+
+    def __post_init__(self) -> None:
+        if not self.role.strip():
+            raise ValueError("firmware role must not be empty")
+        if not self.project_name.strip():
+            raise ValueError("firmware project name must not be empty")
+
+
 @dataclass(slots=True)
 class FirmwareData:
     """Firmware references that the daemon stages before execution."""
@@ -253,6 +268,18 @@ class FirmwareData:
     sisdk_version: str = ""
     sisdk_commit: str = ""
     sisdk_hash: str = ""
+    role_images: tuple[FirmwareRoleImage, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DifferentialFirmwareData:
+    """The complete, independently provenanced child and parent firmware sets."""
+
+    child: FirmwareData
+    parent: FirmwareData
+
+    def __post_init__(self) -> None:
+        validate_differential_firmware(self)
 
 
 @dataclass(slots=True)
@@ -291,6 +318,7 @@ class MeasurementRequest:
     upload_results_to_database: bool = True
     debug_artifact_streaming: bool = False
     identity: MeasurementIdentity | None = None
+    differential_firmware: DifferentialFirmwareData | None = None
 
 
 @dataclass(slots=True)
@@ -649,8 +677,27 @@ def firmware_image_from_dict(data: dict[str, Any] | None) -> FirmwareImage | Non
     )
 
 
-def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
+def firmware_role_image_to_dict(role_image: FirmwareRoleImage) -> dict[str, Any]:
     return {
+        "role": role_image.role,
+        "project_name": role_image.project_name,
+        "image": firmware_image_to_dict(role_image.image),
+    }
+
+
+def firmware_role_image_from_dict(data: dict[str, Any]) -> FirmwareRoleImage:
+    image = firmware_image_from_dict(data.get("image"))
+    if image is None:
+        raise ValueError("firmware role image must contain an image")
+    return FirmwareRoleImage(
+        role=str(data.get("role", "")),
+        project_name=str(data.get("project_name", "")),
+        image=image,
+    )
+
+
+def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
+    payload = {
         "dut_img": firmware_image_to_dict(firmware.dut_img),
         "tester_img": firmware_image_to_dict(firmware.tester_img),
         "dut_variants": {
@@ -672,6 +719,12 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
         "sisdk_commit": firmware.sisdk_commit,
         "sisdk_hash": firmware.sisdk_hash,
     }
+    if firmware.role_images:
+        payload["role_images"] = [
+            firmware_role_image_to_dict(role_image)
+            for role_image in firmware.role_images
+        ]
+    return payload
 
 
 def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
@@ -692,6 +745,9 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         for name, value in raw_dut_variants.items()
         if (image := firmware_image_from_dict(value)) is not None
     }
+    raw_role_images = data.get("role_images", [])
+    if not isinstance(raw_role_images, list):
+        raise ValueError("role_images must be a list")
     return FirmwareData(
         dut_img=dut_img,
         tester_img=tester_img,
@@ -710,11 +766,56 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         sisdk_version=str(data.get("sisdk_version", "")),
         sisdk_commit=str(data.get("sisdk_commit", "")),
         sisdk_hash=str(data.get("sisdk_hash", "")),
+        role_images=tuple(firmware_role_image_from_dict(item) for item in raw_role_images),
     )
 
 
-def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
+def differential_firmware_to_dict(firmware: DifferentialFirmwareData) -> dict[str, Any]:
+    validate_differential_firmware(firmware)
     return {
+        "child": firmware_data_to_dict(firmware.child),
+        "parent": firmware_data_to_dict(firmware.parent),
+    }
+
+
+def differential_firmware_from_dict(data: dict[str, Any]) -> DifferentialFirmwareData:
+    child = data.get("child")
+    parent = data.get("parent")
+    if not isinstance(child, dict) or not isinstance(parent, dict):
+        raise ValueError("differential_firmware must contain child and parent firmware objects")
+    return DifferentialFirmwareData(
+        child=firmware_data_from_dict(child),
+        parent=firmware_data_from_dict(parent),
+    )
+
+
+def validate_differential_firmware(firmware: DifferentialFirmwareData) -> None:
+    """Reject incomplete or ambiguous parent/child firmware sets before staging."""
+
+    for variant_name, variant in (("child", firmware.child), ("parent", firmware.parent)):
+        required_images = [variant.dut_img, variant.tester_img, variant.xapi_file]
+        required_images.extend(variant.dut_variants.values())
+        required_images.extend(role_image.image for role_image in variant.role_images)
+        if variant.bootloader_img is not None:
+            required_images.append(variant.bootloader_img)
+        if any(image is None or not image.sha256 for image in required_images):
+            raise ValueError(f"differential {variant_name} firmware contains an image without sha256")
+        if not variant.role_images:
+            raise ValueError(f"differential {variant_name} firmware must contain explicit role images")
+        role_keys = [(item.role, item.project_name) for item in variant.role_images]
+        if len(role_keys) != len(set(role_keys)):
+            raise ValueError(f"differential {variant_name} firmware contains duplicate role images")
+        project_names = [item.project_name for item in variant.role_images]
+        if len(project_names) != len(set(project_names)):
+            raise ValueError(f"differential {variant_name} firmware contains duplicate role project names")
+    child_target = (firmware.child.board, firmware.child.device)
+    parent_target = (firmware.parent.board, firmware.parent.device)
+    if all(child_target) and all(parent_target) and child_target != parent_target:
+        raise ValueError("differential child and parent firmware targets do not match")
+
+
+def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
+    payload = {
         "request_id": request.request_id,
         "identity": measurement_identity_to_dict(request.identity) if request.identity else None,
         "selector": {
@@ -730,6 +831,11 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
         "upload_results_to_database": request.upload_results_to_database,
         "debug_artifact_streaming": request.debug_artifact_streaming,
     }
+    if request.differential_firmware is not None:
+        payload["differential_firmware"] = differential_firmware_to_dict(
+            request.differential_firmware
+        )
+    return payload
 
 
 def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
@@ -750,6 +856,11 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
         upload_results_to_database=bool(data.get("upload_results_to_database", True)),
         debug_artifact_streaming=bool(data.get("debug_artifact_streaming", False)),
         identity=measurement_identity_from_dict(identity_data) if identity_data else None,
+        differential_firmware=(
+            differential_firmware_from_dict(data["differential_firmware"])
+            if data.get("differential_firmware") is not None
+            else None
+        ),
     )
 
 

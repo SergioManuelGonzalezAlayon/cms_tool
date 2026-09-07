@@ -1461,6 +1461,30 @@ def _local_test_config_path(feature: str, config: str) -> Path:
 
 def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
     payloads: dict[str, str] = {}
+    if request.differential_firmware is not None:
+        for variant_name, firmware in (
+            ("child", request.differential_firmware.child),
+            ("parent", request.differential_firmware.parent),
+        ):
+            for role_image in firmware.role_images:
+                path = Path(role_image.image.url)
+                if path.exists() and path.is_file():
+                    payloads[
+                        f"differential_firmware.{variant_name}.role_images.{role_image.project_name}"
+                    ] = base64.b64encode(path.read_bytes()).decode("ascii")
+            if firmware.xapi_file is not None:
+                path = Path(firmware.xapi_file.url)
+                if path.exists() and path.is_file():
+                    payloads[f"differential_firmware.{variant_name}.xapi_file"] = (
+                        base64.b64encode(path.read_bytes()).decode("ascii")
+                    )
+            if firmware.bootloader_img is not None:
+                path = Path(firmware.bootloader_img.url)
+                if path.exists() and path.is_file():
+                    payloads[f"differential_firmware.{variant_name}.bootloader_img"] = (
+                        base64.b64encode(path.read_bytes()).decode("ascii")
+                    )
+        return payloads
     for key, image in (("dut_img", request.firmware.dut_img), ("tester_img", request.firmware.tester_img)):
         path = Path(image.url)
         if path.exists() and path.is_file():

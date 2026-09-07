@@ -4,9 +4,11 @@ import pytest
 
 from cms_protocol import (
     CMS_OBSERVATION_PROTOCOL_VERSION,
+    DifferentialFirmwareData,
     EventCursor,
     FirmwareData,
     FirmwareImage,
+    FirmwareRoleImage,
     MeasurementEvent,
     MeasurementEventPage,
     MeasurementIdentity,
@@ -167,6 +169,59 @@ def test_measurement_request_round_trip_preserves_requested_config_hash():
     assert payload["selector"]["config_hash"] == "sha256:dcdc"
     assert measurement_request_from_dict(payload).selector.config_hash == "sha256:dcdc"
     assert measurement_request_from_dict(payload).firmware.dut_variants == request.firmware.dut_variants
+
+
+def _differential_variant(name: str, *, board: str = "brd4182a") -> FirmwareData:
+    dut = FirmwareImage(name=f"{name}-dut.s37", url=f"{name}-dut.s37", sha256=f"{name}-dut-hash")
+    tester = FirmwareImage(name=f"{name}-tester.s37", url=f"{name}-tester.s37", sha256=f"{name}-tester-hash")
+    xapi = FirmwareImage(name=f"{name}-sl_bt.xapi", url=f"{name}-sl_bt.xapi", sha256=f"{name}-xapi-hash")
+    return FirmwareData(
+        dut_img=dut,
+        tester_img=tester,
+        xapi_file=xapi,
+        board=board,
+        device="EFR32MG22C224F512IM40",
+        sisdk_version=f"{name}-sdk",
+        sisdk_hash=f"{name}-sdk-hash",
+        role_images=(
+            FirmwareRoleImage("dut_dcdc", "ncp_ble_dut_dcdc", dut),
+            FirmwareRoleImage("tester", "ncp_ble_tester", tester),
+        ),
+    )
+
+
+def test_measurement_request_round_trip_preserves_named_differential_firmware() -> None:
+    differential = DifferentialFirmwareData(
+        child=_differential_variant("child"),
+        parent=_differential_variant("parent"),
+    )
+    request = MeasurementRequest(
+        request_id="diff-001",
+        selector=SuiteSelector(mode="ble", feature="beacon"),
+        firmware=differential.child,
+        differential_firmware=differential,
+    )
+
+    payload = measurement_request_to_dict(request)
+    parsed = measurement_request_from_dict(payload)
+
+    assert set(payload["differential_firmware"]) == {"child", "parent"}
+    assert parsed.differential_firmware is not None
+    assert parsed.differential_firmware.child.sisdk_version == "child-sdk"
+    assert parsed.differential_firmware.parent.role_images[0].role == "dut_dcdc"
+
+
+def test_differential_firmware_rejects_missing_hashes_and_mismatched_targets() -> None:
+    child = _differential_variant("child")
+    child.dut_img.sha256 = ""
+    with pytest.raises(ValueError, match="image without sha256"):
+        DifferentialFirmwareData(child=child, parent=_differential_variant("parent"))
+
+    with pytest.raises(ValueError, match="targets do not match"):
+        DifferentialFirmwareData(
+            child=_differential_variant("child", board="brd4182a"),
+            parent=_differential_variant("parent", board="brd4182b"),
+        )
 
 
 def test_measurement_request_round_trip_preserves_variable_filters():
