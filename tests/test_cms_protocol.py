@@ -3,7 +3,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from cms_protocol import (
+    BenchHealthReport,
+    BenchState,
     CMS_OBSERVATION_PROTOCOL_VERSION,
+    CommanderProbeEvidence,
+    DetectedTargetIdentity,
     DifferentialFirmwareData,
     EventCursor,
     FirmwareData,
@@ -23,6 +27,8 @@ from cms_protocol import (
     TestCounts as Counts,
     VariableFilter,
     create_measurement_identity,
+    bench_health_report_from_dict,
+    bench_health_report_to_dict,
     event_cursor_from_int,
     event_cursor_to_int,
     measurement_event_from_dict,
@@ -96,6 +102,44 @@ def test_create_measurement_identity_uses_collision_safe_suffixes():
 def test_create_measurement_identity_rejects_naive_timestamp():
     with pytest.raises(ValueError, match="timezone"):
         create_measurement_identity("beacon", created_at=datetime(2026, 8, 18, 9, 30))
+
+
+def test_health_report_round_trips_optional_detected_identity_and_probe_evidence():
+    report = BenchHealthReport(
+        state=BenchState.IDLE,
+        detected_identity=DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+            vcom_supported=True,
+        ),
+        commander_probe=CommanderProbeEvidence(
+            command=["commander", "adapter", "probe", "-s", "440365029"],
+            returncode=0,
+            stdout="Board List:\\n...",
+        ),
+    )
+
+    payload = bench_health_report_to_dict(report)
+    recovered = bench_health_report_from_dict(payload)
+
+    assert payload["detected_identity"]["canonical_target_device"] == "EFR32MG22C224F512IM40"
+    assert payload["commander_probe"]["command"][-1] == "440365029"
+    assert recovered.detected_identity == report.detected_identity
+    assert recovered.commander_probe == report.commander_probe
+
+
+def test_health_report_accepts_legacy_payload_without_probe_fields():
+    report = bench_health_report_from_dict({"state": "idle", "identity": {"bench_id": "bench-1"}})
+
+    assert report.detected_identity is None
+    assert report.commander_probe is None
+    payload = bench_health_report_to_dict(report)
+    assert "detected_identity" not in payload
+    assert "commander_probe" not in payload
 
 
 def test_measurement_result_round_trip_preserves_identity():

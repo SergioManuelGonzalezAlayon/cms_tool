@@ -52,6 +52,7 @@ DEFAULT_CONSOLE_EVENT_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_EXECUTION_TIMEOUT_S: float | None = None
 PROCESS_TERMINATE_GRACE_S = 5.0
 MAX_CONSOLE_EVENT_SEGMENT_BYTES = 64 * 1024
+COMMANDER_PROBE_TIMEOUT_S = 15.0
 
 
 @dataclass(slots=True)
@@ -74,6 +75,46 @@ class BenchResources:
     xapi_path: str = ""
     group_id: int | None = None
     group_name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CommanderProbeEvidence:
+    """Raw evidence produced by one Commander DUT probe invocation."""
+
+    command: tuple[str, ...]
+    returncode: int | None
+    stdout: str = ""
+    stderr: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CommanderProbeIdentity:
+    """Physical DUT identity extracted from one Commander probe output."""
+
+    radio_board_part_number: str
+    radio_board_revision: str
+    radio_board_serial_number: str
+    target_device: str
+    canonical_target_device: str
+    dut_jlink_serial: str
+    vcom_supported: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class CommanderProbeResult:
+    """One validated Commander probe, including its retained raw evidence."""
+
+    evidence: CommanderProbeEvidence
+    identity: CommanderProbeIdentity
+
+
+class CommanderProbeError(RuntimeError):
+    """A Commander probe could not establish one trustworthy DUT identity."""
+
+    def __init__(self, message: str, evidence: CommanderProbeEvidence):
+        super().__init__(message)
+        self.evidence = evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -1840,6 +1881,199 @@ def _presence_check(name: str, value: str, ok_summary: str) -> BenchCheckResult:
         status=BenchCheckStatus.FAIL,
         summary=f"{name} is not configured",
     )
+
+
+def _run_commander_probe(
+    commander_path: str,
+    dut_probe_sn: str,
+    *,
+    timeout_s: float = COMMANDER_PROBE_TIMEOUT_S,
+) -> CommanderProbeEvidence:
+    """Run Commander against the configured DUT probe and retain raw output."""
+
+    if not str(commander_path).strip():
+        raise ValueError("commander path is required for a DUT probe")
+    if not str(dut_probe_sn).strip():
+        raise ValueError("DUT probe serial is required for a Commander probe")
+    if timeout_s <= 0:
+        raise ValueError("Commander probe timeout must be positive")
+
+    command = (str(commander_path), "adapter", "probe", "-s", str(dut_probe_sn))
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        stdout = getattr(exc, "stdout", "") or ""
+        stderr = getattr(exc, "stderr", "") or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return CommanderProbeEvidence(
+            command=command,
+            returncode=None,
+            stdout=stdout,
+            stderr=stderr,
+            error=str(exc),
+        )
+
+    return CommanderProbeEvidence(
+        command=command,
+        returncode=completed.returncode,
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+    )
+
+
+def _parse_commander_probe_identity(output: str) -> CommanderProbeIdentity:
+    """Extract the radio-board identity from Commander ``adapter probe`` output."""
+
+    board_entries = _commander_board_list_entries(output)
+    radio_boards = [entry for entry in board_entries if entry.get("target_device")]
+    if not radio_boards:
+        raise ValueError("Commander probe output has no radio-board entry with a target device")
+    if len(radio_boards) != 1:
+        raise ValueError("Commander probe output has multiple radio-board entries with target devices")
+
+    radio_board = radio_boards[0]
+    part_number, revision = _split_commander_board_part_number(radio_board.get("part_number", ""))
+    if not part_number:
+        raise ValueError("Commander radio-board entry has no part number")
+    if not radio_board.get("serial_number"):
+        raise ValueError("Commander radio-board entry has no serial number")
+
+    return CommanderProbeIdentity(
+        radio_board_part_number=part_number,
+        radio_board_revision=revision,
+        radio_board_serial_number=radio_board["serial_number"],
+        target_device=radio_board["target_device"],
+        canonical_target_device=_canonicalize_commander_device(radio_board["target_device"]),
+        dut_jlink_serial=_commander_probe_field(output, "J-Link Serial"),
+        vcom_supported=_commander_bool_field(output, "VCOM Supported"),
+    )
+
+
+def _probe_dut_identity(
+    commander_path: str,
+    dut_probe_sn: str,
+    *,
+    timeout_s: float = COMMANDER_PROBE_TIMEOUT_S,
+) -> CommanderProbeResult:
+    """Run and validate Commander output without falling back to configured identity."""
+
+    evidence = _run_commander_probe(commander_path, dut_probe_sn, timeout_s=timeout_s)
+    if evidence.error:
+        raise CommanderProbeError(f"Commander DUT probe could not run: {evidence.error}", evidence)
+    if evidence.returncode != 0:
+        raise CommanderProbeError(
+            f"Commander DUT probe failed with exit code {evidence.returncode}", evidence
+        )
+
+    try:
+        identity = _parse_commander_probe_identity(evidence.stdout)
+    except ValueError as exc:
+        raise CommanderProbeError(f"Commander DUT probe output is invalid: {exc}", evidence) from exc
+    if not identity.target_device:
+        raise CommanderProbeError(
+            "Commander radio-board entry has no target device",
+            evidence,
+        )
+    if identity.dut_jlink_serial != str(dut_probe_sn):
+        raise CommanderProbeError(
+            "Commander probe J-Link serial does not match the configured DUT probe serial",
+            evidence,
+        )
+    return CommanderProbeResult(evidence=evidence, identity=identity)
+
+
+def _commander_board_list_entries(output: str) -> list[dict[str, str]]:
+    """Return labelled records from the Commander ``Board List`` section only."""
+
+    lines = output.splitlines()
+    try:
+        start = next(
+            index
+            for index, line in enumerate(lines)
+            if re.fullmatch(r"\s*Board List\s*:\s*", line, flags=re.IGNORECASE)
+        )
+    except StopIteration:
+        raise ValueError("Commander probe output has no Board List section") from None
+
+    entries: list[dict[str, str]] = []
+    entry: dict[str, str] = {}
+    labels = {
+        "name": "name",
+        "part number": "part_number",
+        "serial number": "serial_number",
+        "target device": "target_device",
+    }
+    for line in lines[start + 1 :]:
+        if re.fullmatch(r"\s*DONE\s*", line, flags=re.IGNORECASE):
+            break
+        match = re.fullmatch(r"\s*([^:]+?)\s*:\s*(.*?)\s*", line)
+        if match is None:
+            continue
+        label = match.group(1).strip().casefold()
+        if label not in labels:
+            continue
+        key = labels[label]
+        if key == "name" and entry:
+            entries.append(entry)
+            entry = {}
+        entry[key] = match.group(2).strip()
+    if entry:
+        entries.append(entry)
+    return entries
+
+
+def _split_commander_board_part_number(value: str) -> tuple[str, str]:
+    """Split Commander ``BRDxxxx Rev. yyy`` text without normalizing it."""
+
+    match = re.fullmatch(r"\s*(.*?)\s+Rev\.?\s+(.+?)\s*", value, flags=re.IGNORECASE)
+    if match is None:
+        return value.strip(), ""
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def _canonicalize_commander_device(value: str) -> str:
+    """Return the stable build-comparison form of a Commander target device.
+
+    Commander may append a one-letter package suffix, such as ``-C``, to an
+    EFR32 device identifier. Build manifests omit that suffix, so it is removed
+    only from otherwise valid EFR32 identifiers. All other text is retained
+    after trimming and uppercasing rather than guessed or rewritten.
+    """
+
+    raw = value.strip().upper()
+    match = re.fullmatch(r"(EFR32[A-Z0-9]+)-[A-Z]", raw)
+    return match.group(1) if match else raw
+
+
+def _commander_probe_field(output: str, label: str) -> str:
+    """Read one top-level Commander key/value field without guessing a default."""
+
+    match = re.search(
+        rf"^\s*{re.escape(label)}\s*:\s*(.*?)\s*$",
+        output,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _commander_bool_field(output: str, label: str) -> bool | None:
+    value = _commander_probe_field(output, label).casefold()
+    if value in {"true", "yes", "supported", "available"}:
+        return True
+    if value in {"false", "no", "unsupported", "unavailable"}:
+        return False
+    return None
 
 
 def _optional_presence_check(

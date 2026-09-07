@@ -361,6 +361,30 @@ class BenchStatus:
 
 
 @dataclass(slots=True)
+class DetectedTargetIdentity:
+    """Physical DUT identity freshly detected by the CMS Bench."""
+
+    radio_board_part_number: str
+    radio_board_revision: str
+    radio_board_serial_number: str
+    target_device: str
+    canonical_target_device: str
+    dut_jlink_serial: str
+    vcom_supported: bool | None = None
+
+
+@dataclass(slots=True)
+class CommanderProbeEvidence:
+    """Raw execution evidence from the Commander probe used for health."""
+
+    command: list[str]
+    returncode: int | None
+    stdout: str = ""
+    stderr: str = ""
+    error: str = ""
+
+
+@dataclass(slots=True)
 class BenchHealthReport:
     """Health snapshot for hardware and local tooling."""
     state: BenchState
@@ -370,6 +394,8 @@ class BenchHealthReport:
     identity: BenchIdentity = field(default_factory=lambda: BenchIdentity(bench_id=""))
     summary: str = ""
     checks: list["BenchCheckResult"] = field(default_factory=list)
+    detected_identity: DetectedTargetIdentity | None = None
+    commander_probe: CommanderProbeEvidence | None = None
     checked_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -613,8 +639,56 @@ def bench_check_to_dict(check: BenchCheckResult) -> dict[str, str]:
     return result
 
 
-def bench_health_report_to_dict(report: BenchHealthReport) -> dict[str, Any]:
+def detected_target_identity_to_dict(identity: DetectedTargetIdentity) -> dict[str, Any]:
     return {
+        "radio_board_part_number": identity.radio_board_part_number,
+        "radio_board_revision": identity.radio_board_revision,
+        "radio_board_serial_number": identity.radio_board_serial_number,
+        "target_device": identity.target_device,
+        "canonical_target_device": identity.canonical_target_device,
+        "dut_jlink_serial": identity.dut_jlink_serial,
+        "vcom_supported": identity.vcom_supported,
+    }
+
+
+def detected_target_identity_from_dict(data: dict[str, Any] | None) -> DetectedTargetIdentity | None:
+    if data is None:
+        return None
+    return DetectedTargetIdentity(
+        radio_board_part_number=str(data.get("radio_board_part_number", "")),
+        radio_board_revision=str(data.get("radio_board_revision", "")),
+        radio_board_serial_number=str(data.get("radio_board_serial_number", "")),
+        target_device=str(data.get("target_device", "")),
+        canonical_target_device=str(data.get("canonical_target_device", "")),
+        dut_jlink_serial=str(data.get("dut_jlink_serial", "")),
+        vcom_supported=data.get("vcom_supported"),
+    )
+
+
+def commander_probe_evidence_to_dict(evidence: CommanderProbeEvidence) -> dict[str, Any]:
+    return {
+        "command": list(evidence.command),
+        "returncode": evidence.returncode,
+        "stdout": evidence.stdout,
+        "stderr": evidence.stderr,
+        "error": evidence.error,
+    }
+
+
+def commander_probe_evidence_from_dict(data: dict[str, Any] | None) -> CommanderProbeEvidence | None:
+    if data is None:
+        return None
+    return CommanderProbeEvidence(
+        command=[str(value) for value in data.get("command", [])],
+        returncode=data.get("returncode"),
+        stdout=str(data.get("stdout", "")),
+        stderr=str(data.get("stderr", "")),
+        error=str(data.get("error", "")),
+    )
+
+
+def bench_health_report_to_dict(report: BenchHealthReport) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "identity": bench_identity_to_dict(report.identity),
         "state": report.state.value,
         "dut_state": report.dut_state.value,
@@ -624,6 +698,11 @@ def bench_health_report_to_dict(report: BenchHealthReport) -> dict[str, Any]:
         "checks": [bench_check_to_dict(check) for check in report.checks],
         "checked_at": report.checked_at.isoformat(),
     }
+    if report.detected_identity is not None:
+        result["detected_identity"] = detected_target_identity_to_dict(report.detected_identity)
+    if report.commander_probe is not None:
+        result["commander_probe"] = commander_probe_evidence_to_dict(report.commander_probe)
+    return result
 
 
 def bench_identity_from_dict(data: dict[str, Any] | None) -> BenchIdentity:
@@ -664,6 +743,8 @@ def bench_health_report_from_dict(data: dict[str, Any]) -> BenchHealthReport:
         js_state=DeviceState(str(data.get("js_state", DeviceState.ERROR.value))),
         summary=str(data.get("summary", "")),
         checks=[bench_check_from_dict(check) for check in data.get("checks", [])],
+        detected_identity=detected_target_identity_from_dict(data.get("detected_identity")),
+        commander_probe=commander_probe_evidence_from_dict(data.get("commander_probe")),
         checked_at=parsed_checked_at,
     )
 
