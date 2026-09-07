@@ -116,6 +116,7 @@ class CMSClientConfig:
     target: dict[str, str] | None = None
     build: dict[str, str] | None = None
     tools: dict[str, str] | None = None
+    diff: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -573,6 +574,7 @@ def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
         target={str(key): str(value) for key, value in config.get("target", {}).items()},
         build={str(key): str(value) for key, value in config.get("build", {}).items()},
         tools={str(key): str(value) for key, value in config.get("tools", {}).items()},
+        diff={str(key): str(value) for key, value in config.get("diff", {}).items()},
     )
 
 
@@ -698,6 +700,13 @@ def build_cli_parser() -> argparse.ArgumentParser:
     build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
     build.add_argument("--build-root", default="", help="override firmware build root")
     build.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
+    build.add_argument(
+        "--diff",
+        action="store_true",
+        help=(
+            "build configured parent and child SiSDK packages in isolated diff roots"
+        ),
+    )
 
     send_fw = subparsers.add_parser(
         "send_fw",
@@ -1295,8 +1304,12 @@ def _sisdk_name_from_properties(sdk_package_path: Path) -> str:
 
 
 def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
-    _sync_config_sisdk_version(config_path, args.sdk_package_path)
+    is_diff = bool(getattr(args, "diff", False))
+    if not is_diff:
+        _sync_config_sisdk_version(config_path, args.sdk_package_path)
     cmd = [sys.executable, str(Path("apps") / "app_manager.py"), args.action, *args.targets]
+    if is_diff:
+        cmd.append("--diff")
     for option, value in (
         ("--config", config_path),
         ("--sdk-package-path", args.sdk_package_path),

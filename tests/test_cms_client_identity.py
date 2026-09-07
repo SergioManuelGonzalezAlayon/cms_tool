@@ -96,6 +96,47 @@ def test_build_derives_sisdk_version_from_the_selected_package(tmp_path, monkeyp
     assert "--sisdk-version" not in captured["command"]
 
 
+def test_diff_build_passes_preflight_flag_without_rewriting_normal_sdk_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "target": {"sisdk": "unchanged"},
+                "diff": {
+                    "sisdk_child_path": "child-sdk",
+                    "sisdk_parent_path": "parent-sdk",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(cms_client.subprocess, "run", fake_run)
+    args = argparse.Namespace(
+        action="build",
+        targets=[],
+        sdk_package_path="",
+        build_root="",
+        bootloader_slcp="",
+        diff=True,
+    )
+
+    assert _run_local_build(args, str(config_path)) == 0
+    assert "--diff" in captured["command"]
+    assert json.loads(config_path.read_text(encoding="utf-8"))["target"]["sisdk"] == "unchanged"
+
+
+def test_build_parser_accepts_diff_preflight():
+    args = build_cli_parser().parse_args(["BUILD", "--diff"])
+
+    assert args.diff is True
+
+
 def test_run_test_sends_requested_run_name_to_daemon():
     captured = {}
     client = CMSClient.__new__(CMSClient)
@@ -463,6 +504,14 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     build_root = tmp_path / "fw"
     runtime = build_root / "runtime"
     runtime.mkdir(parents=True)
+    sdk_root = tmp_path / "sdk"
+    sdk_xapi = sdk_root / "bluetooth_le_host" / "api" / "sl_bt.xapi"
+    sdk_xapi.parent.mkdir(parents=True)
+    sdk_xapi.write_bytes(b"exact-sdk-xapi")
+    (sdk_root / ".properties").write_text(
+        "id=com.silabs.sdk.stack.sisdk\nversion=2026.1.0\n",
+        encoding="utf-8",
+    )
     dut_image = tmp_path / "dut.s37"
     no_dcdc_dut_image = tmp_path / "dut-no-dcdc.s37"
     tester_image = tmp_path / "tester.s37"
@@ -489,6 +538,7 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
                 "version": "2026.1.0",
                 "commit": "sdk-commit",
                 "hash": "sdk-hash",
+                "package_path": str(sdk_root),
                 "xapi_sha256": xapi_hash,
             },
         }),

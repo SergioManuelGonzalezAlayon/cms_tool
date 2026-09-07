@@ -1,4 +1,5 @@
 import subprocess
+import argparse
 import json
 import shutil
 from pathlib import Path
@@ -186,6 +187,153 @@ def test_resolve_sdk_selection_rejects_a_properties_version_mismatch(tmp_path: P
 
     with pytest.raises(RuntimeError, match="target.sisdk=2026.1.0"):
         app_manager.resolve_sdk_selection(version="2026.1.0", cli_package_path=str(sdk))
+
+
+def test_resolve_diff_sdk_selections_records_each_variant_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def make_sdk(name: str, version: str) -> Path:
+        sdk = tmp_path / name
+        xapi = sdk / app_manager.SL_BT_XAPI_PATH
+        xapi.parent.mkdir(parents=True)
+        xapi.write_bytes(name.encode())
+        (sdk / ".properties").write_text(f"version={version}\n", encoding="utf-8")
+        return sdk
+
+    child = make_sdk("child", "2026.1.0")
+    parent = make_sdk("parent", "2025.12.3")
+    monkeypatch.setattr(
+        app_manager,
+        "_sdk_git_commit",
+        lambda sdk: f"commit-{sdk.name}",
+    )
+
+    selections = app_manager.resolve_diff_sdk_selections(
+        {
+            "diff": {
+                "sisdk_child_path": str(child),
+                "sisdk_parent_path": str(parent),
+            }
+        }
+    )
+
+    assert selections["child"].version == "2026.1.0"
+    assert selections["child"].source == "client_config_diff_child_path"
+    assert app_manager.sdk_selection_provenance(selections["child"]) == {
+        "source": "client_config_diff_child_path",
+        "version": "2026.1.0",
+        "package_path": str(child.resolve()),
+        "commit": "commit-child",
+        "hash": "commit-child",
+        "xapi_path": str(child / app_manager.SL_BT_XAPI_PATH),
+        "xapi_sha256": app_manager._sha256(child / app_manager.SL_BT_XAPI_PATH),
+    }
+    assert selections["parent"].version == "2025.12.3"
+    assert selections["parent"].xapi_path == parent / app_manager.SL_BT_XAPI_PATH
+
+
+@pytest.mark.parametrize(
+    ("diff", "message"),
+    [
+        ({}, "sisdk_child_path is required"),
+        ({"sisdk_child_path": "missing", "sisdk_parent_path": "missing"}, "does not exist"),
+    ],
+)
+def test_resolve_diff_sdk_selections_rejects_incomplete_or_missing_paths(
+    tmp_path: Path, diff: dict[str, str], message: str
+) -> None:
+    if diff:
+        diff = {name: str(tmp_path / path) for name, path in diff.items()}
+
+    with pytest.raises(RuntimeError, match=message):
+        app_manager.resolve_diff_sdk_selections({"diff": diff})
+
+
+def test_resolve_diff_sdk_selections_rejects_missing_xapi(tmp_path: Path) -> None:
+    child = tmp_path / "child"
+    parent = tmp_path / "parent"
+    for sdk in (child, parent):
+        sdk.mkdir()
+        (sdk / ".properties").write_text("version=2026.1.0\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="cannot find `sl_bt.xapi`"):
+        app_manager.resolve_diff_sdk_selections(
+            {
+                "diff": {
+                    "sisdk_child_path": str(child),
+                    "sisdk_parent_path": str(parent),
+                }
+            }
+        )
+
+
+def test_build_diff_variants_uses_isolated_roots_and_sdk_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_root = tmp_path / "firmware"
+    child_sdk = tmp_path / "child-sdk"
+    parent_sdk = tmp_path / "parent-sdk"
+    selections = {
+        "child": app_manager.SDKSelection(
+            path=child_sdk,
+            version="2026.1.0",
+            source="client_config_diff_child_path",
+        ),
+        "parent": app_manager.SDKSelection(
+            path=parent_sdk,
+            version="2025.12.3",
+            source="client_config_diff_parent_path",
+        ),
+    }
+    captured: list[tuple[argparse.Namespace, dict, Path, app_manager.SDKSelection, frozenset[str]]] = []
+    manifest_calls: list[dict] = []
+
+    monkeypatch.setattr(app_manager, "resolve_diff_sdk_selections", lambda config: selections)
+    monkeypatch.setattr(
+        app_manager,
+        "run_firmware_action",
+        lambda args, config, root, *, sdk_selection, required_firmware_roles: (
+            captured.append((args, config, root, sdk_selection, required_firmware_roles)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        app_manager,
+        "write_diff_fw_data",
+        lambda **kwargs: manifest_calls.append(kwargs) or build_root / app_manager.DIFF_FW_DATA_FILENAME,
+    )
+    parsed = app_manager.parse_args(["build", "--diff", "--build-root", str(build_root)])
+    client_config = {
+        "target": {
+            "board": "brd4182a",
+            "board_rev": "a06",
+            "device": "EFR32MG22C224F512IM40",
+        }
+    }
+
+    assert app_manager.build_diff_variants(parsed, client_config, build_root) == 0
+    assert [root for _, _, root, _, _ in captured] == [
+        build_root / "diff" / "child",
+        build_root / "diff" / "parent",
+    ]
+    assert [config["firmware"]["sisdk"] for _, config, _, _, _ in captured] == [
+        "2026.1.0",
+        "2025.12.3",
+    ]
+    assert [config["firmware"]["sisdk_package_path"] for _, config, _, _, _ in captured] == [
+        str(child_sdk),
+        str(parent_sdk),
+    ]
+    assert [selection for _, _, _, selection, _ in captured] == [selections["child"], selections["parent"]]
+    assert [roles for _, _, _, _, roles in captured] == [
+        app_manager.REQUIRED_DIFF_FIRMWARE_ROLES,
+        app_manager.REQUIRED_DIFF_FIRMWARE_ROLES,
+    ]
+    assert manifest_calls == [{
+        "build_root": build_root,
+        "parsed": parsed,
+        "client_config": client_config,
+        "selections": selections,
+    }]
 
 
 def test_generate_slcp_passes_explicit_sdk_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -517,6 +665,11 @@ def test_write_fw_data_records_firmware_identity_and_role_hashes() -> None:
     dut_dir.mkdir(parents=True)
     dut_image = dut_dir / "ncp_ble_dut_dcdc.s37"
     dut_image.write_bytes(b"dut")
+    no_dcdc_out_dir = build_root / "ncp_ble_dut"
+    no_dcdc_dir = no_dcdc_out_dir / "cmake_gcc" / "build" / "base"
+    no_dcdc_dir.mkdir(parents=True)
+    no_dcdc_image = no_dcdc_dir / "ncp_ble_dut.s37"
+    no_dcdc_image.write_bytes(b"no-dcdc-dut")
     tester_out_dir = build_root / "ncp_ble_tester"
     tester_dir = tester_out_dir / "cmake_gcc" / "build" / "base"
     tester_dir.mkdir(parents=True)
@@ -561,6 +714,12 @@ def test_write_fw_data_records_firmware_identity_and_role_hashes() -> None:
                 "image": str(dut_image.resolve()),
             },
             {
+                "slcp": str(Path("apps/ncp_ble_dut.slcp").resolve()),
+                "out_dir": str(no_dcdc_out_dir.resolve()),
+                "generated_slcp": str((no_dcdc_out_dir / "ncp_ble_dut.slcp").resolve()),
+                "image": str(no_dcdc_image.resolve()),
+            },
+            {
                 "slcp": str(Path("apps/ncp_ble_tester.slcp").resolve()),
                 "out_dir": str(tester_out_dir.resolve()),
                 "generated_slcp": str((tester_out_dir / "ncp_ble_tester.slcp").resolve()),
@@ -577,8 +736,35 @@ def test_write_fw_data_records_firmware_identity_and_role_hashes() -> None:
         "device": "EFR32MG22C224F512IM40",
         "sisdk": "2026.0.0",
         "dut_app_hash": app_manager._sha256(dut_image),
+        "dut_no_dcdc_app_hash": app_manager._sha256(no_dcdc_image),
         "tester_app_hash": app_manager._sha256(tester_image),
         "bootloader_app_hash": app_manager._sha256(bootloader_image),
+        "artifacts": [
+            {
+                "role": "bootloader",
+                "project_name": "bootloader-uart-bgapi",
+                "image": str(bootloader_image.resolve()),
+                "sha256": app_manager._sha256(bootloader_image),
+            },
+            {
+                "role": "dut_dcdc",
+                "project_name": "ncp_ble_dut_dcdc",
+                "image": str(dut_image.resolve()),
+                "sha256": app_manager._sha256(dut_image),
+            },
+            {
+                "role": "dut_no_dcdc",
+                "project_name": "ncp_ble_dut",
+                "image": str(no_dcdc_image.resolve()),
+                "sha256": app_manager._sha256(no_dcdc_image),
+            },
+            {
+                "role": "tester",
+                "project_name": "ncp_ble_tester",
+                "image": str(tester_image.resolve()),
+                "sha256": app_manager._sha256(tester_image),
+            },
+        ],
     }
     assert fw_data["sdk"] == {
         "source": "slt",
@@ -588,6 +774,70 @@ def test_write_fw_data_records_firmware_identity_and_role_hashes() -> None:
         "hash": "sdk-hash",
         "xapi_sha256": app_manager._sha256(runtime_xapi),
     }
+
+
+def test_validate_required_firmware_roles_rejects_missing_no_dcdc_role(tmp_path: Path) -> None:
+    image = tmp_path / "ncp_ble_dut_dcdc.s37"
+    image.write_bytes(b"dut")
+
+    with pytest.raises(RuntimeError, match="missing required roles: bootloader, dut_no_dcdc, tester"):
+        app_manager.validate_required_firmware_roles(
+            [{"slcp": "apps/ncp_ble_dut_dcdc.slcp", "image": str(image)}],
+            app_manager.REQUIRED_DIFF_FIRMWARE_ROLES,
+        )
+
+
+def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> None:
+    build_root = tmp_path / "firmware"
+    target = {"board": "brd4182a", "board_rev": "a06", "device": "EFR32MG22C224F512IM40"}
+    roles = sorted(app_manager.REQUIRED_DIFF_FIRMWARE_ROLES)
+    selections: dict[str, app_manager.SDKSelection] = {}
+    for variant, version in (("child", "2026.1.0"), ("parent", "2025.12.3")):
+        variant_root = build_root / "diff" / variant
+        variant_root.mkdir(parents=True)
+        sdk_path = tmp_path / f"{variant}-sdk"
+        xapi_path = sdk_path / app_manager.SL_BT_XAPI_PATH
+        selections[variant] = app_manager.SDKSelection(
+            path=sdk_path,
+            version=version,
+            source=f"client_config_diff_{variant}_path",
+            commit=f"{variant}-commit",
+            sdk_hash=f"{variant}-commit",
+            xapi_path=xapi_path,
+            xapi_hash=f"{variant}-xapi-hash",
+        )
+        (variant_root / app_manager.FW_DATA_FILENAME).write_text(
+            json.dumps(
+                {
+                    "firmware": {
+                        "board": target["board"],
+                        "brev": target["board_rev"],
+                        "device": target["device"],
+                        "artifacts": [{"role": role} for role in roles],
+                    },
+                    "build": {"root": str(variant_root)},
+                    "sdk": {"version": version},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    parsed = app_manager.parse_args(["build", "--diff", "--build-root", str(build_root)])
+    diff_path = app_manager.write_diff_fw_data(
+        build_root=build_root,
+        parsed=parsed,
+        client_config={"target": target},
+        selections=selections,
+    )
+
+    manifest = json.loads(diff_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
+    assert manifest["target"] == {"board": "brd4182a", "board_revision": "a06", "device": "EFR32MG22C224F512IM40"}
+    assert set(manifest["variants"]) == {"child", "parent"}
+    assert manifest["variants"]["child"]["manifest_sha256"] == app_manager._sha256(
+        build_root / "diff" / "child" / app_manager.FW_DATA_FILENAME
+    )
+    assert manifest["variants"]["parent"]["sdk"]["version"] == "2025.12.3"
 
 
 def test_load_effective_config_layers_role_specific_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
