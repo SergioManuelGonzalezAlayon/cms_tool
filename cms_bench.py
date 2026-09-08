@@ -593,7 +593,10 @@ class CMSBench:
             session.notes.append("firmware git_commit was not supplied")
         if session.request.firmware.sisdk_version == "":
             session.notes.append("firmware sisdk_version was not supplied")
-        if session.manifest.board and session.manifest.board != self.resources.board:
+        if (
+            session.manifest.board
+            and session.manifest.board.lower() != self.resources.board.lower()
+        ):
             raise RuntimeError(
                 f"firmware board {session.manifest.board} does not match bench board {self.resources.board}"
             )
@@ -637,7 +640,7 @@ class CMSBench:
         if differential is None:
             raise RuntimeError("differential firmware was not supplied")
         for variant_name, firmware in (("child", differential.child), ("parent", differential.parent)):
-            if firmware.board and firmware.board != self.resources.board:
+            if firmware.board and firmware.board.lower() != self.resources.board.lower():
                 raise RuntimeError(
                     f"{variant_name} firmware board {firmware.board} does not match bench board {self.resources.board}"
                 )
