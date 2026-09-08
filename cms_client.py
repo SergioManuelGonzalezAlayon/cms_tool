@@ -43,6 +43,7 @@ from cms_protocol import (
     BenchIdentity,
     BenchState,
     BenchStatus,
+    DetectedTargetIdentity,
     FirmwareImage,
     FirmwareData,
     EventCursor,
@@ -57,6 +58,7 @@ from cms_protocol import (
     artifact_from_dict,
     artifact_to_dict,
     bench_health_report_from_dict,
+    canonicalize_target_device,
     measurement_request_from_dict,
     measurement_request_to_dict,
     measurement_result_from_dict,
@@ -154,6 +156,165 @@ class CMSClientConfig:
     tools: dict[str, str] | None = None
     diff: dict[str, str] | None = None
     benches: dict[str, CMSBenchEndpointConfig] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TargetIdentityComparison:
+    """Comparison evidence for one detected Bench target and requested target."""
+
+    detected_board: str
+    requested_board: str
+    detected_device_raw: str
+    detected_device_canonical: str
+    requested_device: str
+    requested_device_canonical: str
+    mismatches: tuple[str, ...]
+
+    @property
+    def matches(self) -> bool:
+        return not self.mismatches
+
+
+def compare_detected_target_identity(
+    detected: DetectedTargetIdentity,
+    *,
+    requested_board: str,
+    requested_device: str,
+) -> TargetIdentityComparison:
+    """Compare detected Bench hardware with build/firmware target metadata."""
+
+    detected_board = detected.radio_board_part_number.strip().upper()
+    expected_board = requested_board.strip().upper()
+    detected_device = detected.canonical_target_device or canonicalize_target_device(
+        detected.target_device
+    )
+    expected_device = canonicalize_target_device(requested_device)
+    mismatches: list[str] = []
+    if not expected_board:
+        mismatches.append("requested board is missing")
+    elif detected_board != expected_board:
+        mismatches.append(f"board detected={detected.radio_board_part_number} requested={requested_board}")
+    if not expected_device:
+        mismatches.append("requested device is missing")
+    elif detected_device != expected_device:
+        mismatches.append(
+            "device "
+            f"detected_raw={detected.target_device} "
+            f"detected_canonical={detected_device} "
+            f"requested={requested_device} "
+            f"requested_canonical={expected_device}"
+        )
+    return TargetIdentityComparison(
+        detected_board=detected.radio_board_part_number,
+        requested_board=requested_board,
+        detected_device_raw=detected.target_device,
+        detected_device_canonical=detected_device,
+        requested_device=requested_device,
+        requested_device_canonical=expected_device,
+        mismatches=tuple(mismatches),
+    )
+
+
+def refresh_and_record_bench_target(
+    client: CMSClient,
+    config_path: str | Path,
+) -> DetectedTargetIdentity:
+    """Fetch fresh Bench identity and record it in the sole Client config file."""
+
+    report = client.get_health()
+    if report.state is BenchState.ERROR:
+        raise RuntimeError(f"CMS Bench health failed before workflow action: {report.summary}")
+    detected = report.detected_identity
+    if detected is None:
+        raise RuntimeError("CMS Bench health did not provide a detected DUT identity")
+
+    path = Path(config_path)
+    if not path.is_file():
+        raise RuntimeError(f"CMS client config does not exist: {path}")
+    config = _read_json_file(path)
+    target = config.get("target")
+    if target is None:
+        target = {}
+        config["target"] = target
+    if not isinstance(target, dict):
+        raise RuntimeError("cms_client_config.json target must be an object")
+    target.update(
+        {
+            "board": detected.radio_board_part_number,
+            "board_rev": detected.radio_board_revision,
+            "device": detected.target_device,
+            "device_canonical": detected.canonical_target_device,
+            "radio_board_serial": detected.radio_board_serial_number,
+            "dut_jlink_serial": detected.dut_jlink_serial,
+            "vcom_supported": detected.vcom_supported,
+        }
+    )
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return detected
+
+
+def require_firmware_target_match(
+    detected: DetectedTargetIdentity,
+    firmware: FirmwareData,
+) -> TargetIdentityComparison:
+    """Reject firmware that does not match one fresh detected Bench target."""
+
+    comparison = compare_detected_target_identity(
+        detected,
+        requested_board=firmware.board,
+        requested_device=firmware.device,
+    )
+    if not comparison.matches:
+        raise RuntimeError(
+            "Firmware target does not match freshly detected CMS Bench target: "
+            + "; ".join(comparison.mismatches)
+        )
+    return comparison
+
+
+def require_fresh_firmware_target_match(
+    client: CMSClient,
+    config_path: str | Path,
+    firmware: FirmwareData,
+) -> TargetIdentityComparison:
+    """Compatibility helper for callers that need to refresh before comparison."""
+
+    return require_firmware_target_match(
+        refresh_and_record_bench_target(client, config_path),
+        firmware,
+    )
+
+
+def require_firmware_request_target_match(
+    detected: DetectedTargetIdentity,
+    request: MeasurementRequest,
+) -> tuple[TargetIdentityComparison, ...]:
+    """Validate normal firmware or each differential variant before staging."""
+
+    variants: tuple[tuple[str, FirmwareData], ...]
+    if request.differential_firmware is None:
+        variants = (("firmware", request.firmware),)
+    else:
+        variants = (
+            ("differential child", request.differential_firmware.child),
+            ("differential parent", request.differential_firmware.parent),
+        )
+    comparisons: list[TargetIdentityComparison] = []
+    mismatches: list[str] = []
+    for variant_name, firmware in variants:
+        comparison = compare_detected_target_identity(
+            detected,
+            requested_board=firmware.board,
+            requested_device=firmware.device,
+        )
+        comparisons.append(comparison)
+        mismatches.extend(f"{variant_name}: {item}" for item in comparison.mismatches)
+    if mismatches:
+        raise RuntimeError(
+            "Firmware target does not match freshly detected CMS Bench target: "
+            + "; ".join(mismatches)
+        )
+    return tuple(comparisons)
 
 
 @dataclass(slots=True)
@@ -1173,7 +1334,7 @@ def _main(argv: list[str] | None = None) -> int:
     uses_resolved_endpoint = (
         args.command == "health"
         or args.command in {"send_fw", "SEND_FW", "test", "TEST"}
-        or (args.command in {"build", "BUILD"} and args.diff)
+        or args.command in {"build", "BUILD"}
     )
     if uses_resolved_endpoint:
         endpoint = resolve_client_endpoint(
@@ -1256,6 +1417,11 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"build", "BUILD"}:
         _print_explicit_endpoint_selection(args, client)
+        detected = refresh_and_record_bench_target(client, args.config)
+        print(
+            "recorded_bench_target: "
+            f"{detected.radio_board_part_number} {detected.target_device}"
+        )
         return (
             CMSCLIExitCode.SUCCESS
             if _run_local_build(args, args.config) == 0
@@ -1264,7 +1430,10 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"send_fw", "SEND_FW"}:
         _print_explicit_endpoint_selection(args, client)
+        detected = refresh_and_record_bench_target(client, args.config)
+        client_config = load_client_config(args.config)
         request = _request_from_send_fw_args(args, client_config)
+        require_firmware_request_target_match(detected, request)
         result = client.send_firmware(request)
         _print_measurement_result(result, colors=colors)
         if result.state is MeasurementState.REJECTED:

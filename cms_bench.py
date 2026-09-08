@@ -32,6 +32,7 @@ from cms_protocol import (
     BenchIdentity,
     BenchState,
     CommanderProbeEvidence as HealthCommanderProbeEvidence,
+    canonicalize_target_device,
     DetectedTargetIdentity,
     DeviceState,
     EventCursor,
@@ -2120,17 +2121,9 @@ def _split_commander_board_part_number(value: str) -> tuple[str, str]:
 
 
 def _canonicalize_commander_device(value: str) -> str:
-    """Return the stable build-comparison form of a Commander target device.
+    """Compatibility wrapper for the shared target-device comparison rule."""
 
-    Commander may append a one-letter package suffix, such as ``-C``, to an
-    EFR32 device identifier. Build manifests omit that suffix, so it is removed
-    only from otherwise valid EFR32 identifiers. All other text is retained
-    after trimming and uppercasing rather than guessed or rewritten.
-    """
-
-    raw = value.strip().upper()
-    match = re.fullmatch(r"(EFR32[A-Z0-9]+)-[A-Z]", raw)
-    return match.group(1) if match else raw
+    return canonicalize_target_device(value)
 
 
 def _commander_probe_field(output: str, label: str) -> str:

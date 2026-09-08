@@ -34,6 +34,20 @@ class BenchCheckStatus(str, Enum):
     FAIL = "fail"
 
 
+def canonicalize_target_device(value: str) -> str:
+    """Return the stable build-comparison form of a target device identifier.
+
+    Commander may append a one-letter package suffix, such as ``-C``, to an
+    EFR32 device identifier. Build manifests omit that suffix, so it is removed
+    only from otherwise valid EFR32 identifiers. All other text is retained
+    after trimming and uppercasing rather than guessed or rewritten.
+    """
+
+    raw = value.strip().upper()
+    match = re.fullmatch(r"(EFR32[A-Z0-9]+)-[A-Z]", raw)
+    return match.group(1) if match else raw
+
+
 class MeasurementState(str, Enum):
     """Lifecycle states visible to the remote client."""
     ACCEPTED = "accepted"

@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import argparse
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,10 @@ from cms_client import (
     CMSClientConfig,
     CMSBenchEndpointConfig,
     CMSResolvedEndpoint,
+    compare_detected_target_identity,
+    refresh_and_record_bench_target,
+    require_fresh_firmware_target_match,
+    require_firmware_request_target_match,
     _failed_test_records_from_job_results,
     _print_measurement_result,
     _request_from_send_fw_args,
@@ -26,6 +31,8 @@ from cms_protocol import (
     BenchIdentity,
     BenchState,
     DetectedTargetIdentity,
+    FirmwareData,
+    FirmwareImage,
     MeasurementIdentity,
     MeasurementMode,
     MeasurementResult,
@@ -183,6 +190,145 @@ def test_client_endpoint_resolution_rejects_unknown_or_conflicting_selectors():
         resolve_client_endpoint(config, base_url="http://one", bench_ip="192.0.2.10")
 
 
+def test_target_comparison_accepts_detected_device_package_suffix_and_board_case():
+    comparison = compare_detected_target_identity(
+        DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+        ),
+        requested_board="brd4182a",
+        requested_device="EFR32MG22C224F512IM40",
+    )
+
+    assert comparison.matches
+    assert comparison.mismatches == ()
+    assert comparison.detected_device_raw == "EFR32MG22C224F512IM40-C"
+    assert comparison.detected_device_canonical == "EFR32MG22C224F512IM40"
+
+
+def test_target_comparison_records_actionable_board_and_device_mismatches():
+    comparison = compare_detected_target_identity(
+        DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+        ),
+        requested_board="BRD4183A",
+        requested_device="EFR32MG24B220F1536IM48",
+    )
+
+    assert not comparison.matches
+    assert "board detected=BRD4182A requested=BRD4183A" in comparison.mismatches
+    assert any("detected_raw=EFR32MG22C224F512IM40-C" in item for item in comparison.mismatches)
+
+
+def test_fresh_health_records_detected_bench_target_in_existing_client_config(tmp_path):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(json.dumps({"target": {"sisdk": "2026.1.0"}}), encoding="utf-8")
+    report = BenchHealthReport(
+        state=BenchState.IDLE,
+        detected_identity=DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+            vcom_supported=True,
+        ),
+    )
+
+    class Client:
+        def get_health(self):
+            return report
+
+    assert refresh_and_record_bench_target(Client(), config_path) == report.detected_identity
+    target = json.loads(config_path.read_text(encoding="utf-8"))["target"]
+    assert target == {
+        "sisdk": "2026.1.0",
+        "board": "BRD4182A",
+        "board_rev": "B06",
+        "device": "EFR32MG22C224F512IM40-C",
+        "device_canonical": "EFR32MG22C224F512IM40",
+        "radio_board_serial": "212300218",
+        "dut_jlink_serial": "440365029",
+        "vcom_supported": True,
+    }
+
+
+def test_send_firmware_target_check_rejects_mismatch_after_fresh_health(tmp_path):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(json.dumps({"target": {}}), encoding="utf-8")
+    report = BenchHealthReport(
+        state=BenchState.IDLE,
+        detected_identity=DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+        ),
+    )
+
+    class Client:
+        def get_health(self):
+            return report
+
+    firmware = FirmwareData(
+        dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut"),
+        tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester"),
+        board="BRD4183A",
+        device="EFR32MG24B220F1536IM48",
+    )
+
+    with pytest.raises(RuntimeError, match="does not match freshly detected") as raised:
+        require_fresh_firmware_target_match(Client(), config_path, firmware)
+
+    message = str(raised.value)
+    assert "board detected=BRD4182A requested=BRD4183A" in message
+    assert "detected_raw=EFR32MG22C224F512IM40-C" in message
+    assert "detected_canonical=EFR32MG22C224F512IM40" in message
+    assert "requested=EFR32MG24B220F1536IM48" in message
+
+
+def test_differential_firmware_target_check_names_the_mismatched_variant():
+    detected = DetectedTargetIdentity(
+        radio_board_part_number="BRD4182A",
+        radio_board_revision="B06",
+        radio_board_serial_number="212300218",
+        target_device="EFR32MG22C224F512IM40-C",
+        canonical_target_device="EFR32MG22C224F512IM40",
+        dut_jlink_serial="440365029",
+    )
+    matching = FirmwareData(
+        dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut"),
+        tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester"),
+        board="BRD4182A",
+        device="EFR32MG22C224F512IM40",
+    )
+    mismatching = FirmwareData(
+        dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut"),
+        tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester"),
+        board="BRD4183A",
+        device="EFR32MG24B220F1536IM48",
+    )
+    request = SimpleNamespace(
+        differential_firmware=SimpleNamespace(child=matching, parent=mismatching),
+        firmware=matching,
+    )
+
+    with pytest.raises(RuntimeError, match="differential parent"):
+        require_firmware_request_target_match(detected, request)
+
+
 def test_remote_workflow_commands_accept_named_and_one_shot_bench_selectors():
     parser = build_cli_parser()
 
@@ -218,6 +364,19 @@ def test_diff_build_uses_and_displays_the_resolved_named_endpoint(tmp_path, monk
 
     class Client:
         base_url = "https://lab-a.example.test:8443"
+
+        def get_health(self):
+            return BenchHealthReport(
+                state=BenchState.IDLE,
+                detected_identity=DetectedTargetIdentity(
+                    radio_board_part_number="BRD4182A",
+                    radio_board_revision="B06",
+                    radio_board_serial_number="212300218",
+                    target_device="EFR32MG22C224F512IM40-C",
+                    canonical_target_device="EFR32MG22C224F512IM40",
+                    dut_jlink_serial="440365029",
+                ),
+            )
 
     def fake_client(**kwargs):
         captured.update(kwargs)
