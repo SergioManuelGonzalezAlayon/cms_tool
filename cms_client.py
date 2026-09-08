@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime
 import hashlib
 import json
 import platform
@@ -251,6 +252,43 @@ def refresh_and_record_bench_target(
     )
     path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     return detected
+
+
+def record_last_measurement(
+    config_path: str | Path,
+    result: MeasurementResult,
+    *,
+    mode: MeasurementMode,
+    feature: str,
+    config_name: str,
+    run_name: str,
+    variable_filters: tuple[VariableFilter, ...],
+    staging_id: str,
+    endpoint: str,
+) -> None:
+    """Persist the locally recoverable identity of an accepted measurement."""
+
+    if not result.measurement_id:
+        return
+    path = Path(config_path)
+    if not path.is_file():
+        raise RuntimeError(f"CMS client config does not exist: {path}")
+    config = _read_json_file(path)
+    config["last_measurement"] = {
+        "measurement_id": result.measurement_id,
+        "mode": mode.value,
+        "feature": feature,
+        "config": config_name,
+        "run_name": run_name,
+        "variable_filters": [
+            {"name": item.name, "value": item.value}
+            for item in variable_filters
+        ],
+        "staging_id": staging_id,
+        "endpoint": endpoint,
+        "submitted_at": datetime.utcnow().isoformat(),
+    }
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
 
 def require_firmware_target_match(
@@ -1932,6 +1970,17 @@ def _run_test_feature(
         upload_results_to_database=args.upload_results_to_database,
         debug_artifact_streaming=args.debug,
         staging_id=args.staging_id,
+    )
+    record_last_measurement(
+        args.config,
+        result,
+        mode=MeasurementMode(args.mode),
+        feature=args.feature,
+        config_name=args.config_name,
+        run_name=args.run_name,
+        variable_filters=variable_filters,
+        staging_id=args.staging_id,
+        endpoint=client.base_url,
     )
     if not result.measurement_id:
         _print_measurement_result(result, colors=colors)
