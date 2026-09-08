@@ -600,7 +600,11 @@ class CMSBench:
             raise RuntimeError(
                 f"firmware board {session.manifest.board} does not match bench board {self.resources.board}"
             )
-        if session.manifest.device and session.manifest.device != self.resources.device:
+        if (
+            session.manifest.device
+            and canonicalize_target_device(session.manifest.device)
+            != canonicalize_target_device(self.resources.device)
+        ):
             raise RuntimeError(
                 f"firmware device {session.manifest.device} does not match bench device {self.resources.device}"
             )
@@ -644,7 +648,11 @@ class CMSBench:
                 raise RuntimeError(
                     f"{variant_name} firmware board {firmware.board} does not match bench board {self.resources.board}"
                 )
-            if firmware.device and firmware.device != self.resources.device:
+            if (
+                firmware.device
+                and canonicalize_target_device(firmware.device)
+                != canonicalize_target_device(self.resources.device)
+            ):
                 raise RuntimeError(
                     f"{variant_name} firmware device {firmware.device} does not match bench device {self.resources.device}"
                 )
