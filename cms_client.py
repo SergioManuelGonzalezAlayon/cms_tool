@@ -45,8 +45,10 @@ from cms_protocol import (
     BenchState,
     BenchStatus,
     DetectedTargetIdentity,
+    DifferentialFirmwareData,
     FirmwareImage,
     FirmwareData,
+    FirmwareRoleImage,
     EventCursor,
     MeasurementEventPage,
     MeasurementMode,
@@ -1076,6 +1078,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     _add_color_argument(send_fw)
     _add_bench_endpoint_arguments(send_fw)
     send_fw.add_argument("--request-json", help="load the full firmware request from JSON")
+    send_fw.add_argument(
+        "--diff",
+        action="store_true",
+        help="stage the parent/child firmware pair from diff_fw_data.json",
+    )
     send_fw.add_argument("--request-id", default="", help="firmware staging id")
     send_fw.add_argument("--dut-image", default="", help="DUT firmware path or URL")
     send_fw.add_argument("--tester-image", default="", help="tester firmware path or URL")
@@ -1560,6 +1567,8 @@ def _request_from_send_fw_args(
     target_cfg = client_config.target if client_config and client_config.target else {}
     build_cfg = client_config.build if client_config and client_config.build else {}
     build_root = Path(args.build_root or str(build_cfg.get("root", ".fw_build")))
+    if getattr(args, "diff", False):
+        return _request_from_diff_build_manifest(args, build_root)
     fw_data = _read_json_file(build_root / "fw_data.json")
     if not fw_data:
         raise RuntimeError(
@@ -1701,6 +1710,79 @@ def _request_from_send_fw_args(
             sisdk_hash=sdk_hash,
         ),
         requested_by=args.requested_by,
+    )
+
+
+def _request_from_diff_build_manifest(args: argparse.Namespace, build_root: Path) -> MeasurementRequest:
+    """Create one paired staging request from the app manager's diff build manifest."""
+
+    diff_manifest = _read_json_file(build_root / "diff_fw_data.json")
+    variants = diff_manifest.get("variants")
+    if not isinstance(variants, dict):
+        raise RuntimeError(
+            f"Differential build provenance is missing: {build_root / 'diff_fw_data.json'}. "
+            "Run `cms build --diff` before staging differential firmware."
+        )
+
+    def variant_firmware(name: str) -> FirmwareData:
+        variant = variants.get(name)
+        if not isinstance(variant, dict) or not isinstance(variant.get("manifest"), dict):
+            raise RuntimeError(f"Differential build manifest is missing the {name} variant")
+        manifest = variant["manifest"]
+        firmware = manifest.get("firmware")
+        build = manifest.get("build")
+        sdk = manifest.get("sdk")
+        if not isinstance(firmware, dict) or not isinstance(build, dict) or not isinstance(sdk, dict):
+            raise RuntimeError(f"Differential {name} build manifest is incomplete")
+        artifacts = firmware.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise RuntimeError(f"Differential {name} build manifest has no firmware artifacts")
+        all_role_images = tuple(
+            FirmwareRoleImage(
+                role=str(item.get("role", "")),
+                project_name=str(item.get("project_name", "")),
+                image=FirmwareImage(
+                    name=Path(str(item.get("image", ""))).name,
+                    url=str(item.get("image", "")),
+                    sha256=str(item.get("sha256", "")),
+                ),
+            )
+            for item in artifacts
+            if isinstance(item, dict)
+        )
+        by_role = {item.role: item.image for item in all_role_images}
+        required_roles = {"dut_dcdc", "dut_no_dcdc", "tester"}
+        missing_roles = sorted(required_roles - set(by_role))
+        if missing_roles:
+            raise RuntimeError(f"Differential {name} build is missing roles: {', '.join(missing_roles)}")
+        xapi_path = str(build.get("xapi", ""))
+        xapi_hash = str(sdk.get("xapi_sha256", ""))
+        return FirmwareData(
+            dut_img=by_role["dut_dcdc"],
+            tester_img=by_role["tester"],
+            dut_variants={"dcdc": by_role["dut_dcdc"], "no_dcdc": by_role["dut_no_dcdc"]},
+            bootloader_img=by_role.get("bootloader"),
+            board=str(firmware.get("board", "")),
+            device=str(firmware.get("device", "")),
+            xapi_file=FirmwareImage(name=Path(xapi_path).name, url=xapi_path, sha256=xapi_hash),
+            xapi_file_hash=xapi_hash,
+            sisdk_source=str(sdk.get("source", "")),
+            sisdk_version=str(sdk.get("version", "")),
+            sisdk_commit=str(sdk.get("commit", "")),
+            sisdk_hash=str(sdk.get("hash", "")),
+            role_images=tuple(item for item in all_role_images if item.role != "bootloader"),
+        )
+
+    child = variant_firmware("child")
+    parent = variant_firmware("parent")
+    request_id = args.request_id or f"cms-diff-{int(time.time())}"
+    return MeasurementRequest(
+        request_id=request_id,
+        selector=SuiteSelector(mode="ble", feature="", config="default"),
+        firmware=child,
+        mode=MeasurementMode.DIFF,
+        requested_by=args.requested_by,
+        differential_firmware=DifferentialFirmwareData(child=child, parent=parent),
     )
 
 
