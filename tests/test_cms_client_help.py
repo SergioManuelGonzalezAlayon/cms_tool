@@ -42,6 +42,16 @@ def test_send_fw_help_explains_inputs_and_next_step(capsys):
     assert "cms TEST" in text
 
 
+def test_health_help_explains_named_and_one_shot_endpoint_selection(capsys):
+    text = _command_help_text("HEALTH", capsys=capsys)
+
+    assert "--bench-id" in text
+    assert "--bench-ip" in text
+    assert "--base-url" in text
+    assert "conflicting selectors are rejected" in text
+    assert "cms HEALTH --bench-id cms-bench-001" in text
+
+
 def test_test_help_explains_config_preview_watch_and_results(capsys):
     text = _command_help_text("TEST", capsys=capsys)
 

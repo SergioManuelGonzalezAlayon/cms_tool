@@ -118,6 +118,31 @@ class CMSDaemonError(CMSClientError):
 
 
 @dataclass(slots=True)
+class CMSBenchEndpointConfig:
+    """One named CMS Bench daemon endpoint from client configuration."""
+
+    scheme: str
+    host: str
+    port: int
+    api_token: str
+    timeout_s: float = 30.0
+
+    @property
+    def base_url(self) -> str:
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+
+@dataclass(frozen=True, slots=True)
+class CMSResolvedEndpoint:
+    """One concrete Client endpoint selected for the current invocation."""
+
+    base_url: str
+    api_token: str
+    timeout_s: float
+    source: str
+
+
+@dataclass(slots=True)
 class CMSClientConfig:
     """Configuration needed for one remote CMS daemon client."""
 
@@ -128,6 +153,7 @@ class CMSClientConfig:
     build: dict[str, str] | None = None
     tools: dict[str, str] | None = None
     diff: dict[str, str] | None = None
+    benches: dict[str, CMSBenchEndpointConfig] | None = None
 
 
 @dataclass(slots=True)
@@ -167,12 +193,13 @@ class CMSClient:
         self,
         base_url: str = "",
         api_token: str = "",
+        timeout_s: float | None = None,
         config_path: str | Path = CMS_CLIENT_CONFIG,
     ):
         config = load_client_config(config_path)
         self.base_url = (base_url or config.base_url).rstrip("/")
         self.api_token = api_token or config.api_token
-        self.timeout_s = config.timeout_s
+        self.timeout_s = config.timeout_s if timeout_s is None else timeout_s
 
     def get_health(self) -> BenchHealthReport:
         """Fetch the daemon health view for operator and CI checks."""
@@ -219,6 +246,7 @@ class CMSClient:
         config: str = "default",
         run_name: str = "",
         variable_filters: tuple[VariableFilter, ...] = (),
+        upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
         staging_id: str = "",
     ) -> MeasurementResult:
@@ -243,7 +271,7 @@ class CMSClient:
                     for item in variable_filters
                 ],
                 "run_name": run_name,
-                "upload_results_to_database": True,
+                "upload_results_to_database": upload_results_to_database,
                 "debug_artifact_streaming": debug_artifact_streaming,
                 "staging_id": staging_id,
             },
@@ -586,6 +614,21 @@ def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
     if not base_url:
         base_url = f"{scheme}://{host}:{port}"
 
+    benches: dict[str, CMSBenchEndpointConfig] = {}
+    raw_benches = config.get("benches", {})
+    if not isinstance(raw_benches, dict):
+        raise ValueError("cms_client_config.json benches must be an object keyed by bench ID")
+    for bench_id, raw_endpoint in raw_benches.items():
+        if not isinstance(raw_endpoint, dict):
+            raise ValueError(f"cms_client_config.json benches.{bench_id} must be an object")
+        benches[str(bench_id)] = CMSBenchEndpointConfig(
+            scheme=str(raw_endpoint.get("scheme", "http")),
+            host=str(raw_endpoint.get("host", "")),
+            port=int(raw_endpoint.get("port", 8000)),
+            api_token=str(raw_endpoint.get("api_token", "")),
+            timeout_s=float(raw_endpoint.get("timeout_s", daemon.get("timeout_s", 30.0))),
+        )
+
     return CMSClientConfig(
         base_url=base_url,
         api_token=str(daemon.get("api_token", config.get("api_token", "silabs-cms"))),
@@ -594,7 +637,70 @@ def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
         build={str(key): str(value) for key, value in config.get("build", {}).items()},
         tools={str(key): str(value) for key, value in config.get("tools", {}).items()},
         diff={str(key): str(value) for key, value in config.get("diff", {}).items()},
+        benches=benches,
     )
+
+
+def resolve_client_endpoint(
+    config: CMSClientConfig,
+    *,
+    base_url: str = "",
+    api_token: str = "",
+    bench_id: str = "",
+    bench_ip: str = "",
+) -> CMSResolvedEndpoint:
+    """Resolve one endpoint without persisting a command-specific selection."""
+
+    endpoint_selectors = [
+        name
+        for name, value in (("--base-url", base_url), ("--bench-id", bench_id), ("--bench-ip", bench_ip))
+        if value
+    ]
+    if len(endpoint_selectors) > 1:
+        raise ValueError("endpoint selectors cannot be combined: " + ", ".join(endpoint_selectors))
+
+    if base_url:
+        return CMSResolvedEndpoint(
+            base_url=base_url.rstrip("/"),
+            api_token=api_token or config.api_token,
+            timeout_s=config.timeout_s,
+            source="--base-url",
+        )
+    if bench_id:
+        endpoint = (config.benches or {}).get(bench_id)
+        if endpoint is None:
+            raise ValueError(f"unknown CMS bench ID: {bench_id}")
+        return CMSResolvedEndpoint(
+            base_url=endpoint.base_url,
+            api_token=api_token or endpoint.api_token,
+            timeout_s=endpoint.timeout_s,
+            source=f"bench ID {bench_id}",
+        )
+    if bench_ip:
+        if "://" in bench_ip or "/" in bench_ip:
+            raise ValueError("--bench-ip must be a host name or IP address, not a URL")
+        parsed_default = urllib.parse.urlsplit(config.base_url)
+        if not parsed_default.scheme or not parsed_default.hostname or parsed_default.port is None:
+            raise ValueError("default daemon endpoint is invalid; cannot resolve --bench-ip")
+        return CMSResolvedEndpoint(
+            base_url=f"{parsed_default.scheme}://{bench_ip}:{parsed_default.port}",
+            api_token=api_token or config.api_token,
+            timeout_s=config.timeout_s,
+            source="--bench-ip",
+        )
+    return CMSResolvedEndpoint(
+        base_url=config.base_url,
+        api_token=api_token or config.api_token,
+        timeout_s=config.timeout_s,
+        source="default daemon configuration",
+    )
+
+
+def _print_explicit_endpoint_selection(args: argparse.Namespace, client: CMSClient) -> None:
+    """Show a one-shot endpoint choice without changing normal command output."""
+
+    if args.base_url or args.bench_id or args.bench_ip:
+        print(f"endpoint: {client.base_url}")
 
 
 def _non_negative_int(value: str) -> int:
@@ -609,6 +715,13 @@ def _non_negative_float(value: str) -> float:
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be non-negative")
     return parsed
+
+
+def _add_bench_endpoint_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add non-persistent bench selection options to one remote-workflow command."""
+
+    parser.add_argument("--bench-id", default="", help="configured bench ID from the benches mapping")
+    parser.add_argument("--bench-ip", default="", help="one-shot bench host name or IP address")
 
 
 def build_cli_parser() -> argparse.ArgumentParser:
@@ -645,8 +758,27 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-    health = subparsers.add_parser("health", help="show daemon and bench health")
+    health = subparsers.add_parser(
+        "health",
+        aliases=["HEALTH"],
+        help="show daemon and bench health",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Endpoint selection:\n"
+            "  With no endpoint option, use the default daemon configuration.\n"
+            "  --bench-id selects one configured benches entry.\n"
+            "  --bench-ip makes a one-shot host/IP override using default daemon settings.\n"
+            "  --base-url makes a one-shot complete URL override.\n"
+            "  Use only one endpoint selector; conflicting selectors are rejected.\n"
+            "  --api-token may override the selected endpoint token.\n\n"
+            "Examples:\n"
+            "  cms HEALTH --bench-id cms-bench-001\n"
+            "  cms HEALTH --bench-ip 192.0.2.10\n"
+            "  cms --base-url http://cms-bench-001:8000 HEALTH"
+        ),
+    )
     _add_color_argument(health)
+    _add_bench_endpoint_arguments(health)
     status = subparsers.add_parser("status", help="show bench status")
     _add_color_argument(status)
     tests = subparsers.add_parser("tests", aliases=["TESTS"], help="list test modes and features")
@@ -726,6 +858,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "build configured parent and child SiSDK packages in isolated diff roots"
         ),
     )
+    _add_bench_endpoint_arguments(build)
 
     send_fw = subparsers.add_parser(
         "send_fw",
@@ -742,6 +875,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_color_argument(send_fw)
+    _add_bench_endpoint_arguments(send_fw)
     send_fw.add_argument("--request-json", help="load the full firmware request from JSON")
     send_fw.add_argument("--request-id", default="", help="firmware staging id")
     send_fw.add_argument("--dut-image", default="", help="DUT firmware path or URL")
@@ -790,6 +924,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_color_argument(test)
+    _add_bench_endpoint_arguments(test)
     test.add_argument(
         "--mode",
         "-m",
@@ -827,6 +962,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
         dest="run_name",
         default="",
         help="human-readable test run name",
+    )
+    test.add_argument(
+        "--upload-results-to-database",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="upload completed results to the configured database (default: enabled)",
     )
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
     test.add_argument(
@@ -1029,7 +1170,27 @@ def _main(argv: list[str] | None = None) -> int:
     args = build_cli_parser().parse_args(argv)
     colors = color_formatter(args.color)
     client_config = load_client_config(args.config)
-    client = CMSClient(base_url=args.base_url, api_token=args.api_token, config_path=args.config)
+    uses_resolved_endpoint = (
+        args.command == "health"
+        or args.command in {"send_fw", "SEND_FW", "test", "TEST"}
+        or (args.command in {"build", "BUILD"} and args.diff)
+    )
+    if uses_resolved_endpoint:
+        endpoint = resolve_client_endpoint(
+            client_config,
+            base_url=args.base_url,
+            api_token=args.api_token,
+            bench_id=args.bench_id,
+            bench_ip=args.bench_ip,
+        )
+        client = CMSClient(
+            base_url=endpoint.base_url,
+            api_token=endpoint.api_token,
+            timeout_s=endpoint.timeout_s,
+            config_path=args.config,
+        )
+    else:
+        client = CMSClient(base_url=args.base_url, api_token=args.api_token, config_path=args.config)
 
     if args.command == "health":
         report = client.get_health()
@@ -1094,6 +1255,7 @@ def _main(argv: list[str] | None = None) -> int:
         return CMSCLIExitCode.SUCCESS
 
     if args.command in {"build", "BUILD"}:
+        _print_explicit_endpoint_selection(args, client)
         return (
             CMSCLIExitCode.SUCCESS
             if _run_local_build(args, args.config) == 0
@@ -1101,6 +1263,7 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command in {"send_fw", "SEND_FW"}:
+        _print_explicit_endpoint_selection(args, client)
         request = _request_from_send_fw_args(args, client_config)
         result = client.send_firmware(request)
         _print_measurement_result(result, colors=colors)
@@ -1131,6 +1294,7 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command in {"test", "TEST"}:
+        _print_explicit_endpoint_selection(args, client)
         variable_filters = parse_variable_filters(args.variable)
         if args.mode == MeasurementMode.DIFF.value and not args.staging_id.strip():
             raise RuntimeError("cms TEST --mode diff requires --staging-id")
@@ -1596,6 +1760,7 @@ def _run_test_feature(
         config=args.config_name,
         run_name=args.run_name,
         variable_filters=variable_filters,
+        upload_results_to_database=args.upload_results_to_database,
         debug_artifact_streaming=args.debug,
         staging_id=args.staging_id,
     )

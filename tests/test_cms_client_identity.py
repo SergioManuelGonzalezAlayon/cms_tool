@@ -10,11 +10,15 @@ import cms_client
 from cms_client import (
     CMSClient,
     CMSClientConfig,
+    CMSBenchEndpointConfig,
+    CMSResolvedEndpoint,
     _failed_test_records_from_job_results,
     _print_measurement_result,
     _request_from_send_fw_args,
     _run_local_build,
     build_cli_parser,
+    load_client_config,
+    resolve_client_endpoint,
 )
 from cms_colors import ColorFormatter
 from cms_protocol import (
@@ -97,6 +101,136 @@ def test_health_command_prints_endpoint_and_detected_dut_identity(capsys, monkey
     assert "detected_target_device: EFR32MG22C224F512IM40-C" in output
     assert "detected_dut_jlink_serial: 440365029" in output
     assert "detected_vcom_supported: true" in output
+
+
+def test_client_config_loads_optional_named_bench_endpoints(tmp_path):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "daemon": {"host": "default-bench", "port": 8000, "api_token": "default-token"},
+                "benches": {
+                    "lab-a": {
+                        "scheme": "https",
+                        "host": "lab-a.example.test",
+                        "port": 8443,
+                        "api_token": "lab-a-token",
+                        "timeout_s": 45,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_client_config(config_path)
+
+    assert config.base_url == "http://default-bench:8000"
+    assert config.benches == {
+        "lab-a": CMSBenchEndpointConfig(
+            scheme="https",
+            host="lab-a.example.test",
+            port=8443,
+            api_token="lab-a-token",
+            timeout_s=45.0,
+        )
+    }
+    assert config.benches["lab-a"].base_url == "https://lab-a.example.test:8443"
+
+
+def test_client_endpoint_resolution_supports_named_one_shot_and_default_endpoints():
+    config = CMSClientConfig(
+        base_url="http://default-bench:8000",
+        api_token="default-token",
+        timeout_s=30.0,
+        benches={
+            "lab-a": CMSBenchEndpointConfig(
+                scheme="https",
+                host="lab-a.example.test",
+                port=8443,
+                api_token="lab-a-token",
+                timeout_s=45.0,
+            )
+        },
+    )
+
+    assert resolve_client_endpoint(config, bench_id="lab-a") == CMSResolvedEndpoint(
+        base_url="https://lab-a.example.test:8443",
+        api_token="lab-a-token",
+        timeout_s=45.0,
+        source="bench ID lab-a",
+    )
+    assert resolve_client_endpoint(config, bench_ip="192.0.2.10") == CMSResolvedEndpoint(
+        base_url="http://192.0.2.10:8000",
+        api_token="default-token",
+        timeout_s=30.0,
+        source="--bench-ip",
+    )
+    assert resolve_client_endpoint(config) == CMSResolvedEndpoint(
+        base_url="http://default-bench:8000",
+        api_token="default-token",
+        timeout_s=30.0,
+        source="default daemon configuration",
+    )
+
+
+def test_client_endpoint_resolution_rejects_unknown_or_conflicting_selectors():
+    config = CMSClientConfig(base_url="http://default-bench:8000")
+
+    with pytest.raises(ValueError, match="unknown CMS bench ID"):
+        resolve_client_endpoint(config, bench_id="missing")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        resolve_client_endpoint(config, base_url="http://one", bench_ip="192.0.2.10")
+
+
+def test_remote_workflow_commands_accept_named_and_one_shot_bench_selectors():
+    parser = build_cli_parser()
+
+    build = parser.parse_args(["BUILD", "--diff", "--bench-id", "lab-a"])
+    send_fw = parser.parse_args(["SEND_FW", "--bench-ip", "192.0.2.10"])
+    test = parser.parse_args(
+        ["TEST", "--mode", "diff", "--feature", "beacon", "--staging-id", "stage-1", "--bench-id", "lab-a"]
+    )
+
+    assert build.bench_id == "lab-a"
+    assert send_fw.bench_ip == "192.0.2.10"
+    assert test.bench_id == "lab-a"
+
+
+def test_diff_build_uses_and_displays_the_resolved_named_endpoint(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "benches": {
+                    "lab-a": {
+                        "scheme": "https",
+                        "host": "lab-a.example.test",
+                        "port": 8443,
+                        "api_token": "lab-a-token",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class Client:
+        base_url = "https://lab-a.example.test:8443"
+
+    def fake_client(**kwargs):
+        captured.update(kwargs)
+        return Client()
+
+    monkeypatch.setattr(cms_client, "CMSClient", fake_client)
+    monkeypatch.setattr(cms_client, "_run_local_build", lambda *_args: 0)
+
+    assert cms_client.main(["--config", str(config_path), "BUILD", "--diff", "--bench-id", "lab-a"]) == 0
+
+    assert captured["base_url"] == "https://lab-a.example.test:8443"
+    assert captured["api_token"] == "lab-a-token"
+    assert "endpoint: https://lab-a.example.test:8443" in capsys.readouterr().out
 
 
 def test_build_derives_sisdk_version_from_the_selected_package(tmp_path, monkeypatch):

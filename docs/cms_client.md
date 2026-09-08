@@ -32,6 +32,34 @@ daemon endpoint. It speaks the daemon protocol using JSON over HTTP, wraps the
 local application build flow, prepares firmware payloads, and provides the
 command-line entry point named `cms` by the parser.
 
+## Selecting a Bench Endpoint
+
+The default `daemon` entry in `cms_client_config.json` remains the endpoint when
+no selector is supplied. The optional `benches` mapping names additional bench
+endpoints; select one with:
+
+```text
+cms health --bench-id cms-bench-001
+```
+
+For a one-shot host/IP override that keeps the default daemon scheme, port,
+token, and timeout, use:
+
+```text
+cms health --bench-ip 192.0.2.10
+```
+
+For a complete one-shot URL override, use:
+
+```text
+cms --base-url http://cms-bench-001:8000 health
+```
+
+Use exactly one endpoint selector per invocation: `--base-url`, `--bench-id`,
+or `--bench-ip`. Combining them is rejected. `--api-token` may be used with any
+one selector to override that invocation's configured token. `cms HEALTH`
+prints the resolved endpoint before its health checks.
+
 ## Operator Quick Start
 
 Use this sequence when you want to build firmware, stage it on the configured
@@ -96,7 +124,7 @@ that firmware is staged and ready for test.
 6. Preview the default config that would be submitted.
 
 ```text
-cms TEST default beacon --config-name default --preview
+cms TEST --mode default --feature beacon --config-name default --preview
 ```
 
 This validates the selected local config and prints the exact mode, feature,
@@ -111,7 +139,7 @@ default. `debug` tests do not upload results to the database.
 7. Run the default config and watch it until completion.
 
 ```text
-cms TEST default beacon --config-name default --out-dir artifacts
+cms TEST --mode default --feature beacon --config-name default --out-dir artifacts
 ```
 
 This submits a measurement using the most recently staged firmware, attaches to
@@ -122,7 +150,7 @@ measurement ID, current test, and total/pass/fail/remaining counts.
 8. Run one exact named config and watch it until completion.
 
 ```text
-cms TEST default beacon --config-name dcdc --out-dir artifacts
+cms TEST --mode default --feature beacon --config-name dcdc --out-dir artifacts
 ```
 
 The client validates the selected config locally, sends its hash to the daemon,
@@ -133,7 +161,7 @@ and either a passed terminal state or the failed identities you need to inspect.
 9. Preview a variable-filtered generated campaign.
 
 ```text
-cms TEST full_sweep beacon --variable phy=2m --preview
+cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview
 ```
 
 This validates the filter against the selected feature's `parameters.json` and
@@ -144,7 +172,7 @@ prints the expected job count before bench time is spent. For `beacon`,
 10. Run the variable-filtered generated campaign and watch it until completion.
 
 ```text
-cms TEST full_sweep beacon --variable phy=2m --out-dir artifacts
+cms TEST --mode full_sweep --feature beacon --variable phy=2m --out-dir artifacts
 ```
 
 This submits every generated `beacon` full-sweep case whose declared `phy`
@@ -194,7 +222,7 @@ rendered console lines and still refreshes structured counts independently.
 15. Force or disable colored human output when needed.
 
 ```text
-cms TEST full_sweep beacon --variable phy=2m --color always --out-dir artifacts
+cms TEST --mode full_sweep --feature beacon --variable phy=2m --color always --out-dir artifacts
 cms WATCH <measurement_id> --verbose --color never
 ```
 
@@ -277,8 +305,8 @@ Use this when the bench should execute the feature's persistent
 `default.json`.
 
 ```text
-cms TEST default beacon --config-name default --preview
-cms TEST default beacon --config-name default --out-dir artifacts
+cms TEST --mode default --feature beacon --config-name default --preview
+cms TEST --mode default --feature beacon --config-name default --out-dir artifacts
 ```
 
 The preview shows the selected config path and hash before submission. The run
@@ -291,8 +319,8 @@ Use this when the bench should execute one named config from the persistent
 feature config directory.
 
 ```text
-cms TEST default beacon --config-name dcdc --preview
-cms TEST default beacon --config-name dcdc --out-dir artifacts
+cms TEST --mode default --feature beacon --config-name dcdc --preview
+cms TEST --mode default --feature beacon --config-name dcdc --out-dir artifacts
 ```
 
 The client validates and hashes `tests/configs/ble/beacon/dcdc.json`. The daemon
@@ -310,7 +338,7 @@ campaign.
 First preview the accepted parameter spelling and job count:
 
 ```text
-cms TEST full_sweep beacon --variable phy=2m --preview
+cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview
 ```
 
 For `beacon`, `tests/configs/ble/beacon/parameters.json` declares the parameter
@@ -319,8 +347,8 @@ for that feature. The same file declares `dcdc` with values `On` and `Off`, so
 filters can be intersected:
 
 ```text
-cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --preview
-cms TEST full_sweep beacon --variable phy=2m --variable dcdc=On --out-dir artifacts
+cms TEST --mode full_sweep --feature beacon --variable phy=2m --variable dcdc=On --preview
+cms TEST --mode full_sweep --feature beacon --variable phy=2m --variable dcdc=On --out-dir artifacts
 ```
 
 The preview prints `available_variables:` from the selected feature's
@@ -348,7 +376,7 @@ hashes, and the final selected job count before hardware execution.
 To make local and watched output easier to scan, color can be controlled with:
 
 ```text
-cms TEST full_sweep beacon --variable phy=2m --color always --out-dir artifacts
+cms TEST --mode full_sweep --feature beacon --variable phy=2m --color always --out-dir artifacts
 cms WATCH <measurement_id> --verbose --color never
 ```
 
@@ -374,8 +402,8 @@ Each failed record includes the feature, generated config path, mode, partition,
 and config hash. For a broad failure pattern, rerun the same filtered campaign:
 
 ```text
-cms TEST full_sweep beacon --variable phy=2m --preview
-cms TEST full_sweep beacon --variable phy=2m --out-dir artifacts
+cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview
+cms TEST --mode full_sweep --feature beacon --variable phy=2m --out-dir artifacts
 ```
 
 For a single failed generated config, use the `rerun:` command printed by
@@ -687,7 +715,7 @@ cms SEND_FW --request-id cms-dev-001 --requested-by <user>
 3. Run a selected BLE feature using the staged firmware.
 
 ```text
-cms TEST default beacon --config-name default --out-dir artifacts
+cms TEST --mode default --feature beacon --config-name default --out-dir artifacts
 ```
 
 4. Polling happens automatically during `cms TEST`.
