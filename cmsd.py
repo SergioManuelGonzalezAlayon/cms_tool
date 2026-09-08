@@ -282,6 +282,8 @@ class CMSDaemon:
             js_state=bench_report.js_state,
             summary=summary,
             checks=checks,
+            detected_identity=bench_report.detected_identity,
+            commander_probe=bench_report.commander_probe,
         )
 
     def get_status(self) -> dict[str, Any]:
