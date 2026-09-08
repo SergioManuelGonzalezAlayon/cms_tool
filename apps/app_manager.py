@@ -34,6 +34,7 @@ TOOL_ENV_VARS = {
 SL_BT_XAPI_PATH = Path("bluetooth_le_host") / "api" / "sl_bt.xapi"
 SLC_SDK_PACKAGE_PATH_FLAG = "--sdk-package-path"
 FIRMWARE_IMAGE_SUFFIXES = (".s37", ".hex", ".bin")
+CMS_FLASHABLE_IMAGE_SUFFIXES = (".s37", ".hex")
 FIRMWARE_ARTIFACT_SUFFIXES = FIRMWARE_IMAGE_SUFFIXES + (".map", ".out")
 FIRMWARE_ROLE_BY_PROJECT = {
     "bootloader-uart-bgapi": "bootloader",
@@ -437,8 +438,8 @@ def find_artifacts(out_dir: Path, suffixes: tuple[str, ...]) -> list[Path]:
     root = out_dir / "cmake_gcc"
     artifacts: list[Path] = []
     for suffix in suffixes:
-        artifacts.extend(root.rglob(f"*{suffix}"))
-    return sorted({path.resolve() for path in artifacts})
+        artifacts.extend(sorted(path.resolve() for path in root.rglob(f"*{suffix}")))
+    return list(dict.fromkeys(artifacts))
 
 
 def copy_bgapi_xapi(build_root: Path, sdk_path: Path) -> Path:
@@ -619,10 +620,18 @@ def validate_required_firmware_roles(
 ) -> None:
     """Reject a differential variant that lacks exactly one required named role."""
 
-    validate_firmware_artifact_roles(
-        firmware_artifacts_from_summaries(summaries),
-        required_roles,
-    )
+    artifacts = firmware_artifacts_from_summaries(summaries)
+    validate_firmware_artifact_roles(artifacts, required_roles)
+    unsupported = [
+        f"{artifact['role']}={artifact['image']}"
+        for artifact in artifacts
+        if Path(artifact["image"]).suffix.lower() not in CMS_FLASHABLE_IMAGE_SUFFIXES
+    ]
+    if unsupported:
+        raise RuntimeError(
+            "Differential firmware roles must use a CMS-flashable .s37 or .hex image: "
+            + ", ".join(sorted(unsupported))
+        )
 
 
 def validate_firmware_artifact_roles(

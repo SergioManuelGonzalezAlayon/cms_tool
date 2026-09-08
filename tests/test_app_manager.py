@@ -787,6 +787,30 @@ def test_validate_required_firmware_roles_rejects_missing_no_dcdc_role(tmp_path:
         )
 
 
+def test_validate_required_firmware_roles_rejects_bin_images(tmp_path: Path) -> None:
+    summaries = []
+    for project, role in app_manager.FIRMWARE_ROLE_BY_PROJECT.items():
+        image = tmp_path / f"{project}.bin"
+        image.write_bytes(b"firmware")
+        summaries.append({"slcp": f"apps/{project}.slcp", "image": str(image)})
+
+    with pytest.raises(RuntimeError, match="CMS-flashable .s37 or .hex"):
+        app_manager.validate_required_firmware_roles(
+            summaries,
+            app_manager.REQUIRED_DIFF_FIRMWARE_ROLES,
+        )
+
+
+def test_find_built_image_prefers_s37_to_bin(tmp_path: Path) -> None:
+    output = tmp_path / "cmake_gcc" / "build" / "base"
+    output.mkdir(parents=True)
+    (output / "firmware.bin").write_bytes(b"bin")
+    expected = output / "firmware.s37"
+    expected.write_bytes(b"s37")
+
+    assert app_manager.find_built_image(tmp_path) == expected.resolve()
+
+
 def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> None:
     build_root = tmp_path / "firmware"
     target = {"board": "brd4182a", "board_rev": "a06", "device": "EFR32MG22C224F512IM40"}

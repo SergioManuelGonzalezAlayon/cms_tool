@@ -710,8 +710,6 @@ def cms_pytest_args(parsed: argparse.Namespace) -> list[str]:
         args.extend(["--cms-runtime-config", parsed.cms_runtime_config])
     if parsed.cms_fw_metadata:
         args.extend(["--cms-fw-metadata", parsed.cms_fw_metadata])
-    if parsed.variant:
-        args.extend(["--cms-variant", parsed.variant])
     if parsed.upload_results_to_database:
         args.append("--upload-results-to-database")
     return args

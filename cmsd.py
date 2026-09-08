@@ -72,6 +72,7 @@ from cms_protocol import (
 PUBLISHABLE_DIAGNOSTIC_NAMES = frozenset(
     {
         "cms_fw_metadata.json",
+        "setup_status.json",
         "cms_test_run.json",
         "orchestrator_plan.json",
         "orchestrator_results.jsonl",
@@ -85,6 +86,7 @@ PUBLISHABLE_CAMPAIGN_NAMES = frozenset(
         "paired_default_plan.json",
         "differential_campaign.json",
         "differential_comparison_inputs.json",
+        "differential_passes.json",
     }
 )
 
@@ -838,6 +840,25 @@ class CMSDaemon:
             self.current_differential_firmware = None
             self._release_staging_workspace(staging.runtime_dir)
 
+    def retain_differential_pass_records(
+        self,
+        execution_runtime_dir: Path,
+        pass_records: list[dict[str, Any]],
+    ) -> Artifacts:
+        """Retain each variant's terminal execution truth for reconnect and diagnosis."""
+
+        destination = execution_runtime_dir / "results" / "differential_passes.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps({"schema_version": 1, "passes": pass_records}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return Artifacts(
+            name="results/differential_passes.json",
+            path=destination,
+            result_type=ResultType.CAMPAIGN,
+        )
+
     def run_staged_test(
         self,
         *,
@@ -897,11 +918,6 @@ class CMSDaemon:
                 return _staged_test_failure(
                     "no differential firmware has been staged; run SEND_FW --diff first"
                 )
-            plan_builder = self.bench or CMSBench(config_path=self.config.bench_config)
-            plan_builder.build_differential_plan(
-                differential_staging.request,
-                differential_staging.runtime_dir,
-            )
             request = measurement_request_from_dict(
                 measurement_request_to_dict(differential_staging.request)
             )
@@ -928,6 +944,12 @@ class CMSDaemon:
         request.debug_artifact_streaming = debug_artifact_streaming
         request.identity = None
         request.request_id = ""
+        if differential_staging is not None:
+            plan_builder = self.bench or CMSBench(config_path=self.config.bench_config)
+            plan_builder.build_differential_plan(
+                request,
+                differential_staging.runtime_dir,
+            )
         identity = self._assign_execution_identity(request, run_name)
 
         started = MeasurementResult(
@@ -1165,6 +1187,12 @@ class CMSDaemon:
         started_at = self.measurements[request.request_id].started_at
         artifacts: list[Artifacts] = []
         pass_results: list[MeasurementResult] = []
+        pass_records: list[dict[str, Any]] = []
+        top_level_events = MeasurementEventStream(
+            request.request_id,
+            MeasurementRuntimePaths.from_root(runtime_dir),
+            max_console_bytes=self.config.max_console_event_bytes,
+        )
         try:
             if self.bench is None:
                 self.bench = CMSBench(config_path=self.config.bench_config)
@@ -1191,11 +1219,33 @@ class CMSDaemon:
                     variant,
                     cancel_event=self.cancellation_events[request.request_id],
                 )
+                session.console_relay = top_level_events
                 pass_result = self.bench.measurement_run(session, active_root=campaign.active_root)
                 pass_results.append(pass_result)
+                pass_record = _differential_pass_record(variant, pass_result, session.runtime_dir)
+                pass_records.append(pass_record)
                 for artifact in pass_result.artifacts:
                     artifact.name = (Path("results") / variant / artifact.name).as_posix()
                     artifacts.append(artifact)
+                passed_count = sum(item.state is MeasurementState.PASSED for item in pass_results)
+                failed_count = len(pass_results) - passed_count
+                self._update_differential_status(
+                    request.request_id,
+                    current_variant=variant,
+                    completed_variants=index,
+                    current_test=pass_record["current_test"],
+                    passed_count=passed_count,
+                    failed_count=failed_count,
+                )
+                if pass_result.state is not MeasurementState.PASSED and not pass_record["pytest_launched"]:
+                    runtime_paths = MeasurementRuntimePaths.from_root(
+                        self._runtime_workspace_path(request.request_id)
+                    )
+                    MeasurementEventStream(
+                        request.request_id,
+                        runtime_paths,
+                        max_console_bytes=self.config.max_console_event_bytes,
+                    ).append_lifecycle("differential_setup_failure", **pass_record)
                 if index == 1:
                     self._update_measurement(request.request_id, MeasurementState.RUNNING, 75, "running child differential pass")
                     self._update_differential_status(
@@ -1207,6 +1257,7 @@ class CMSDaemon:
                     )
             campaign_path = self.bench.record_differential_campaign_order(runtime_dir)
             artifacts.append(Artifacts(name="results/differential_campaign.json", path=campaign_path, result_type=ResultType.DIAGNOSTIC))
+            artifacts.append(self.retain_differential_pass_records(runtime_dir, pass_records))
             known_artifact_paths = {artifact.path for artifact in artifacts}
             artifacts.extend(
                 artifact
@@ -1214,6 +1265,15 @@ class CMSDaemon:
                 if artifact.path not in known_artifact_paths
             )
             state = MeasurementState.PASSED if all(item.state is MeasurementState.PASSED for item in pass_results) else MeasurementState.FAILED
+            failed_records = [record for record in pass_records if record["state"] != MeasurementState.PASSED.value]
+            message = (
+                "differential parent and child passes completed"
+                if not failed_records
+                else "; ".join(
+                    f"{record['variant']} failed during {record['phase']}: {record['message']}"
+                    for record in failed_records
+                )
+            )
             result = MeasurementResult(
                 measurement_id=request.request_id,
                 state=state,
@@ -1221,7 +1281,7 @@ class CMSDaemon:
                 finished_at=datetime.utcnow(),
                 progress_percent=100,
                 current_step=state.value,
-                message="differential parent and child passes completed",
+                message=message,
                 identity=request.identity,
                 artifacts=artifacts,
                 mode=MeasurementMode.DIFF.value,
@@ -2028,6 +2088,34 @@ def _is_publishable_final_artifact(artifact: Artifacts) -> bool:
     if artifact.result_type is ResultType.CAMPAIGN:
         return artifact_name in PUBLISHABLE_CAMPAIGN_NAMES
     return False
+
+
+def _differential_pass_record(
+    variant: str,
+    result: MeasurementResult,
+    runtime_dir: Path,
+) -> dict[str, Any]:
+    """Extract one pass's terminal truth, including pre-pytest setup status."""
+
+    setup_status: dict[str, Any] = {}
+    status_path = runtime_dir / "setup_status.json"
+    if status_path.is_file():
+        try:
+            parsed = json.loads(status_path.read_text(encoding="utf-8"))
+            if isinstance(parsed, dict):
+                setup_status = parsed
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {
+        "variant": variant,
+        "state": result.state.value,
+        "current_step": result.current_step,
+        "message": result.message,
+        "phase": str(setup_status.get("phase", result.current_step or "unknown")),
+        "pytest_launched": bool(setup_status.get("pytest_launched", False)),
+        "current_test": str(setup_status.get("current_test", "")),
+        "artifacts": [artifact.name for artifact in result.artifacts],
+    }
 
 
 def _staged_test_failure(message: str) -> MeasurementResult:

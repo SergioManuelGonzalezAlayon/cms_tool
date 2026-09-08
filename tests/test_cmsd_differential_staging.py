@@ -285,7 +285,9 @@ def test_diff_test_uses_the_current_differential_stage_without_a_staging_id(
     plan = json.loads(
         (runtime_dir / "firmware" / "paired_default_plan.json").read_text(encoding="utf-8")
     )
-    assert plan["scope"] == "all_default_features"
+    assert plan["scope"] == "feature_default"
+    assert plan["selector"]["feature"] == "beacon"
+    assert {job["feature"] for job in plan["jobs"]} == {"beacon"}
     assert plan["jobs"]
 
 

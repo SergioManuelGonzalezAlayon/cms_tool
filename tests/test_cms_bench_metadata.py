@@ -113,6 +113,55 @@ def test_pytest_runtime_metadata_contains_measurement_identity(tmp_path, monkeyp
     assert result_types[current_result] is ResultType.CURRENT_MEASUREMENT
 
 
+def test_differential_session_validates_firmware_from_its_active_root(tmp_path, monkeypatch):
+    session = _session(tmp_path / "results" / "parent")
+    active_root = tmp_path / "active"
+    active_root.mkdir()
+    session.active_firmware_dir = active_root
+    validated_paths = []
+    monkeypatch.setattr(
+        cms_bench,
+        "_validate_firmware_file",
+        lambda path, _hash: validated_paths.append(path),
+    )
+    bench = CMSBench()
+    bench.resources = BenchResources()
+
+    bench.test_prepare(session)
+
+    assert validated_paths == [
+        active_root / "dut.s37",
+        active_root / "tester.s37",
+        active_root / "sl_bt.xapi",
+    ]
+    assert not list(session.runtime_dir.glob("*.s37"))
+
+
+def test_setup_failure_retains_variant_status_summary_and_diagnostics(tmp_path, monkeypatch):
+    session = _session(tmp_path / "results" / "parent")
+    session.variant = "parent"
+    bench = CMSBench()
+    bench.initialized = True
+    monkeypatch.setattr(bench, "test_smoke", lambda session: (_ for _ in ()).throw(RuntimeError("missing active DUT image")))
+
+    result = bench.measurement_run(session)
+
+    setup_status = json.loads((session.runtime_dir / "setup_status.json").read_text(encoding="utf-8"))
+    run_summary = json.loads((session.runtime_dir / "cms_test_run.json").read_text(encoding="utf-8"))
+    assert result.state is MeasurementState.FAILED
+    assert result.message == "missing active DUT image"
+    assert setup_status["variant"] == "parent"
+    assert setup_status["phase"] == "validation"
+    assert setup_status["pytest_launched"] is False
+    assert setup_status["error"] == "missing active DUT image"
+    assert run_summary["phase"] == "validation"
+    assert run_summary["pytest_launched"] is False
+    assert {artifact.path.name for artifact in result.artifacts} >= {
+        "setup_status.json",
+        "cms_test_run.json",
+    }
+
+
 def test_pytest_runtime_materializes_named_dut_variants(tmp_path, monkeypatch):
     session = _session(tmp_path)
     session.manifest.dut_variants = {

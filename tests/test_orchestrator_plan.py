@@ -768,3 +768,23 @@ def test_cms_orchestrator_rejects_forwarded_pytest_cfg(tmp_path, monkeypatch, ca
     output = capsys.readouterr().out
     assert exit_code == 2
     assert "CMS orchestrator runs must use --exact-config" in output
+
+
+def test_cms_orchestrator_keeps_variant_identity_out_of_pytest_arguments() -> None:
+    parsed, _ = orchestrator.parse_args_with_pytest(
+        [
+            "--cms-runtime-config",
+            "cms_bench_runtime.json",
+            "--cms-fw-metadata",
+            "cms_fw_metadata.json",
+            "--variant",
+            "parent",
+        ]
+    )
+
+    assert orchestrator.cms_pytest_args(parsed) == [
+        "--cms-runtime-config",
+        "cms_bench_runtime.json",
+        "--cms-fw-metadata",
+        "cms_fw_metadata.json",
+    ]

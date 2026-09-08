@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -53,9 +54,19 @@ DEFAULT_CONSOLE_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_CONSOLE_EVENT_MAX_BYTES = 4 * 1024 * 1024
 # CMS measurements may run for days; cancellation is the normal stop mechanism.
 DEFAULT_EXECUTION_TIMEOUT_S: float | None = None
+_EVENT_STREAM_LOCKS: dict[str, threading.RLock] = {}
+_EVENT_STREAM_LOCKS_GUARD = threading.Lock()
 PROCESS_TERMINATE_GRACE_S = 5.0
 MAX_CONSOLE_EVENT_SEGMENT_BYTES = 64 * 1024
 COMMANDER_PROBE_TIMEOUT_S = 15.0
+
+
+def _event_stream_lock(root: Path) -> threading.RLock:
+    """Return the one in-process lock for all writers to one event workspace."""
+
+    key = str(root.resolve())
+    with _EVENT_STREAM_LOCKS_GUARD:
+        return _EVENT_STREAM_LOCKS.setdefault(key, threading.RLock())
 
 
 @dataclass(slots=True)
@@ -165,7 +176,7 @@ class MeasurementEventStream:
             MAX_CONSOLE_EVENT_SEGMENT_BYTES,
             max_console_bytes,
         )
-        self._lock = threading.Lock()
+        self._lock = _event_stream_lock(paths.root)
         self._console_segments = _console_segment_paths(paths.console_events)
         self._console_segment_bytes = sum(path.stat().st_size for path in self._console_segments)
         self._cursor = EventCursor(_last_event_cursor(paths))
@@ -188,11 +199,11 @@ class MeasurementEventStream:
         with self._lock:
             return self._append_structured_locked(state, **details)
 
-    def append_console(self, source: str, text: str) -> dict[str, Any]:
+    def append_console(self, source: str, text: str, *, variant: str = "") -> dict[str, Any]:
         if source not in {"stdout", "stderr"}:
             raise ValueError("console event source must be stdout or stderr")
         with self._lock:
-            record = self._next_record_locked("console", source=source, text=text)
+            record = self._next_record_locked("console", source=source, text=text, variant=variant)
             payload, record = _bounded_console_payload(record, self.max_console_bytes)
             self._append_console_payload_locked(record["cursor"], payload)
             self._cursor = EventCursor(record["cursor"])
@@ -250,6 +261,7 @@ class MeasurementEventStream:
             os.replace(temporary_path, self.paths.status)
 
     def _next_record_locked(self, event_type: str, **details: Any) -> dict[str, Any]:
+        self._cursor = EventCursor(_last_event_cursor(self.paths))
         return {
             **details,
             "measurement_id": self.measurement_id,
@@ -257,7 +269,6 @@ class MeasurementEventStream:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": event_type,
         }
-
     def _append_structured_locked(self, state: str, **details: Any) -> dict[str, Any]:
         record = self._next_record_locked("lifecycle", state=state, **details)
         self.paths.root.mkdir(parents=True, exist_ok=True)
@@ -306,12 +317,14 @@ class BenchSession:
     runtime_dir: Path
     manifest: FirmwareData
     request: MeasurementRequest
+    active_firmware_dir: Path | None = None
     notes: list[str] = field(default_factory=list)
     max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
     max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
     execution_timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S
     variant: str = ""
     job_plan_path: Path | None = None
+    console_relay: MeasurementEventStream | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     event_stream: MeasurementEventStream = field(init=False, repr=False)
 
@@ -325,6 +338,12 @@ class BenchSession:
     @property
     def runtime_paths(self) -> MeasurementRuntimePaths:
         return MeasurementRuntimePaths.from_root(self.runtime_dir)
+
+    @property
+    def firmware_root(self) -> Path:
+        """Return the RAM-backed directory that owns active firmware images."""
+
+        return self.active_firmware_dir or self.runtime_dir
 
 
 @dataclass(frozen=True, slots=True)
@@ -611,24 +630,25 @@ class CMSBench:
         if self.resources.board and session.request.selector.mode == "":
             raise RuntimeError("test selector mode is required")
 
-        dut_path = session.runtime_dir / session.manifest.dut_img.name
-        tester_path = session.runtime_dir / session.manifest.tester_img.name
+        firmware_root = session.firmware_root
+        dut_path = firmware_root / session.manifest.dut_img.name
+        tester_path = firmware_root / session.manifest.tester_img.name
         _validate_firmware_file(dut_path, session.manifest.dut_img.sha256 or session.manifest.dut_img_hash)
         _validate_firmware_file(tester_path, session.manifest.tester_img.sha256 or session.manifest.tester_img_hash)
         for name, image in session.manifest.dut_variants.items():
             _validate_firmware_file(
-                session.runtime_dir / image.name,
+                firmware_root / image.name,
                 image.sha256,
             )
         if session.manifest.bootloader_img is not None:
-            bootloader_path = session.runtime_dir / session.manifest.bootloader_img.name
+            bootloader_path = firmware_root / session.manifest.bootloader_img.name
             _validate_firmware_file(
                 bootloader_path,
                 session.manifest.bootloader_img.sha256 or session.manifest.bootloader_img_hash,
             )
         if session.manifest.xapi_file is None:
             raise RuntimeError("sl_bt.xapi was not supplied by the CMS client")
-        xapi_path = session.runtime_dir / session.manifest.xapi_file.name
+        xapi_path = firmware_root / session.manifest.xapi_file.name
         _validate_firmware_file(
             xapi_path,
             session.manifest.xapi_file.sha256 or session.manifest.xapi_file_hash,
@@ -686,20 +706,29 @@ class CMSBench:
                 raise RuntimeError("selected config hash does not match the requested differential campaign")
 
     def build_differential_plan(self, request: MeasurementRequest, runtime_dir: Path) -> Path:
-        """Create one deterministic all-default plan to be reused by both SDK variants."""
+        """Create the submitted deterministic plan to be reused by both SDK variants."""
 
         if request.differential_firmware is None:
             raise RuntimeError("differential plan requires differential firmware")
         from test_orchestrator import build_job_plan, build_jobs
 
+        feature = request.selector.feature.strip()
+        if not feature:
+            raise RuntimeError("differential test feature is required")
+        config = request.selector.config.strip() or "default"
+        if feature == "all" and config != "default":
+            raise RuntimeError("differential --feature all only supports the default config")
+        feature_filters = set() if feature == "all" else {feature}
+        exact_config = "" if config == "default" else config
         jobs = build_jobs(
             [Path("tests") / "configs" / "ble"],
             mode="default",
-            feature_filters=set(),
+            feature_filters=feature_filters,
             partition_filters=set(),
+            exact_config=exact_config,
         )
         if not jobs:
-            raise RuntimeError("differential all-default plan selected zero jobs")
+            raise RuntimeError("differential selected zero jobs")
         plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
         plan = build_job_plan(jobs)
         for job_record in plan["jobs"]:
@@ -707,7 +736,18 @@ class CMSBench:
             job_record["firmware_role"] = (
                 "dcdc" if dut_project == "ncp_ble_dut_dcdc" else "no_dcdc"
             )
-        plan["scope"] = "all_default_features"
+        plan["scope"] = (
+            "all_default_features"
+            if feature == "all"
+            else "feature_default"
+            if config == "default"
+            else "feature_exact_config"
+        )
+        plan["selector"] = {
+            "feature": feature,
+            "config": config,
+            "config_hash": request.selector.config_hash,
+        }
         plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
         return plan_path
 
@@ -820,6 +860,7 @@ class CMSBench:
             runtime_dir=result_root,
             manifest=active_firmware,
             request=active_request,
+            active_firmware_dir=active_root,
             variant=variant,
             job_plan_path=campaign.staged_runtime_dir / "firmware" / "paired_default_plan.json",
             cancel_event=cancel_event,
@@ -903,12 +944,35 @@ class CMSBench:
         """Run the requested measurement flow and return structured results."""
         started_at = datetime.utcnow()
         self.state = BenchState.TESTING
+        phase = "validation"
+        pytest_launched = False
+        _write_setup_status(
+            session,
+            phase=phase,
+            state="running",
+            pytest_launched=pytest_launched,
+        )
         try:
             self.test_smoke(session)
+            phase = "runtime_preparation"
+            _write_setup_status(
+                session,
+                phase=phase,
+                state="running",
+                pytest_launched=pytest_launched,
+            )
             prepared = _prepare_pytest_runtime(
                 session,
                 self.resources or BenchResources(),
                 active_root=active_root,
+            )
+            phase = "pytest"
+            pytest_launched = True
+            _write_setup_status(
+                session,
+                phase=phase,
+                state="running",
+                pytest_launched=pytest_launched,
             )
             completed = _run_test_orchestrator(session, prepared["results_log"], prepared["metadata_path"])
             result = MeasurementResult(
@@ -921,24 +985,25 @@ class CMSBench:
                 message="test execution completed" if completed.returncode == 0 else "test execution failed",
                 identity=session.request.identity,
             )
-            run_summary_path = session.runtime_dir / "cms_test_run.json"
-            run_summary_path.write_text(
-                json.dumps(
-                    {
-                        "request": measurement_request_to_dict(session.request),
-                        "returncode": completed.returncode,
-                        "stdout": completed.stdout,
-                        "stderr": completed.stderr,
-                        "notes": session.notes,
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
+            _write_setup_status(
+                session,
+                phase="collection",
+                state="completed" if completed.returncode == 0 else "failed",
+                pytest_launched=pytest_launched,
             )
+            _write_test_run_summary(session, completed=completed, phase="pytest")
             return self.collect_artifacts(session, result, artifact_since=prepared["artifact_since"])
         except RuntimeError as exc:
-            return MeasurementResult(
+            _write_setup_status(
+                session,
+                phase=phase,
+                state="failed",
+                error=str(exc),
+                traceback_text=traceback.format_exc(),
+                pytest_launched=pytest_launched,
+            )
+            _write_test_run_summary(session, completed=None, phase=phase, error=str(exc))
+            result = MeasurementResult(
                 measurement_id=session.measurement_id,
                 state=MeasurementState.FAILED,
                 started_at=started_at,
@@ -948,6 +1013,11 @@ class CMSBench:
                 message=str(exc),
                 identity=session.request.identity,
             )
+            try:
+                return self.collect_artifacts(session, result)
+            except OSError as artifact_exc:
+                result.message = f"{result.message}; failed to collect diagnostics: {artifact_exc}"
+                return result
         finally:
             self.state = BenchState.IDLE
 
@@ -1379,6 +1449,8 @@ def _run_managed_process(
     stdout_path: Path,
     stderr_path: Path,
     event_stream: MeasurementEventStream | None = None,
+    relay_event_stream: MeasurementEventStream | None = None,
+    relay_variant: str = "",
     log_max_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES,
     timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S,
     cancel_event: threading.Event | None = None,
@@ -1433,6 +1505,8 @@ def _run_managed_process(
             stdout_path,
             "stdout",
             event_stream,
+            relay_event_stream,
+            relay_variant,
             log_max_bytes,
             drain_errors,
         ),
@@ -1446,6 +1520,8 @@ def _run_managed_process(
             stderr_path,
             "stderr",
             event_stream,
+            relay_event_stream,
+            relay_variant,
             log_max_bytes,
             drain_errors,
         ),
@@ -1579,6 +1655,8 @@ def _drain_process_stream(
     destination: Path,
     source: str,
     event_stream: MeasurementEventStream | None,
+    relay_event_stream: MeasurementEventStream | None,
+    relay_variant: str,
     log_max_bytes: int,
     errors: list[OSError],
 ) -> None:
@@ -1593,6 +1671,8 @@ def _drain_process_stream(
                 event_stream.append_console(source, line)
                 if discarded_bytes:
                     event_stream.record_log_truncation(source, discarded_bytes)
+            if relay_event_stream is not None:
+                relay_event_stream.append_console(source, line, variant=relay_variant)
     except OSError as exc:
         errors.append(exc)
     finally:
@@ -1653,6 +1733,8 @@ def _run_test_orchestrator(
         stdout_path=session.runtime_paths.stdout,
         stderr_path=session.runtime_paths.stderr,
         event_stream=session.event_stream,
+        relay_event_stream=session.console_relay,
+        relay_variant=session.variant,
         log_max_bytes=session.max_console_log_bytes,
         timeout_s=session.execution_timeout_s,
         cancel_event=session.cancel_event,
@@ -1705,6 +1787,7 @@ def _orchestrator_mode(session: BenchSession) -> str:
 def _run_diagnostic_artifacts(session: BenchSession) -> list[Path]:
     names = [
         "cms_fw_metadata.json",
+        "setup_status.json",
         "cms_test_run.json",
         "orchestrator_plan.json",
         "orchestrator_results.jsonl",
@@ -1720,6 +1803,70 @@ def _run_diagnostic_artifacts(session: BenchSession) -> list[Path]:
     if junit_dir.exists():
         artifacts.extend(sorted(junit_dir.glob("*.xml")))
     return artifacts
+
+
+def _write_setup_status(
+    session: BenchSession,
+    *,
+    phase: str,
+    state: str,
+    pytest_launched: bool,
+    error: str = "",
+    traceback_text: str = "",
+) -> Path:
+    """Persist RAM-backed per-pass setup progress before pytest can run."""
+
+    path = session.runtime_dir / "setup_status.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "measurement_id": session.measurement_id,
+                "variant": session.variant,
+                "phase": phase,
+                "state": state,
+                "pytest_launched": pytest_launched,
+                "error": error,
+                "traceback": traceback_text,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_test_run_summary(
+    session: BenchSession,
+    *,
+    completed: subprocess.CompletedProcess[str] | None,
+    phase: str,
+    error: str = "",
+) -> Path:
+    """Write a terminal run summary even when setup blocks pytest launch."""
+
+    path = session.runtime_dir / "cms_test_run.json"
+    path.write_text(
+        json.dumps(
+            {
+                "request": measurement_request_to_dict(session.request),
+                "phase": phase,
+                "pytest_launched": completed is not None,
+                "returncode": completed.returncode if completed is not None else None,
+                "stdout": completed.stdout if completed is not None else "",
+                "stderr": completed.stderr if completed is not None else "",
+                "error": error,
+                "notes": session.notes,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _load_requested_test_config(session: BenchSession) -> dict[str, Any]:

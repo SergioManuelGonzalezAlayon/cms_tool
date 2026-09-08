@@ -1780,6 +1780,16 @@ def _request_from_diff_build_manifest(args: argparse.Namespace, build_root: Path
         missing_roles = sorted(required_roles - set(by_role))
         if missing_roles:
             raise RuntimeError(f"Differential {name} build is missing roles: {', '.join(missing_roles)}")
+        unsupported_roles = sorted(
+            f"{item.role}={item.image.name}"
+            for item in all_role_images
+            if item.image.name and Path(item.image.name).suffix.lower() not in {".s37", ".hex"}
+        )
+        if unsupported_roles:
+            raise RuntimeError(
+                f"Differential {name} build contains non-flashable firmware artifact(s): "
+                f"{', '.join(unsupported_roles)}. Run `cms BUILD --diff` to produce .s37 or .hex images."
+            )
         xapi_path = str(build.get("xapi", ""))
         xapi_hash = str(sdk.get("xapi_sha256", ""))
         return FirmwareData(
@@ -2539,9 +2549,11 @@ def _print_verbose_event_page(
         timestamp = event.timestamp.isoformat()
         if event.event_type == "console":
             source = str(event.details.get("source", "console"))
+            variant = str(event.details.get("variant", ""))
+            label = f"{variant} {source}" if variant else source
             text = str(event.details.get("text", ""))
             for line in text.splitlines() or [""]:
-                print(f"{colors.color(timestamp, 'dim')} [{source}] {line}")
+                print(f"{colors.color(timestamp, 'dim')} [{label}] {line}")
             continue
         state = str(event.details.get("state", event.event_type))
         print(f"{colors.color(timestamp, 'dim')} [event] {colors.color(state, state_role(state))}")

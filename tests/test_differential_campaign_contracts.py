@@ -69,6 +69,21 @@ def test_paired_plan_metadata_and_records_are_variant_isolated(tmp_path: Path) -
     assert json.loads(campaign_path.read_text(encoding="utf-8"))["run_order"] == ["parent", "child"]
 
 
+def test_differential_plan_honors_the_submitted_feature_selector(tmp_path: Path) -> None:
+    request = _request()
+    request.selector.feature = "beacon"
+    runtime = tmp_path / "runtime"
+    (runtime / "firmware").mkdir(parents=True)
+
+    plan_path = CMSBench().build_differential_plan(request, runtime)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+    assert plan["scope"] == "feature_default"
+    assert plan["selector"] == {"feature": "beacon", "config": "default", "config_hash": ""}
+    assert plan["jobs"]
+    assert {job["feature"] for job in plan["jobs"]} == {"beacon"}
+
+
 def test_daemon_lists_parent_and_child_artifacts_without_cross_variant_loss(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
     (runtime / "results" / "parent").mkdir(parents=True)
@@ -130,6 +145,18 @@ def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_re
     plan_source.write_text('{"jobs": []}\n', encoding="utf-8")
     plan = daemon.retain_differential_plan_artifact(staging_dir, execution_dir)
     inputs = daemon.retain_differential_comparison_inputs(request, execution_dir)
+    passes = daemon.retain_differential_pass_records(
+        execution_dir,
+        [
+            {
+                "variant": "parent",
+                "state": "failed",
+                "phase": "validation",
+                "message": "missing active DUT image",
+                "pytest_launched": False,
+            }
+        ],
+    )
     campaign = execution_dir / "results" / "differential_campaign.json"
     campaign.write_text('{"run_order": ["parent", "child"]}\n', encoding="utf-8")
     result = MeasurementResult(
@@ -138,6 +165,7 @@ def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_re
         artifacts=[
             plan,
             inputs,
+            passes,
             Artifacts(
                 name="results/differential_campaign.json",
                 path=campaign,
@@ -151,6 +179,7 @@ def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_re
     assert {artifact.name for artifact in published.artifacts} >= {
         "results/paired_default_plan.json",
         "results/differential_comparison_inputs.json",
+        "results/differential_passes.json",
         "results/differential_campaign.json",
     }
     assert staging_dir.is_dir()
@@ -205,11 +234,13 @@ def test_activate_differential_variant_materializes_a_normal_isolated_session(tm
 
     assert session.variant == "parent"
     assert session.runtime_dir == execution_runtime / "results" / "parent"
+    assert session.firmware_root == execution_runtime / "active"
     assert set(session.manifest.dut_variants) == {"dcdc", "no_dcdc"}
     active_root = execution_runtime / "active"
     assert (active_root / "parent-dut.s37").is_file()
     assert (active_root / "parent-no-dcdc.s37").is_file()
     assert (active_root / "parent-tester.s37").is_file()
+    assert not list(session.runtime_dir.glob("*.s37"))
 
 
 def test_differential_campaign_session_owns_active_and_isolated_result_roots(tmp_path: Path) -> None:

@@ -953,3 +953,35 @@ def test_firmware_request_rejects_incomplete_build_sdk_provenance(tmp_path):
             args,
             CMSClientConfig(target={}, build={"root": str(build_root)}),
         )
+
+
+def test_differential_request_rejects_bin_firmware_manifest(tmp_path) -> None:
+    build_root = tmp_path / "fw"
+    build_root.mkdir()
+    variants = {}
+    for name in ("parent", "child"):
+        variants[name] = {
+            "manifest": {
+                "firmware": {
+                    "board": "brd4182a",
+                    "device": "EFR32MG22C224F512IM40",
+                    "artifacts": [
+                        {"role": role, "project_name": project, "image": f"{project}.bin", "sha256": "hash"}
+                        for role, project in (
+                            ("dut_dcdc", "ncp_ble_dut_dcdc"),
+                            ("dut_no_dcdc", "ncp_ble_dut"),
+                            ("tester", "ncp_ble_tester"),
+                        )
+                    ],
+                },
+                "build": {"xapi": "runtime/sl_bt.xapi"},
+                "sdk": {"xapi_sha256": "xapi-hash"},
+            }
+        }
+    (build_root / "diff_fw_data.json").write_text(
+        json.dumps({"variants": variants}), encoding="utf-8"
+    )
+    args = argparse.Namespace(request_id="request", requested_by="developer")
+
+    with pytest.raises(RuntimeError, match="non-flashable firmware artifact"):
+        cms_client._request_from_diff_build_manifest(args, build_root)

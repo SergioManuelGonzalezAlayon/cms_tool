@@ -116,6 +116,43 @@ def test_managed_process_large_output_does_not_deadlock(tmp_path: Path) -> None:
     assert len((tmp_path / "stderr.log").read_text(encoding="utf-8").splitlines()) == 8000
 
 
+def test_managed_process_relays_variant_labelled_console_output(tmp_path: Path) -> None:
+    local_events = MeasurementEventStream(
+        "measurement-123", MeasurementRuntimePaths.from_root(tmp_path / "parent")
+    )
+    relay_events = MeasurementEventStream(
+        "measurement-123", MeasurementRuntimePaths.from_root(tmp_path / "top-level")
+    )
+
+    completed = cms_bench._run_managed_process(
+        _fake_command("stdout:parent output", "stderr:parent error"),
+        cwd=Path("."),
+        stdout_path=tmp_path / "parent" / "stdout.log",
+        stderr_path=tmp_path / "parent" / "stderr.log",
+        event_stream=local_events,
+        relay_event_stream=relay_events,
+        relay_variant="parent",
+    )
+
+    assert completed.returncode == 0
+    console_events = [event for event in relay_events.read_events() if event["type"] == "console"]
+    assert {(event["source"], event["variant"]) for event in console_events} == {
+        ("stdout", "parent"),
+        ("stderr", "parent"),
+    }
+
+
+def test_independent_event_stream_writers_keep_cursors_strictly_increasing(tmp_path: Path) -> None:
+    paths = MeasurementRuntimePaths.from_root(tmp_path)
+    first = MeasurementEventStream("measurement-123", paths)
+    second = MeasurementEventStream("measurement-123", paths)
+
+    first.append_lifecycle("differential_status")
+    second.append_console("stdout", "parent output\n", variant="parent")
+
+    assert [event["cursor"] for event in MeasurementEventStream("measurement-123", paths).read_events()] == [1, 2]
+
+
 def test_managed_process_times_out_and_preserves_live_diagnostics(tmp_path: Path) -> None:
     event_stream = MeasurementEventStream(
         "measurement-123",
@@ -264,6 +301,8 @@ def test_orchestrator_starts_python_unbuffered_and_uses_runtime_logs(
         stdout_path,
         stderr_path,
         event_stream,
+        relay_event_stream,
+        relay_variant,
         log_max_bytes,
         timeout_s,
         cancel_event,
@@ -274,6 +313,8 @@ def test_orchestrator_starts_python_unbuffered_and_uses_runtime_logs(
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             event_stream=event_stream,
+            relay_event_stream=relay_event_stream,
+            relay_variant=relay_variant,
             log_max_bytes=log_max_bytes,
             timeout_s=timeout_s,
             cancel_event=cancel_event,
@@ -294,6 +335,8 @@ def test_orchestrator_starts_python_unbuffered_and_uses_runtime_logs(
     assert observed["stdout_path"] == session.runtime_paths.stdout
     assert observed["stderr_path"] == session.runtime_paths.stderr
     assert observed["event_stream"] is session.event_stream
+    assert observed["relay_event_stream"] is None
+    assert observed["relay_variant"] == ""
     assert observed["log_max_bytes"] == session.max_console_log_bytes
     assert observed["timeout_s"] == session.execution_timeout_s
     assert observed["cancel_event"] is session.cancel_event
