@@ -2,7 +2,7 @@ import pytest
 import shlex
 from pathlib import Path
 
-from cms_client import build_cli_parser
+from cms_client import _print_staged_firmware, build_cli_parser
 
 
 def _help_text(*args: str) -> str:
@@ -30,16 +30,53 @@ def test_top_level_help_shows_normal_workflow(capsys):
     assert "cms TEST --mode default --feature beacon --config-name default" in text
     assert "cms WATCH <measurement_id> --cursor <last_cursor>" in text
     assert "cms ARTIFACTS <measurement_id>" in text
+    assert "Differential workflow:" in text
+    assert "cms BUILD --diff" in text
+    assert "cms SEND_FW --diff" in text
+    assert "cms TEST --mode diff --feature beacon --verbose" in text
 
 
 def test_send_fw_help_explains_inputs_and_next_step(capsys):
     text = _command_help_text("SEND_FW", capsys=capsys)
 
-    assert "--request-id" in text
-    assert "--requested-by" in text
-    assert "Example:" in text
+    assert "cms SEND_FW --diff" in text
+    assert "--request-json" in text
+    assert "Examples:" in text
     assert "Next:" in text
-    assert "cms TEST" in text
+    assert "cms TEST --mode diff --feature beacon --verbose" in text
+
+
+def test_staged_help_and_output_expose_only_the_current_operator_view(capsys):
+    text = _command_help_text("STAGED", capsys=capsys)
+
+    assert "Read-only view:" in text
+    assert "cms STAGED" in text
+
+    _print_staged_firmware(
+        {
+            "normal": None,
+            "differential": {
+                "intended_use": "differential parent/child comparison",
+                "created_at": "2026-09-08T10:00:00+00:00",
+                "target": {"board": "BRD4002A", "device": "EFR32MG22"},
+                "parent": {
+                    "sisdk": {"version": "2026.12.0", "commit": "parent"},
+                    "firmware": [{"role": "dut", "name": "parent.s37"}],
+                },
+                "child": {
+                    "sisdk": {"version": "2026.13.0", "commit": "child"},
+                    "firmware": [{"role": "dut", "name": "child.s37"}],
+                },
+            },
+        }
+    )
+    output = capsys.readouterr().out
+
+    assert "normal: none" in output
+    assert "differential: differential parent/child comparison" in output
+    assert "parent firmware: dut=parent.s37" in output
+    assert "child firmware: dut=child.s37" in output
+    assert "staging_id" not in output
 
 
 def test_health_help_explains_named_and_one_shot_endpoint_selection(capsys):
@@ -67,15 +104,19 @@ def test_test_help_explains_config_preview_watch_and_results(capsys):
     assert "Example:" in text
     assert "cms TEST --mode default --feature beacon --config-name dcdc --preview" in text
     assert "Next:" in text
+    assert "--staging-id" not in text
+    assert "cms TEST --mode diff --feature beacon --verbose" in text
 
 
 def test_watch_help_explains_reconnect_cursor_and_verbose(capsys):
     text = _command_help_text("WATCH", capsys=capsys)
 
     assert "measurement_id" in text
+    assert "--reconnect" in text
     assert "--cursor" in text
     assert "--verbose" in text
     assert "cms WATCH <measurement_id> --cursor <last_cursor>" in text
+    assert "cms WATCH --reconnect" in text
     assert "Next:" in text
 
 

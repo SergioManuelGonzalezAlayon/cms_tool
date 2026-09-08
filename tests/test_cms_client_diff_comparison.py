@@ -62,6 +62,8 @@ def _write_downloaded_diff_artifacts(out_dir: Path, *, child_current: float) -> 
 
 def _install_diff_client(monkeypatch, out_dir: Path, *, child_current: float):
     class Client:
+        base_url = "http://bench.test"
+
         def run_test(self, *args, **kwargs):
             return MeasurementResult(measurement_id=MEASUREMENT_ID, state=MeasurementState.ACCEPTED)
 
@@ -93,7 +95,7 @@ def test_diff_client_saves_report_and_renders_table_after_successful_execution(
     _install_diff_client(monkeypatch, tmp_path, child_current=1.016)
 
     exit_code = cms_client.main(
-        ["test", "--mode", "diff", "--feature", "all", "--staging-id", "staged-001", "--out-dir", str(tmp_path)]
+        ["test", "--mode", "diff", "--feature", "all", "--out-dir", str(tmp_path)]
     )
 
     output = capsys.readouterr().out
@@ -108,7 +110,7 @@ def test_diff_client_returns_regression_exit_code_after_successful_execution(
     _install_diff_client(monkeypatch, tmp_path, child_current=1.02)
 
     exit_code = cms_client.main(
-        ["test", "--mode", "diff", "--feature", "all", "--staging-id", "staged-001", "--out-dir", str(tmp_path)]
+        ["test", "--mode", "diff", "--feature", "all", "--out-dir", str(tmp_path)]
     )
 
     assert exit_code == int(cms_client.CMSCLIExitCode.THRESHOLD_REGRESSION)
@@ -127,7 +129,7 @@ def test_diff_client_renders_the_saved_report_not_the_in_memory_report(
     monkeypatch.setattr(cms_client, "write_diff_comparison_report", write_replaced_report)
 
     exit_code = cms_client.main(
-        ["test", "--mode", "diff", "--feature", "all", "--staging-id", "staged-001", "--out-dir", str(tmp_path)]
+        ["test", "--mode", "diff", "--feature", "all", "--out-dir", str(tmp_path)]
     )
 
     output = capsys.readouterr().out
@@ -140,6 +142,8 @@ def test_diff_execution_failure_takes_precedence_over_comparison_outcome(
     tmp_path: Path, monkeypatch
 ) -> None:
     class Client:
+        base_url = "http://bench.test"
+
         def run_test(self, *args, **kwargs):
             return MeasurementResult(measurement_id=MEASUREMENT_ID, state=MeasurementState.ACCEPTED)
 
@@ -156,7 +160,7 @@ def test_diff_execution_failure_takes_precedence_over_comparison_outcome(
     )
 
     exit_code = cms_client.main(
-        ["test", "--mode", "diff", "--feature", "all", "--staging-id", "staged-001", "--out-dir", str(tmp_path)]
+        ["test", "--mode", "diff", "--feature", "all", "--out-dir", str(tmp_path)]
     )
 
     assert exit_code == int(cms_client.CMSCLIExitCode.TEST_FAILED)

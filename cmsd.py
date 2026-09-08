@@ -80,6 +80,13 @@ PUBLISHABLE_DIAGNOSTIC_NAMES = frozenset(
         "test_stderr.log",
     }
 )
+PUBLISHABLE_CAMPAIGN_NAMES = frozenset(
+    {
+        "paired_default_plan.json",
+        "differential_campaign.json",
+        "differential_comparison_inputs.json",
+    }
+)
 
 
 def _should_upload_results_to_database(mode: MeasurementMode | str) -> bool:
@@ -161,7 +168,7 @@ class DaemonFiles:
 
 @dataclass(frozen=True, slots=True)
 class StagedDifferentialFirmware:
-    """A complete validated parent/child pair retained under one staging ID."""
+    """The one complete validated parent/child pair retained for this bench."""
 
     request: MeasurementRequest
     runtime_dir: Path
@@ -181,7 +188,10 @@ class CMSDaemon:
         self.measurements: dict[str, MeasurementResult] = {}
         self.last_firmware_request: MeasurementRequest | None = None
         self.last_firmware_runtime_dir: Path | None = None
-        self.staged_differential_firmware: dict[str, StagedDifferentialFirmware] = {}
+        # Firmware staging has one current slot for each supported use.  A
+        # candidate is promoted only after bench validation succeeds, so a
+        # failed SEND_FW leaves the previous current stage usable.
+        self.current_differential_firmware: StagedDifferentialFirmware | None = None
         self.last_measurement_id: str | None = None
         self.cancelled_measurements: set[str] = set()
         self.cancellation_events: dict[str, threading.Event] = {}
@@ -300,6 +310,26 @@ class CMSDaemon:
             "runtime_root": str(self.config.runtime_root),
             "artifacts_root": str(self.config.artifacts_root),
             "files": self.files.as_dict(),
+        }
+
+    def get_staged(self) -> dict[str, Any]:
+        """Return the two current firmware stages without exposing staging history."""
+
+        differential_stage = self.current_differential_firmware
+        return {
+            "normal": (
+                _staged_firmware_summary(
+                    self.last_firmware_request,
+                    intended_use="normal test execution",
+                )
+                if self.last_firmware_request is not None
+                else None
+            ),
+            "differential": (
+                _staged_differential_firmware_summary(differential_stage.request)
+                if differential_stage is not None
+                else None
+            ),
         }
 
     def get_active_measurement_id(self) -> str | None:
@@ -669,11 +699,11 @@ class CMSDaemon:
                     current_step=MeasurementState.ACCEPTED.value,
                     message="firmware staged and ready for test",
                 )
-                self.last_firmware_request = request
-                self.last_firmware_runtime_dir = runtime_dir
+                self._retain_staged_normal_firmware(request, runtime_dir)
                 if self.active_measurement_id == request.request_id:
                     self.active_measurement_id = None
         except (OSError, RuntimeError, ValueError) as exc:
+            self._release_staging_workspace(runtime_dir)
             result = MeasurementResult(
                 measurement_id=request.request_id,
                 state=MeasurementState.FAILED,
@@ -694,26 +724,50 @@ class CMSDaemon:
         request: MeasurementRequest,
         runtime_dir: Path,
     ) -> Artifacts:
-        """Make one complete validated differential pair addressable by its staging ID."""
+        """Promote one complete validated differential pair as the current stage."""
 
         manifest_path = runtime_dir / "firmware" / "manifest.json"
         if not manifest_path.is_file():
             raise RuntimeError(f"differential firmware staging manifest is missing: {manifest_path}")
-        self.staged_differential_firmware[request.request_id] = StagedDifferentialFirmware(
+        previous_stage = self.current_differential_firmware
+        current_stage = StagedDifferentialFirmware(
             request=request,
             runtime_dir=runtime_dir,
             manifest_path=manifest_path,
         )
+        self.current_differential_firmware = current_stage
+        if previous_stage is not None and previous_stage.runtime_dir != runtime_dir:
+            self._release_staging_workspace(previous_stage.runtime_dir)
         return Artifacts(
             name=f"cmsd/{request.request_id}/firmware/manifest.json",
             path=manifest_path,
             result_type=ResultType.DIAGNOSTIC,
         )
 
-    def get_staged_firmware(self, staging_id: str) -> "StagedDifferentialFirmware | None":
-        """Find a validated differential pair by its explicit staging ID."""
+    def _retain_staged_normal_firmware(
+        self,
+        request: MeasurementRequest,
+        runtime_dir: Path,
+    ) -> None:
+        """Promote one validated normal candidate and release its predecessor."""
 
-        return self.staged_differential_firmware.get(staging_id)
+        previous_runtime_dir = self.last_firmware_runtime_dir
+        self.last_firmware_request = request
+        self.last_firmware_runtime_dir = runtime_dir
+        if previous_runtime_dir is not None and previous_runtime_dir != runtime_dir:
+            self._release_staging_workspace(previous_runtime_dir)
+
+    def get_current_differential_firmware(self) -> "StagedDifferentialFirmware | None":
+        """Return the one current validated differential firmware stage."""
+
+        return self.current_differential_firmware
+
+    @staticmethod
+    def _release_staging_workspace(runtime_dir: Path) -> None:
+        """Release a superseded or failed staging candidate without raising."""
+
+        if runtime_dir.exists():
+            shutil.rmtree(runtime_dir, ignore_errors=True)
 
     def differential_result_artifacts(self, runtime_dir: Path) -> list[Artifacts]:
         """Expose retained parent and child raw evidence independently."""
@@ -750,6 +804,39 @@ class CMSDaemon:
             path=destination,
             result_type=ResultType.CAMPAIGN,
         )
+
+    def retain_differential_comparison_inputs(
+        self,
+        request: MeasurementRequest,
+        execution_runtime_dir: Path,
+    ) -> Artifacts:
+        """Retain the parent/child provenance required for client-side pairing."""
+
+        destination = execution_runtime_dir / "results" / "differential_comparison_inputs.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(
+                {
+                    "measurement_request": measurement_request_to_dict(request),
+                    "delta_convention": "child - parent",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return Artifacts(
+            name="results/differential_comparison_inputs.json",
+            path=destination,
+            result_type=ResultType.CAMPAIGN,
+        )
+
+    def _release_consumed_differential_stage(self, staging: StagedDifferentialFirmware) -> None:
+        """Release a consumed stage only after completed-run evidence is published."""
+
+        if self.current_differential_firmware is staging:
+            self.current_differential_firmware = None
+            self._release_staging_workspace(staging.runtime_dir)
 
     def run_staged_test(
         self,
@@ -799,20 +886,16 @@ class CMSDaemon:
         run_name: str = "",
         upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
-        staging_id: str = "",
     ) -> MeasurementResult:
-        """Start a test in the background using explicitly selected staged firmware."""
+        """Start a test in the background using the current staged firmware."""
 
         measurement_mode = MeasurementMode(mode)
         differential_staging: StagedDifferentialFirmware | None = None
         if measurement_mode is MeasurementMode.DIFF:
-            staging_id = staging_id.strip()
-            if not staging_id:
-                return _staged_test_failure("cms TEST --mode diff requires --staging-id")
-            differential_staging = self.get_staged_firmware(staging_id)
+            differential_staging = self.get_current_differential_firmware()
             if differential_staging is None:
                 return _staged_test_failure(
-                    f"differential firmware staging ID is unknown: {staging_id}"
+                    "no differential firmware has been staged; run SEND_FW --diff first"
                 )
             plan_builder = self.bench or CMSBench(config_path=self.config.bench_config)
             plan_builder.build_differential_plan(
@@ -821,10 +904,6 @@ class CMSDaemon:
             )
             request = measurement_request_from_dict(
                 measurement_request_to_dict(differential_staging.request)
-            )
-        elif staging_id.strip():
-            return _staged_test_failure(
-                "--staging-id is only valid with cms TEST --mode diff"
             )
         elif self.last_firmware_request is None:
             return MeasurementResult(
@@ -1091,6 +1170,8 @@ class CMSDaemon:
                 self.bench = CMSBench(config_path=self.config.bench_config)
                 self.bench.initialize()
             self.bench.validate_differential_firmware(staging.request, staging.runtime_dir)
+            artifacts.append(self.retain_differential_plan_artifact(staging.runtime_dir, runtime_dir))
+            artifacts.append(self.retain_differential_comparison_inputs(request, runtime_dir))
             self._update_measurement(request.request_id, MeasurementState.RUNNING, 50, "running parent differential pass")
             for index, variant in enumerate(("parent", "child"), start=1):
                 self._raise_if_cancelled(request.request_id)
@@ -1126,8 +1207,11 @@ class CMSDaemon:
                     )
             campaign_path = self.bench.record_differential_campaign_order(runtime_dir)
             artifacts.append(Artifacts(name="results/differential_campaign.json", path=campaign_path, result_type=ResultType.DIAGNOSTIC))
-            artifacts.append(
-                self.retain_differential_plan_artifact(staging.runtime_dir, runtime_dir)
+            known_artifact_paths = {artifact.path for artifact in artifacts}
+            artifacts.extend(
+                artifact
+                for artifact in self.differential_result_artifacts(runtime_dir)
+                if artifact.path not in known_artifact_paths
             )
             state = MeasurementState.PASSED if all(item.state is MeasurementState.PASSED for item in pass_results) else MeasurementState.FAILED
             result = MeasurementResult(
@@ -1158,7 +1242,9 @@ class CMSDaemon:
                 identity=request.identity,
                 artifacts=artifacts,
             )
-        return self.publish_results(result)
+        published = self.publish_results(result)
+        self._release_consumed_differential_stage(staging)
+        return published
 
     def create_app(self) -> Any:
         """Create the FastAPI app for daemon bringup routes."""
@@ -1204,6 +1290,10 @@ class CMSDaemon:
         def daemon_status() -> dict[str, Any]:
             return self.get_status()
 
+        @app.get("/staged")
+        def staged_firmware() -> dict[str, Any]:
+            return self.get_staged()
+
         @app.get("/tests")
         def available_tests() -> dict[str, Any]:
             features = []
@@ -1246,7 +1336,6 @@ class CMSDaemon:
                 run_name=str(request.get("run_name", "")),
                 upload_results_to_database=bool(request.get("upload_results_to_database", True)),
                 debug_artifact_streaming=bool(request.get("debug_artifact_streaming", False)),
-                staging_id=str(request.get("staging_id", "")),
             )
             return measurement_result_to_dict(result)
 
@@ -1857,6 +1946,71 @@ def _safe_artifact_name(name: str) -> str:
     return normalized.as_posix()
 
 
+def _staged_firmware_summary(
+    request: MeasurementRequest,
+    *,
+    intended_use: str,
+) -> dict[str, Any]:
+    """Serialize operator-facing provenance for one current firmware set."""
+
+    firmware = request.firmware
+    images = [
+        {"role": "dut", "name": firmware.dut_img.name, "sha256": firmware.dut_img.sha256},
+        {"role": "tester", "name": firmware.tester_img.name, "sha256": firmware.tester_img.sha256},
+    ]
+    images.extend(
+        {"role": role, "name": image.name, "sha256": image.sha256}
+        for role, image in sorted(firmware.dut_variants.items())
+    )
+    if firmware.xapi_file is not None:
+        images.append(
+            {"role": "xapi", "name": firmware.xapi_file.name, "sha256": firmware.xapi_file.sha256}
+        )
+    if firmware.bootloader_img is not None:
+        images.append(
+            {
+                "role": "bootloader",
+                "name": firmware.bootloader_img.name,
+                "sha256": firmware.bootloader_img.sha256,
+            }
+        )
+    return {
+        "intended_use": intended_use,
+        "created_at": request.identity.created_at.isoformat() if request.identity else "",
+        "target": {"board": firmware.board, "device": firmware.device},
+        "sisdk": {
+            "name": firmware.sisdk_name,
+            "source": firmware.sisdk_source,
+            "version": firmware.sisdk_version,
+            "commit": firmware.sisdk_commit,
+            "hash": firmware.sisdk_hash,
+        },
+        "firmware": images,
+    }
+
+
+def _staged_differential_firmware_summary(request: MeasurementRequest) -> dict[str, Any]:
+    """Serialize the one current parent/child stage for the operator view."""
+
+    differential = request.differential_firmware
+    if differential is None:
+        raise RuntimeError("current differential stage is missing differential firmware")
+    child_request = measurement_request_from_dict(measurement_request_to_dict(request))
+    child_request.firmware = differential.child
+    parent_request = measurement_request_from_dict(measurement_request_to_dict(request))
+    parent_request.firmware = differential.parent
+    return {
+        "intended_use": "differential parent/child comparison",
+        "created_at": request.identity.created_at.isoformat() if request.identity else "",
+        "target": {
+            "board": differential.child.board,
+            "device": differential.child.device,
+        },
+        "parent": _staged_firmware_summary(parent_request, intended_use="parent baseline"),
+        "child": _staged_firmware_summary(child_request, intended_use="child under test"),
+    }
+
+
 def _is_publishable_final_artifact(artifact: Artifacts) -> bool:
     """Allow only selected completed-run evidence onto persistent storage."""
 
@@ -1866,7 +2020,13 @@ def _is_publishable_final_artifact(artifact: Artifacts) -> bool:
     if artifact.result_type is ResultType.PYTEST_JUNIT:
         return artifact_name.lower().endswith(".xml")
     if artifact.result_type is ResultType.DIAGNOSTIC:
-        return artifact_name in PUBLISHABLE_DIAGNOSTIC_NAMES
+        artifact_parts = Path((artifact.name or "").replace("\\", "/")).parts
+        return (
+            artifact_name in PUBLISHABLE_DIAGNOSTIC_NAMES
+            or artifact_parts[:2] in {("results", "parent"), ("results", "child")}
+        )
+    if artifact.result_type is ResultType.CAMPAIGN:
+        return artifact_name in PUBLISHABLE_CAMPAIGN_NAMES
     return False
 
 

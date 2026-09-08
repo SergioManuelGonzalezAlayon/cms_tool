@@ -103,7 +103,7 @@ def test_validated_differential_staging_is_retained_by_request_id(tmp_path: Path
     _write_differential_firmware_payloads(request, runtime_dir, payloads)
 
     artifact = daemon._retain_staged_differential_firmware(request, runtime_dir)
-    retained = daemon.get_staged_firmware(request.request_id)
+    retained = daemon.get_current_differential_firmware()
 
     assert retained is not None
     assert retained.request is request
@@ -127,10 +127,125 @@ def test_differential_staging_is_not_retained_without_its_manifest(tmp_path: Pat
     with pytest.raises(RuntimeError, match="staging manifest is missing"):
         daemon._retain_staged_differential_firmware(request, runtime_dir)
 
-    assert daemon.get_staged_firmware(request.request_id) is None
+    assert daemon.get_current_differential_firmware() is None
 
 
-def test_diff_test_resolves_explicit_staging_id_without_single_variant_pointer(
+def test_staging_replacement_retains_only_one_current_stage_per_kind(tmp_path: Path) -> None:
+    daemon = CMSDaemon(
+        DaemonConfig(
+            runtime_root=tmp_path / "runtime-root",
+            artifacts_root=tmp_path / "artifacts",
+            bench_config=tmp_path / "bench.json",
+        )
+    )
+    normal_first, _ = _request_and_payloads()
+    normal_second, _ = _request_and_payloads()
+    normal_second.request_id = "normal-stage-002"
+    normal_first_dir = daemon.create_runtime_workspace("normal-stage-001")
+    normal_second_dir = daemon.create_runtime_workspace(normal_second.request_id)
+
+    daemon._retain_staged_normal_firmware(normal_first, normal_first_dir)
+    daemon._retain_staged_normal_firmware(normal_second, normal_second_dir)
+
+    assert daemon.last_firmware_request is normal_second
+    assert daemon.last_firmware_runtime_dir == normal_second_dir
+    assert not normal_first_dir.exists()
+    assert normal_second_dir.is_dir()
+
+    diff_first, _ = _request_and_payloads()
+    diff_second, _ = _request_and_payloads()
+    diff_second.request_id = "diff-stage-002"
+    diff_first_dir = daemon.create_runtime_workspace(diff_first.request_id)
+    diff_second_dir = daemon.create_runtime_workspace(diff_second.request_id)
+    for runtime_dir in (diff_first_dir, diff_second_dir):
+        manifest = runtime_dir / "firmware" / "manifest.json"
+        manifest.parent.mkdir()
+        manifest.write_text("{}", encoding="utf-8")
+
+    daemon._retain_staged_differential_firmware(diff_first, diff_first_dir)
+    daemon._retain_staged_differential_firmware(diff_second, diff_second_dir)
+
+    assert daemon.get_current_differential_firmware() is not None
+    assert daemon.get_current_differential_firmware().request is diff_second
+    assert not diff_first_dir.exists()
+    assert diff_second_dir.is_dir()
+
+
+def test_staged_view_reports_only_current_normal_and_differential_provenance(tmp_path: Path) -> None:
+    daemon = CMSDaemon(
+        DaemonConfig(
+            runtime_root=tmp_path / "runtime-root",
+            artifacts_root=tmp_path / "artifacts",
+            bench_config=tmp_path / "bench.json",
+        )
+    )
+    normal_request, _ = _request_and_payloads()
+    normal_request.firmware.board = "BRD4002A"
+    normal_request.firmware.device = "EFR32MG22"
+    normal_request.firmware.sisdk_version = "2026.12.0"
+    normal_dir = daemon.create_runtime_workspace("normal-stage")
+    daemon._retain_staged_normal_firmware(normal_request, normal_dir)
+
+    differential_request, _ = _request_and_payloads()
+    differential_request.differential_firmware.child.board = "BRD4002A"
+    differential_request.differential_firmware.child.device = "EFR32MG22"
+    differential_request.differential_firmware.parent.board = "BRD4002A"
+    differential_request.differential_firmware.parent.device = "EFR32MG22"
+    differential_dir = daemon.create_runtime_workspace(differential_request.request_id)
+    manifest = differential_dir / "firmware" / "manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text("{}", encoding="utf-8")
+    daemon._retain_staged_differential_firmware(differential_request, differential_dir)
+
+    payload = daemon.get_staged()
+    endpoint = next(
+        route.endpoint
+        for route in daemon.create_app().routes
+        if getattr(route, "path", "") == "/staged"
+    )
+
+    assert payload == endpoint()
+    assert set(payload) == {"normal", "differential"}
+    assert payload["normal"]["intended_use"] == "normal test execution"
+    assert payload["normal"]["target"] == {"board": "BRD4002A", "device": "EFR32MG22"}
+    assert payload["normal"]["sisdk"]["version"] == "2026.12.0"
+    assert payload["differential"]["intended_use"] == "differential parent/child comparison"
+    assert payload["differential"]["parent"]["firmware"]
+    assert payload["differential"]["child"]["firmware"]
+    assert "staging_id" not in payload["differential"]
+
+
+def test_failed_differential_stage_releases_its_candidate_without_replacing_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon = CMSDaemon(
+        DaemonConfig(
+            runtime_root=tmp_path / "runtime-root",
+            artifacts_root=tmp_path / "artifacts",
+            bench_config=tmp_path / "bench.json",
+        )
+    )
+    current_request, _ = _request_and_payloads()
+    current_dir = daemon.create_runtime_workspace(current_request.request_id)
+    manifest = current_dir / "firmware" / "manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text("{}", encoding="utf-8")
+    daemon._retain_staged_differential_firmware(current_request, current_dir)
+
+    candidate_request, candidate_payloads = _request_and_payloads()
+    candidate_request.request_id = "failed-diff-stage"
+    candidate_payloads.pop("differential_firmware.parent.xapi_file")
+    monkeypatch.setattr(daemon, "get_status", lambda: {})
+
+    result = daemon.stage_firmware(candidate_request, candidate_payloads)
+
+    assert result.state.value == "failed"
+    assert daemon.get_current_differential_firmware() is not None
+    assert current_dir.is_dir()
+    assert not (daemon.config.runtime_root / candidate_request.request_id).exists()
+
+
+def test_diff_test_uses_the_current_differential_stage_without_a_staging_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -161,7 +276,6 @@ def test_diff_test_resolves_explicit_staging_id_without_single_variant_pointer(
     result = daemon.start_staged_test(
         mode="diff",
         feature="beacon",
-        staging_id=request.request_id,
     )
 
     assert result.state.value == "accepted"
@@ -175,7 +289,7 @@ def test_diff_test_resolves_explicit_staging_id_without_single_variant_pointer(
     assert plan["jobs"]
 
 
-def test_diff_test_rejects_unknown_staging_id_before_starting(tmp_path: Path) -> None:
+def test_diff_test_rejects_when_no_current_differential_stage_exists(tmp_path: Path) -> None:
     daemon = CMSDaemon(
         DaemonConfig(
             runtime_root=tmp_path / "runtime-root",
@@ -187,8 +301,7 @@ def test_diff_test_rejects_unknown_staging_id_before_starting(tmp_path: Path) ->
     result = daemon.start_staged_test(
         mode="diff",
         feature="beacon",
-        staging_id="missing-stage",
     )
 
     assert result.state.value == "failed"
-    assert "unknown" in result.message
+    assert "SEND_FW --diff" in result.message

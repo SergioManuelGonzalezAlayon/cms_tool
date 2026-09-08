@@ -265,7 +265,6 @@ def record_last_measurement(
     config_name: str,
     run_name: str,
     variable_filters: tuple[VariableFilter, ...],
-    staging_id: str,
     endpoint: str,
 ) -> None:
     """Persist the locally recoverable identity of an accepted measurement."""
@@ -274,7 +273,7 @@ def record_last_measurement(
         return
     path = Path(config_path)
     if not path.is_file():
-        raise RuntimeError(f"CMS client config does not exist: {path}")
+        return
     config = _read_json_file(path)
     config["last_measurement"] = {
         "measurement_id": result.measurement_id,
@@ -286,7 +285,6 @@ def record_last_measurement(
             {"name": item.name, "value": item.value}
             for item in variable_filters
         ],
-        "staging_id": staging_id,
         "endpoint": endpoint,
         "submitted_at": datetime.utcnow().isoformat(),
     }
@@ -440,6 +438,11 @@ class CMSClient:
         payload = self._request_json("POST", "/firmware", payload)
         return measurement_result_from_dict(payload)
 
+    def get_staged(self) -> dict[str, Any]:
+        """Return the daemon's current normal and differential firmware stages."""
+
+        return self._request_json("GET", "/staged")
+
     def run_test(
         self,
         mode: MeasurementMode,
@@ -449,15 +452,9 @@ class CMSClient:
         variable_filters: tuple[VariableFilter, ...] = (),
         upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
-        staging_id: str = "",
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
 
-        staging_id = staging_id.strip()
-        if mode is MeasurementMode.DIFF and not staging_id:
-            raise RuntimeError("cms TEST --mode diff requires --staging-id")
-        if mode is not MeasurementMode.DIFF and staging_id:
-            raise RuntimeError("--staging-id is only valid with cms TEST --mode diff")
         config_hash = "" if feature == "all" else _validate_local_test_config(feature, config)
         payload = self._request_json(
             "POST",
@@ -474,7 +471,6 @@ class CMSClient:
                 "run_name": run_name,
                 "upload_results_to_database": upload_results_to_database,
                 "debug_artifact_streaming": debug_artifact_streaming,
-                "staging_id": staging_id,
             },
         )
         return measurement_result_from_dict(payload)
@@ -936,12 +932,17 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  2. cms status\n"
             "  3. cms tests\n"
             "  4. cms BUILD\n"
-            "  5. cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n"
+            "  5. cms SEND_FW\n"
             "  6. cms TEST --mode default --feature beacon --config-name default --preview\n"
             "  7. cms TEST --mode default --feature beacon --config-name default --out-dir artifacts\n"
             "  8. cms WATCH <measurement_id> --cursor <last_cursor>\n"
             "  9. cms CANCEL\n"
             " 10. cms ARTIFACTS <measurement_id> --out-dir artifacts\n\n"
+            "Differential workflow:\n"
+            "  cms HEALTH\n"
+            "  cms BUILD --diff\n"
+            "  cms SEND_FW --diff\n"
+            "  cms TEST --mode diff --feature beacon --verbose\n\n"
             "  cms RECIPES prints copy/paste command recipes for the common workflows.\n\n"
             "  cms EXIT_CODES documents stable script outcomes.\n\n"
             "  cms TROUBLESHOOT prints operator diagnostics for common failures.\n\n"
@@ -1067,12 +1068,14 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="send firmware and metadata to the bench",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Example:\n"
-            "  cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n\n"
+            "Examples:\n"
+            "  cms SEND_FW\n"
+            "  cms SEND_FW --diff\n\n"
             "Defaults:\n"
             "  Firmware images and sl_bt.xapi are discovered from the configured build root.\n\n"
             "Next:\n"
-            "  Run cms TEST --mode default --feature beacon --config-name default --preview before starting a test."
+            "  Run cms TEST --mode default --feature beacon --config-name default --preview before starting a test.\n"
+            "  After cms SEND_FW --diff, run cms TEST --mode diff --feature beacon --verbose."
         ),
     )
     _add_color_argument(send_fw)
@@ -1098,6 +1101,20 @@ def build_cli_parser() -> argparse.ArgumentParser:
     send_fw.add_argument("--build-root", default="", help="override firmware build root used for provenance")
     send_fw.add_argument("--requested-by", default="", help="request owner")
 
+    staged = subparsers.add_parser(
+        "staged",
+        aliases=["STAGED"],
+        help="show the current normal and differential firmware stages",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Read-only view:\n"
+            "  cms STAGED\n\n"
+            "Shows the one current normal stage and the one current differential stage, if present."
+        ),
+    )
+    _add_color_argument(staged)
+    _add_bench_endpoint_arguments(staged)
+
     test = subparsers.add_parser(
         "test",
         aliases=["TEST"],
@@ -1110,7 +1127,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms TEST --mode default --feature beacon --config-name dcdc --preview\n"
             "  cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview\n"
             "  cms TEST -m full_sweep -f beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
-            "  cms TEST --mode diff --feature all --staging-id <staging_id>\n\n"
+            "  cms TEST --mode diff --feature beacon --verbose\n\n"
             "Required options:\n"
             "  --mode, -m      default, full_sweep, or diff\n"
             "  --feature, -f  BLE feature name such as beacon, or all\n\n"
@@ -1148,11 +1165,6 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="BLE feature name, or all to select every available feature",
     )
     test.add_argument("--config-name", default="default", help="test config")
-    test.add_argument(
-        "--staging-id",
-        default="",
-        help="validated differential firmware staging ID; required with --mode diff",
-    )
     test.add_argument(
         "--variable",
         action="append",
@@ -1219,10 +1231,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  cms WATCH\n"
+            "  cms WATCH --reconnect\n"
             "  cms WATCH <measurement_id> --cursor 0\n"
             "  cms WATCH <measurement_id> --cursor <last_cursor> --verbose\n\n"
             "Defaults:\n"
             "  measurement_id omitted means attach to the active measurement.\n"
+            "  --reconnect resumes the last submitted measurement recorded locally.\n"
             "  --cursor 0 starts from the beginning of retained events.\n"
             "  --poll-interval 1.0\n\n"
             "Next:\n"
@@ -1231,6 +1245,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     _add_color_argument(watch)
     watch.add_argument("measurement_id", nargs="?", default="")
+    watch.add_argument(
+        "--reconnect",
+        action="store_true",
+        help="resume the last submitted measurement recorded in cms_client_config.json",
+    )
     watch.add_argument(
         "--cursor",
         type=_non_negative_int,
@@ -1401,7 +1420,7 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command == "health":
         report = client.get_health()
         print(f"{colors.state(report.state)}: {report.summary}")
-        print(f"endpoint: {client.base_url}")
+        _print_explicit_endpoint_selection(args, client)
         print(f"bench_id: {report.identity.bench_id}")
         if report.detected_identity is None:
             print("detected_dut_identity: unavailable")
@@ -1489,12 +1508,22 @@ def _main(argv: list[str] | None = None) -> int:
             else CMSCLIExitCode.SUCCESS
         )
 
+    if args.command in {"staged", "STAGED"}:
+        _print_explicit_endpoint_selection(args, client)
+        _print_staged_firmware(client.get_staged())
+        return CMSCLIExitCode.SUCCESS
+
     if args.command == "measurement":
         _print_measurement_result(client.get_measurement(args.measurement_id), colors=colors)
         return CMSCLIExitCode.SUCCESS
 
     if args.command in {"watch", "WATCH"}:
-        measurement_id = _resolve_watch_measurement_id(client, args.measurement_id)
+        measurement_id = _resolve_watch_measurement_id(
+            client,
+            args.measurement_id,
+            reconnect=args.reconnect,
+            config_path=args.config,
+        )
         state = _watch_remote_measurement(
             client,
             measurement_id,
@@ -1510,10 +1539,6 @@ def _main(argv: list[str] | None = None) -> int:
     if args.command in {"test", "TEST"}:
         _print_explicit_endpoint_selection(args, client)
         variable_filters = parse_variable_filters(args.variable)
-        if args.mode == MeasurementMode.DIFF.value and not args.staging_id.strip():
-            raise RuntimeError("cms TEST --mode diff requires --staging-id")
-        if args.mode != MeasurementMode.DIFF.value and args.staging_id.strip():
-            raise RuntimeError("--staging-id is only valid with cms TEST --mode diff")
         if args.feature == "all" and args.config_name != "default":
             raise RuntimeError("--feature all only supports the default config")
         if args.feature == "all" and variable_filters:
@@ -2023,6 +2048,45 @@ def _print_measurement_result(
         print(f"artifact {artifact.name}: {location}")
 
 
+def _print_staged_firmware(payload: dict[str, Any]) -> None:
+    """Render the read-only current-stage view without exposing stage IDs."""
+
+    for stage_name in ("normal", "differential"):
+        stage = payload.get(stage_name)
+        if not isinstance(stage, dict):
+            print(f"{stage_name}: none")
+            continue
+        print(f"{stage_name}: {stage.get('intended_use', '')}")
+        print(f"  created_at: {stage.get('created_at', '')}")
+        target = stage.get("target", {})
+        if isinstance(target, dict):
+            print(f"  target: {target.get('board', '')} {target.get('device', '')}".rstrip())
+        if stage_name == "differential":
+            for variant_name in ("parent", "child"):
+                variant = stage.get(variant_name, {})
+                if isinstance(variant, dict):
+                    _print_staged_firmware_variant(variant_name, variant)
+        else:
+            _print_staged_firmware_variant("firmware", stage)
+
+
+def _print_staged_firmware_variant(label: str, stage: dict[str, Any]) -> None:
+    sisdk = stage.get("sisdk", {})
+    if isinstance(sisdk, dict):
+        print(
+            f"  {label} SiSDK: {sisdk.get('version', '')} "
+            f"{sisdk.get('commit', '')}".rstrip()
+        )
+    firmware = stage.get("firmware", [])
+    if isinstance(firmware, list):
+        names = ", ".join(
+            f"{item.get('role', '')}={item.get('name', '')}"
+            for item in firmware
+            if isinstance(item, dict)
+        )
+        print(f"  {label} firmware: {names}")
+
+
 def _local_parameters_path(feature: str) -> Path:
     feature_name = feature.strip()
     if not feature_name:
@@ -2051,7 +2115,6 @@ def _run_test_feature(
         variable_filters=variable_filters,
         upload_results_to_database=args.upload_results_to_database,
         debug_artifact_streaming=args.debug,
-        staging_id=args.staging_id,
     )
     record_last_measurement(
         args.config,
@@ -2061,8 +2124,7 @@ def _run_test_feature(
         config_name=args.config_name,
         run_name=args.run_name,
         variable_filters=variable_filters,
-        staging_id=args.staging_id,
-        endpoint=client.base_url,
+        endpoint=getattr(client, "base_url", ""),
     )
     if not result.measurement_id:
         _print_measurement_result(result, colors=colors)
@@ -2387,8 +2449,38 @@ def _print_troubleshooting(topic: str = "all") -> None:
             print(f"  - {line}")
 
 
-def _resolve_watch_measurement_id(client: CMSClient, requested_measurement_id: str) -> str:
+def _resolve_watch_measurement_id(
+    client: CMSClient,
+    requested_measurement_id: str,
+    *,
+    reconnect: bool = False,
+    config_path: str | Path = CMS_CLIENT_CONFIG,
+) -> str:
+    """Resolve an explicit, active, or locally recovered measurement identity."""
+
     measurement_id = requested_measurement_id.strip()
+    if reconnect:
+        if measurement_id:
+            raise RuntimeError("cms WATCH --reconnect cannot be combined with a measurement ID")
+        config_file = Path(config_path)
+        if not config_file.is_file():
+            raise RuntimeError(
+                "cannot reconnect because the CMS client recovery record does not exist; "
+                "submit a test first or use cms WATCH <measurement_id>"
+            )
+        record = _read_json_file(config_file).get("last_measurement")
+        if not isinstance(record, dict) or not isinstance(record.get("measurement_id"), str):
+            raise RuntimeError(
+                "cannot reconnect because no submitted measurement is recorded; "
+                "submit a test first or use cms WATCH <measurement_id>"
+            )
+        measurement_id = record["measurement_id"].strip()
+        if not measurement_id:
+            raise RuntimeError(
+                "cannot reconnect because the recorded measurement ID is empty; "
+                "use cms WATCH <measurement_id>"
+            )
+        return measurement_id
     if measurement_id:
         return measurement_id
     measurement_id = client.get_active_measurement_id()

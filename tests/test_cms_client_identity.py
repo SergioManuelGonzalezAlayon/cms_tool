@@ -102,7 +102,7 @@ def test_health_command_prints_endpoint_and_detected_dut_identity(capsys, monkey
     assert cms_client.main(["--color", "never", "health"]) == 0
 
     output = capsys.readouterr().out
-    assert "endpoint: http://cms-bench-001:8000" in output
+    assert "endpoint: http://cms-bench-001:8000" not in output
     assert "bench_id: cms-bench-001" in output
     assert "detected_radio_board: BRD4182A Rev. B06 (serial 212300218)" in output
     assert "detected_target_device: EFR32MG22C224F512IM40-C" in output
@@ -335,7 +335,7 @@ def test_remote_workflow_commands_accept_named_and_one_shot_bench_selectors():
     build = parser.parse_args(["BUILD", "--diff", "--bench-id", "lab-a"])
     send_fw = parser.parse_args(["SEND_FW", "--bench-ip", "192.0.2.10"])
     test = parser.parse_args(
-        ["TEST", "--mode", "diff", "--feature", "beacon", "--staging-id", "stage-1", "--bench-id", "lab-a"]
+        ["TEST", "--mode", "diff", "--feature", "beacon", "--bench-id", "lab-a"]
     )
 
     assert build.bench_id == "lab-a"
@@ -491,7 +491,7 @@ def test_run_test_sends_requested_run_name_to_daemon():
     assert result.measurement_id == "generated-id"
 
 
-def test_run_diff_test_requires_and_sends_explicit_staging_id_to_daemon():
+def test_run_diff_test_uses_the_current_stage_without_sending_a_staging_id():
     captured = {}
     client = CMSClient.__new__(CMSClient)
 
@@ -501,13 +501,10 @@ def test_run_diff_test_requires_and_sends_explicit_staging_id_to_daemon():
 
     client._request_json = fake_request
 
-    with pytest.raises(RuntimeError, match="requires --staging-id"):
-        client.run_test(MeasurementMode.DIFF, "all")
-
-    client.run_test(MeasurementMode.DIFF, "all", staging_id="diff-stage-001")
+    client.run_test(MeasurementMode.DIFF, "all")
 
     assert captured["mode"] == "diff"
-    assert captured["staging_id"] == "diff-stage-001"
+    assert "staging_id" not in captured
 
 
 def test_run_all_features_does_not_send_a_single_config_hash():

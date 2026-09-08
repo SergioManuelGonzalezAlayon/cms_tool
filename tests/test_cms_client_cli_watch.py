@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from cms_client import (
     _print_measurement_summary,
     _print_verbose_event_page,
     _resolve_watch_measurement_id,
+    _watch_remote_measurement,
     build_cli_parser,
 )
 from cms_protocol import (
@@ -48,6 +50,7 @@ def test_cli_accepts_explicit_or_active_watch_and_explicit_artifacts() -> None:
         ["watch", MEASUREMENT_ID, "--cursor", "17", "--verbose", "--poll-interval", "2.5"]
     )
     active = parser.parse_args(["watch"])
+    reconnect = parser.parse_args(["watch", "--reconnect"])
     artifacts = parser.parse_args(["artifacts", MEASUREMENT_ID, "--out-dir", "downloads"])
     submitted = parser.parse_args(["test", "--mode", "default", "--feature", "beacon", "--verbose"])
 
@@ -56,6 +59,7 @@ def test_cli_accepts_explicit_or_active_watch_and_explicit_artifacts() -> None:
     assert explicit.verbose is True
     assert explicit.poll_interval == 2.5
     assert active.measurement_id == ""
+    assert reconnect.reconnect is True
     assert artifacts.measurement_id == MEASUREMENT_ID
     assert artifacts.out_dir == "downloads"
     assert submitted.verbose is True
@@ -81,6 +85,54 @@ def test_watch_resolution_prefers_explicit_id_and_discovers_active_measurement()
 
     with pytest.raises(RuntimeError, match="no active measurement"):
         _resolve_watch_measurement_id(Client(None), "")
+
+
+def test_watch_reconnect_resolves_only_the_persisted_measurement_id(tmp_path: Path) -> None:
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "last_measurement": {
+                    "measurement_id": "reconnect-measurement-001",
+                    "mode": "diff",
+                    "endpoint": "http://bench.example",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Client:
+        def get_active_measurement_id(self):
+            raise AssertionError("reconnect must not discover an active measurement")
+
+    assert _resolve_watch_measurement_id(
+        Client(),
+        "",
+        reconnect=True,
+        config_path=config_path,
+    ) == "reconnect-measurement-001"
+
+
+def test_watch_reconnect_rejects_missing_record_and_explicit_measurement_id(tmp_path: Path) -> None:
+    class Client:
+        def get_active_measurement_id(self):
+            return None
+
+    with pytest.raises(RuntimeError, match="recovery record does not exist"):
+        _resolve_watch_measurement_id(
+            Client(),
+            "",
+            reconnect=True,
+            config_path=tmp_path / "missing.json",
+        )
+    with pytest.raises(RuntimeError, match="cannot be combined"):
+        _resolve_watch_measurement_id(
+            Client(),
+            "explicit-measurement",
+            reconnect=True,
+            config_path=tmp_path / "missing.json",
+        )
 
 
 def test_concise_summary_shows_current_counts_and_failed_identities(capsys) -> None:
@@ -155,6 +207,22 @@ def test_verbose_display_preserves_console_source_and_lifecycle(capsys) -> None:
     assert "[stderr] warning" in output
     assert "[event] process_completed" in output
     assert timestamp.isoformat() in output
+
+
+def test_remote_watch_requests_live_events_only_with_verbose(monkeypatch) -> None:
+    callbacks = []
+
+    def fake_watch_measurement(client, state, **kwargs):
+        callbacks.append(kwargs["on_events"])
+        return state
+
+    monkeypatch.setattr(cms_client, "watch_measurement", fake_watch_measurement)
+
+    _watch_remote_measurement(object(), MEASUREMENT_ID, verbose=False)
+    _watch_remote_measurement(object(), MEASUREMENT_ID, verbose=True)
+
+    assert callbacks[0] is None
+    assert callbacks[1] is not None
 
 
 def test_watch_command_discovers_active_measurement_before_attaching(monkeypatch) -> None:

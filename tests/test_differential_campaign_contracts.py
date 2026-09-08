@@ -15,7 +15,7 @@ from cms_protocol import (
     ResultType,
     SuiteSelector,
 )
-from cmsd import CMSDaemon, DaemonConfig
+from cmsd import CMSDaemon, DaemonConfig, StagedDifferentialFirmware
 
 
 def _request() -> MeasurementRequest:
@@ -105,6 +105,58 @@ def test_daemon_retains_paired_plan_as_a_completed_measurement_artifact(tmp_path
     assert artifact.result_type is ResultType.CAMPAIGN
     assert artifact.path == execution_runtime / "results" / "paired_default_plan.json"
     assert artifact.path.read_text(encoding="utf-8") == '{"jobs": []}\n'
+
+
+def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_released(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    daemon = CMSDaemon(
+        DaemonConfig(
+            runtime_root=tmp_path / "runtime",
+            artifacts_root=tmp_path / "artifacts",
+            bench_config=tmp_path / "bench.json",
+        )
+    )
+    staging_dir = tmp_path / "staging"
+    manifest = staging_dir / "firmware" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}", encoding="utf-8")
+    stage = StagedDifferentialFirmware(request, staging_dir, manifest)
+    daemon.current_differential_firmware = stage
+
+    execution_dir = tmp_path / "execution"
+    plan_source = staging_dir / "firmware" / "paired_default_plan.json"
+    plan_source.write_text('{"jobs": []}\n', encoding="utf-8")
+    plan = daemon.retain_differential_plan_artifact(staging_dir, execution_dir)
+    inputs = daemon.retain_differential_comparison_inputs(request, execution_dir)
+    campaign = execution_dir / "results" / "differential_campaign.json"
+    campaign.write_text('{"run_order": ["parent", "child"]}\n', encoding="utf-8")
+    result = MeasurementResult(
+        measurement_id="completed-diff-001",
+        state=MeasurementState.PASSED,
+        artifacts=[
+            plan,
+            inputs,
+            Artifacts(
+                name="results/differential_campaign.json",
+                path=campaign,
+                result_type=ResultType.CAMPAIGN,
+            ),
+        ],
+    )
+
+    published = daemon.publish_results(result)
+
+    assert {artifact.name for artifact in published.artifacts} >= {
+        "results/paired_default_plan.json",
+        "results/differential_comparison_inputs.json",
+        "results/differential_campaign.json",
+    }
+    assert staging_dir.is_dir()
+    daemon._release_consumed_differential_stage(stage)
+    assert daemon.current_differential_firmware is None
+    assert not staging_dir.exists()
 
 
 def test_activate_differential_variant_materializes_a_normal_isolated_session(tmp_path: Path) -> None:
