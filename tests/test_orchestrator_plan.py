@@ -9,6 +9,7 @@ import pytest
 
 from cms_colors import ColorFormatter
 import test_orchestrator as orchestrator
+from utils.bgapi_utils import RETRYABLE_STARTUP_EXIT_CODE
 
 
 def _job(name: str) -> orchestrator.Job:
@@ -106,6 +107,105 @@ def test_main_writes_complete_plan_before_first_pytest_job(tmp_path, monkeypatch
         assert completed["result_type"] == "pytest_junit"
         assert datetime.fromisoformat(started["started_at"]).utcoffset().total_seconds() == 0
         assert datetime.fromisoformat(completed["finished_at"]).utcoffset().total_seconds() == 0
+
+
+def test_orchestrator_retries_only_retryable_startup_failures(tmp_path, monkeypatch):
+    jobs = [_job("first"), _job("second")]
+    results_log = tmp_path / "orchestrator_results.jsonl"
+    outcomes = iter([RETRYABLE_STARTUP_EXIT_CODE, RETRYABLE_STARTUP_EXIT_CODE, 0, 0])
+    executed = []
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: jobs)
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or next(outcomes), 0.01),
+    )
+
+    exit_code = orchestrator.main(["--results-log", str(results_log)])
+
+    assert exit_code == 0
+    assert executed == [jobs[0].job_id, jobs[0].job_id, jobs[0].job_id, jobs[1].job_id]
+    records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
+    assert [record["record_type"] for record in records] == [
+        "job_started",
+        "job_completed",
+        "job_started",
+        "job_completed",
+    ]
+
+
+def test_orchestrator_continues_after_exhausting_retryable_startup_retries(tmp_path, monkeypatch):
+    jobs = [_job("first"), _job("second")]
+    results_log = tmp_path / "orchestrator_results.jsonl"
+    outcomes = iter([RETRYABLE_STARTUP_EXIT_CODE] * 4 + [0])
+    executed = []
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: jobs)
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or next(outcomes), 0.01),
+    )
+
+    exit_code = orchestrator.main(["--results-log", str(results_log)])
+
+    assert exit_code == 1
+    assert executed == [
+        jobs[0].job_id,
+        jobs[0].job_id,
+        jobs[0].job_id,
+        jobs[0].job_id,
+        jobs[1].job_id,
+    ]
+    records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
+    assert [record["status"] for record in records] == [
+        "running",
+        "failed",
+        "running",
+        "passed",
+    ]
+
+
+def test_orchestrator_does_not_retry_ordinary_pytest_failures(tmp_path, monkeypatch):
+    job = _job("ordinary-failure")
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: [job])
+    calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path: (calls.append(job.job_id) or 1, 0.01),
+    )
+
+    exit_code = orchestrator.main(["--results-log", str(tmp_path / "results.jsonl")])
+
+    assert exit_code == 1
+    assert calls == [job.job_id]
+
+
+@pytest.mark.parametrize("mode", ["default", "one_factor", "full_sweep", "all"])
+def test_orchestrator_retries_startup_failures_in_every_mode(tmp_path, monkeypatch, mode):
+    job = replace(_job(mode), mode=mode)
+    build_modes = []
+    outcomes = iter([RETRYABLE_STARTUP_EXIT_CODE, 0])
+    executed = []
+
+    def fake_build_jobs(*args, **kwargs):
+        build_modes.append(kwargs["mode"])
+        return [job]
+
+    monkeypatch.setattr(orchestrator, "build_jobs", fake_build_jobs)
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or next(outcomes), 0.01),
+    )
+
+    exit_code = orchestrator.main(
+        ["--mode", mode, "--results-log", str(tmp_path / f"{mode}.jsonl")]
+    )
+
+    assert exit_code == 0
+    assert build_modes == [mode]
+    assert executed == [job.job_id, job.job_id]
 
 
 def test_resume_plan_keeps_jobs_that_execution_skips(tmp_path, monkeypatch):

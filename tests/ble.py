@@ -95,9 +95,21 @@ def open_ble_dev(dev,
             if attempt < open_retries and retry_sleep_s > 0:
                 sleep(retry_sleep_s)
 
+    if is_retryable_startup_event_timeout(last_error):
+        raise RetryableDeviceStartupError(last_error, open_retries) from last_error
+
     raise RuntimeError(
         f"Failed to open/reset BLE device after {open_retries} attempt(s)"
     ) from last_error
+
+
+def open_ble_dev_for_pytest(*args, **kwargs):
+    """Map retryable device startup failures to the orchestrator's pytest code."""
+
+    try:
+        return open_ble_dev(*args, **kwargs)
+    except RetryableDeviceStartupError as exc:
+        pytest.exit(str(exc), returncode=RETRYABLE_STARTUP_EXIT_CODE)
 
 
 def _match_pawr_advertiser_report(evt, dut_address, *, require_periodic_interval: bool) -> bool:
@@ -172,7 +184,7 @@ def BLEDev(EffectiveDevConfig):
 def DUT(BLEDev,
         JoulescopeDev):
     dut = BLEDev("dut")
-    yield open_ble_dev(
+    yield open_ble_dev_for_pytest(
         dut,
         wakeUp=JoulescopeDev,
         open_retries=DUT_OPEN_RETRIES,
@@ -182,7 +194,7 @@ def DUT(BLEDev,
 @pytest.fixture
 def Tester(BLEDev):
     tester = BLEDev("tester")
-    yield open_ble_dev(tester)
+    yield open_ble_dev_for_pytest(tester)
 
 @pytest.fixture
 def DUTLegAdvConfig(DUT,

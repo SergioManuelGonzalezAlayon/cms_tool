@@ -23,6 +23,7 @@ from cms_variable_filters import (
     parse_variable_filters,
     validate_variable_filters,
 )
+from utils.bgapi_utils import RETRYABLE_STARTUP_EXIT_CODE
 
 
 # This is an executable application module, not a pytest test module.
@@ -33,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 CONFIG_ROOT = REPO_ROOT / "tests" / "configs"
 RESULTS_DIR = REPO_ROOT / "artifacts" / "orchestrator"
 DEFAULT_RESULTS_LOG = RESULTS_DIR / "results.jsonl"
+TEST_RETRY_COUNT = 3
 
 
 @dataclass(frozen=True)
@@ -815,7 +817,24 @@ def main(argv: list[str] | None = None) -> int:
             results_log,
             job_started_record(job, ordinal, total_jobs, started_at, junit_path),
         )
+        retry_count = 0
         returncode, duration_s = run_job(job, pytest_args, junit_path)
+        while (
+            returncode == RETRYABLE_STARTUP_EXIT_CODE
+            and retry_count < TEST_RETRY_COUNT
+        ):
+            retry_count += 1
+            print(
+                colors.color(
+                    f"Retrying {ordinal}/{total_jobs}: {job.cfg_arg} "
+                    f"after retryable startup failure "
+                    f"({retry_count}/{TEST_RETRY_COUNT})",
+                    "warning",
+                )
+            )
+            retry_returncode, retry_duration_s = run_job(job, pytest_args, junit_path)
+            returncode = retry_returncode
+            duration_s += retry_duration_s
         finished_at = datetime.now(timezone.utc).isoformat()
         append_result(
             results_log,
