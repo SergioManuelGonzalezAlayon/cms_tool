@@ -253,7 +253,7 @@ def test_fresh_health_records_detected_bench_target_in_existing_client_config(tm
     target = json.loads(config_path.read_text(encoding="utf-8"))["target"]
     assert target == {
         "sisdk": "2026.1.0",
-        "board": "BRD4182A",
+        "board": "brd4182a",
         "board_rev": "B06",
         "device": "EFR32MG22C224F512IM40-C",
         "device_canonical": "EFR32MG22C224F512IM40",

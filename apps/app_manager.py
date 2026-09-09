@@ -268,17 +268,17 @@ def sdk_selection_provenance(selection: SDKSelection) -> dict[str, str]:
 
 
 def resolve_diff_sdk_selections(config: dict) -> dict[str, SDKSelection]:
-    """Resolve independently configured child and parent SDK packages for preflight."""
+    """Resolve independently configured version1 and version2 SDK packages for preflight."""
 
     diff = config.get("diff")
     if not isinstance(diff, dict):
         raise RuntimeError(
             "cms_client_config.json must contain a diff object with "
-            "sisdk_child_path and sisdk_parent_path"
+            "sisdk_version1_path and sisdk_version2_path"
         )
 
     selections: dict[str, SDKSelection] = {}
-    for variant in ("child", "parent"):
+    for variant in ("version1", "version2"):
         path = str(diff.get(f"sisdk_{variant}_path", "")).strip()
         if not path:
             raise RuntimeError(
@@ -671,7 +671,7 @@ def write_diff_fw_data(
         raise RuntimeError("cms_client_config.json target board, board_rev, and device are required for cms BUILD --diff")
 
     variants: dict[str, dict] = {}
-    for variant in ("child", "parent"):
+    for variant in ("version1", "version2"):
         variant_root = build_root / "diff" / variant
         manifest_path = variant_root / FW_DATA_FILENAME
         if not manifest_path.is_file():
@@ -805,7 +805,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--diff",
         action="store_true",
-        help="build configured parent and child SiSDK packages in isolated roots",
+        help="build configured version1 and version2 SiSDK packages in isolated roots",
     )
     parser.add_argument("--sisdk-version", default="", help="override selected SiSDK version")
     parser.add_argument("--build-root", default="", help="override firmware build root")
@@ -910,7 +910,7 @@ def build_diff_variants(
 
     if parsed.sdk_package_path:
         raise RuntimeError(
-            "cms BUILD --diff uses diff.sisdk_child_path and diff.sisdk_parent_path; "
+            "cms BUILD --diff uses diff.sisdk_version1_path and diff.sisdk_version2_path; "
             "do not pass --sdk-package-path"
         )
     if parsed.action == "clean":
@@ -929,7 +929,7 @@ def build_diff_variants(
             sort_keys=True,
         )
     )
-    for variant in ("child", "parent"):
+    for variant in ("version1", "version2"):
         selection = selections[variant]
         variant_values = vars(parsed).copy()
         variant_values.update(

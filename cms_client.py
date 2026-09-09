@@ -243,7 +243,7 @@ def refresh_and_record_bench_target(
         raise RuntimeError("cms_client_config.json target must be an object")
     target.update(
         {
-            "board": detected.radio_board_part_number,
+            "board": detected.radio_board_part_number.lower(),
             "board_rev": detected.radio_board_revision,
             "device": detected.target_device,
             "device_canonical": detected.canonical_target_device,
