@@ -2,8 +2,8 @@
 
 This module intentionally performs no network or CLI work.  It consumes the
 already downloaded ``results/parent`` and ``results/child`` artifact roots,
-then uses the retained paired job plan to supply the explicit DUT firmware
-role for every raw measurement result.
+then uses the retained paired job plan to supply the explicit partition and
+DUT firmware role for every raw measurement result.
 """
 
 from __future__ import annotations
@@ -42,6 +42,14 @@ class PairingIdentity:
     mode: str
     board: str
     device: str
+    firmware_role: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedJobIdentity:
+    """Plan-owned identity values absent from some raw result schemas."""
+
+    partition: str
     firmware_role: str
 
 
@@ -539,7 +547,7 @@ def pair_downloaded_differential_results(
     )
 
 
-def _load_firmware_roles(plan_path: Path) -> dict[tuple[str, str, str, str, str], str]:
+def _load_firmware_roles(plan_path: Path) -> dict[tuple[str, str, str, str], PlannedJobIdentity]:
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -551,24 +559,27 @@ def _load_firmware_roles(plan_path: Path) -> dict[tuple[str, str, str, str, str]
     if not isinstance(jobs, list):
         raise DifferentialPairingError("paired plan must contain a jobs list")
 
-    roles: dict[tuple[str, str, str, str, str], str] = {}
+    roles: dict[tuple[str, str, str, str], PlannedJobIdentity] = {}
     for index, job in enumerate(jobs, start=1):
         if not isinstance(job, dict):
             raise DifferentialPairingError(f"paired plan job {index} must be an object")
-        key = _plan_job_key(job, source=f"paired plan job {index}")
+        key = _plan_result_key(job, source=f"paired plan job {index}")
         role = _required_text(job, "firmware_role", source=f"paired plan job {index}")
         if key in roles:
             raise DifferentialPairingError(
-                f"paired plan has duplicate identity for firmware-role lookup: {key}"
+                f"paired plan has duplicate raw-result identity: {key}"
             )
-        roles[key] = role
+        roles[key] = PlannedJobIdentity(
+            partition=_text_or_empty(job, "partition", source=f"paired plan job {index}"),
+            firmware_role=role,
+        )
     return roles
 
 
 def _load_variant_results(
     variant: str,
     root: Path,
-    roles: dict[tuple[str, str, str, str, str], str],
+    roles: dict[tuple[str, str, str, str], PlannedJobIdentity],
 ) -> list[VariantResult]:
     if not root.is_dir():
         raise DifferentialPairingError(f"{variant} result root does not exist: {root}")
@@ -579,11 +590,19 @@ def _load_variant_results(
         if payload is None:
             continue
         result_key = _result_key(payload, source=str(path))
-        role = roles.get(result_key)
-        if role is None:
+        planned_identity = roles.get(result_key)
+        if planned_identity is None:
             raise DifferentialPairingError(
                 f"result does not match a paired-plan job: {path}"
             )
+        dataset = _required_object(payload, "dataset", source=str(path))
+        raw_partition = dataset.get("partition")
+        if raw_partition is not None:
+            observed_partition = _text_or_empty(dataset, "partition", source=str(path))
+            if observed_partition != planned_identity.partition:
+                raise DifferentialPairingError(
+                    f"{path} partition does not match its paired-plan job"
+                )
         firmware = _required_object(payload, "firmware", source=str(path))
         results.append(
             VariantResult(
@@ -593,11 +612,11 @@ def _load_variant_results(
                     feature=result_key[0],
                     config_path=result_key[1],
                     config_hash=result_key[2],
-                    partition=result_key[3],
-                    mode=result_key[4],
+                    partition=planned_identity.partition,
+                    mode=result_key[3],
                     board=_required_text(firmware, "board", source=str(path)),
                     device=_required_text(firmware, "device", source=str(path)),
-                    firmware_role=role,
+                    firmware_role=planned_identity.firmware_role,
                 ),
                 payload=payload,
             )
@@ -619,24 +638,22 @@ def _load_result_payload(path: Path) -> dict[str, Any] | None:
     return payload
 
 
-def _result_key(payload: dict[str, Any], *, source: str) -> tuple[str, str, str, str, str]:
+def _result_key(payload: dict[str, Any], *, source: str) -> tuple[str, str, str, str]:
     test_run = _required_object(payload, "test_run", source=source)
     dataset = _required_object(payload, "dataset", source=source)
     return (
         _required_text(test_run, "test_name", source=source),
         _normalised_path(_required_text(test_run, "config_path", source=source)),
         _required_text(test_run, "config_hash", source=source),
-        _text_or_empty(dataset, "partition", source=source),
         _required_text(dataset, "mode", source=source),
     )
 
 
-def _plan_job_key(job: dict[str, Any], *, source: str) -> tuple[str, str, str, str, str]:
+def _plan_result_key(job: dict[str, Any], *, source: str) -> tuple[str, str, str, str]:
     return (
         _required_text(job, "feature", source=source),
         _normalised_path(_required_text(job, "config_path", source=source)),
         _required_text(job, "config_hash", source=source),
-        _text_or_empty(job, "partition", source=source),
         _required_text(job, "mode", source=source),
     )
 

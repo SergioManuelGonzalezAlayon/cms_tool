@@ -16,7 +16,7 @@ from cms_diff_comparison import (
 )
 
 
-def _write_plan(path: Path, *, role: str = "dcdc") -> None:
+def _write_plan(path: Path, *, role: str = "dcdc", partition: str = "") -> None:
     path.write_text(
         json.dumps(
             {
@@ -25,7 +25,7 @@ def _write_plan(path: Path, *, role: str = "dcdc") -> None:
                         "feature": "beacon",
                         "config_path": "tests/configs/ble/beacon/default.json",
                         "config_hash": "config-sha256",
-                        "partition": "",
+                        "partition": partition,
                         "mode": "default",
                         "firmware_role": role,
                     }
@@ -73,6 +73,24 @@ def test_pairs_parent_and_child_by_stable_identity_not_filename_or_order(tmp_pat
     assert pairing.pairs[0].child.variant == "child"
     assert not pairing.unmatched_parent
     assert not pairing.unmatched_child
+
+
+def test_resolves_missing_result_partition_from_the_paired_plan(tmp_path: Path) -> None:
+    parent_root = tmp_path / "results" / "parent"
+    child_root = tmp_path / "results" / "child"
+    plan_path = tmp_path / "paired_default_plan.json"
+    _write_plan(plan_path, partition="dcdc")
+    parent_path = _write_result(parent_root, "parent.json")
+    child_path = _write_result(child_root, "child.json")
+    for path in (parent_path, child_path):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        del payload["dataset"]["partition"]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    pairing = pair_downloaded_differential_results(parent_root, child_root, plan_path)
+
+    assert len(pairing.pairs) == 1
+    assert pairing.pairs[0].identity.partition == "dcdc"
 
 
 def test_retains_a_missing_child_as_an_unmatched_parent_result(tmp_path: Path) -> None:
