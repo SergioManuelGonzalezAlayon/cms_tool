@@ -236,35 +236,35 @@ def _differential_variant(name: str, *, board: str = "brd4182a") -> FirmwareData
 
 def test_measurement_request_round_trip_preserves_named_differential_firmware() -> None:
     differential = DifferentialFirmwareData(
-        child=_differential_variant("child"),
-        parent=_differential_variant("parent"),
+        version1=_differential_variant("version1"),
+        version2=_differential_variant("version2"),
     )
     request = MeasurementRequest(
         request_id="diff-001",
         selector=SuiteSelector(mode="ble", feature="beacon"),
-        firmware=differential.child,
+        firmware=differential.version2,
         differential_firmware=differential,
     )
 
     payload = measurement_request_to_dict(request)
     parsed = measurement_request_from_dict(payload)
 
-    assert set(payload["differential_firmware"]) == {"child", "parent"}
+    assert set(payload["differential_firmware"]) == {"version1", "version2"}
     assert parsed.differential_firmware is not None
-    assert parsed.differential_firmware.child.sisdk_version == "child-sdk"
-    assert parsed.differential_firmware.parent.role_images[0].role == "dut_dcdc"
+    assert parsed.differential_firmware.version2.sisdk_version == "version2-sdk"
+    assert parsed.differential_firmware.version1.role_images[0].role == "dut_dcdc"
 
 
 def test_differential_firmware_rejects_missing_hashes_and_mismatched_targets() -> None:
-    child = _differential_variant("child")
-    child.dut_img.sha256 = ""
+    version2 = _differential_variant("version2")
+    version2.dut_img.sha256 = ""
     with pytest.raises(ValueError, match="image without sha256"):
-        DifferentialFirmwareData(child=child, parent=_differential_variant("parent"))
+        DifferentialFirmwareData(version1=_differential_variant("version1"), version2=version2)
 
     with pytest.raises(ValueError, match="targets do not match"):
         DifferentialFirmwareData(
-            child=_differential_variant("child", board="brd4182a"),
-            parent=_differential_variant("parent", board="brd4182b"),
+            version1=_differential_variant("version1", board="brd4182a"),
+            version2=_differential_variant("version2", board="brd4182b"),
         )
 
 

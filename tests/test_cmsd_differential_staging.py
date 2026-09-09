@@ -46,14 +46,14 @@ def _request_and_payloads() -> tuple[MeasurementRequest, dict[str, str]]:
             ),
         )
 
-    child = variant("child")
-    parent = variant("parent")
+    version1 = variant("version1")
+    version2 = variant("version2")
     return (
         MeasurementRequest(
             request_id="diff-stage-001",
             selector=SuiteSelector(mode="ble", feature="beacon"),
-            firmware=child,
-            differential_firmware=DifferentialFirmwareData(child=child, parent=parent),
+            firmware=version2,
+            differential_firmware=DifferentialFirmwareData(version1=version1, version2=version2),
         ),
         payloads,
     )
@@ -69,11 +69,11 @@ def test_differential_payloads_stage_atomically_in_isolated_variant_directories(
     _write_differential_firmware_payloads(request, runtime_dir, payloads)
 
     root = runtime_dir / "firmware"
-    assert (root / "child" / "roles" / "dut" / "ncp_ble_dut_dcdc" / "child__dut.s37").read_bytes() == b"child-dut"
-    assert (root / "parent" / "roles" / "tester" / "ncp_ble_tester" / "parent__tester.s37").read_bytes() == b"parent-tester"
-    assert (root / "child" / "xapi" / "child__sl_bt.xapi").read_bytes() == b"child-xapi"
+    assert (root / "version2" / "roles" / "dut" / "ncp_ble_dut_dcdc" / "version2__dut.s37").read_bytes() == b"version2-dut"
+    assert (root / "version1" / "roles" / "tester" / "ncp_ble_tester" / "version1__tester.s37").read_bytes() == b"version1-tester"
+    assert (root / "version2" / "xapi" / "version2__sl_bt.xapi").read_bytes() == b"version2-xapi"
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["variants"]["parent"]["sisdk_version"] == "parent-sdk"
+    assert manifest["variants"]["version1"]["sisdk_version"] == "version1-sdk"
     assert not list(runtime_dir.glob(".firmware-staging-*"))
 
 
@@ -81,9 +81,9 @@ def test_differential_staging_failure_does_not_publish_a_partial_pair(tmp_path: 
     request, payloads = _request_and_payloads()
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
-    payloads.pop("differential_firmware.parent.xapi_file")
+    payloads.pop("differential_firmware.version1.xapi_file")
 
-    with pytest.raises(RuntimeError, match="parent.xapi_file"):
+    with pytest.raises(RuntimeError, match="version1.xapi_file"):
         _write_differential_firmware_payloads(request, runtime_dir, payloads)
 
     assert not (runtime_dir / "firmware").exists()
@@ -187,10 +187,10 @@ def test_staged_view_reports_only_current_normal_and_differential_provenance(tmp
     daemon._retain_staged_normal_firmware(normal_request, normal_dir)
 
     differential_request, _ = _request_and_payloads()
-    differential_request.differential_firmware.child.board = "BRD4002A"
-    differential_request.differential_firmware.child.device = "EFR32MG22"
-    differential_request.differential_firmware.parent.board = "BRD4002A"
-    differential_request.differential_firmware.parent.device = "EFR32MG22"
+    differential_request.differential_firmware.version1.board = "BRD4002A"
+    differential_request.differential_firmware.version1.device = "EFR32MG22"
+    differential_request.differential_firmware.version2.board = "BRD4002A"
+    differential_request.differential_firmware.version2.device = "EFR32MG22"
     differential_dir = daemon.create_runtime_workspace(differential_request.request_id)
     manifest = differential_dir / "firmware" / "manifest.json"
     manifest.parent.mkdir()
@@ -209,9 +209,9 @@ def test_staged_view_reports_only_current_normal_and_differential_provenance(tmp
     assert payload["normal"]["intended_use"] == "normal test execution"
     assert payload["normal"]["target"] == {"board": "BRD4002A", "device": "EFR32MG22"}
     assert payload["normal"]["sisdk"]["version"] == "2026.12.0"
-    assert payload["differential"]["intended_use"] == "differential parent/child comparison"
-    assert payload["differential"]["parent"]["firmware"]
-    assert payload["differential"]["child"]["firmware"]
+    assert payload["differential"]["intended_use"] == "differential version1/version2 comparison"
+    assert payload["differential"]["version1"]["firmware"]
+    assert payload["differential"]["version2"]["firmware"]
     assert "staging_id" not in payload["differential"]
 
 
@@ -234,7 +234,7 @@ def test_failed_differential_stage_releases_its_candidate_without_replacing_curr
 
     candidate_request, candidate_payloads = _request_and_payloads()
     candidate_request.request_id = "failed-diff-stage"
-    candidate_payloads.pop("differential_firmware.parent.xapi_file")
+    candidate_payloads.pop("differential_firmware.version1.xapi_file")
     monkeypatch.setattr(daemon, "get_status", lambda: {})
 
     result = daemon.stage_firmware(candidate_request, candidate_payloads)

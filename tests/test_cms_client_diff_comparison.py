@@ -11,7 +11,7 @@ from cms_protocol import Artifacts, MeasurementResult, MeasurementState
 MEASUREMENT_ID = "diff-comparison-001"
 
 
-def _write_downloaded_diff_artifacts(out_dir: Path, *, child_current: float) -> list[Path]:
+def _write_downloaded_diff_artifacts(out_dir: Path, *, version2_current: float) -> list[Path]:
     plan = out_dir / "results" / "paired_default_plan.json"
     plan.parent.mkdir(parents=True)
     plan.write_text(
@@ -32,7 +32,7 @@ def _write_downloaded_diff_artifacts(out_dir: Path, *, child_current: float) -> 
         encoding="utf-8",
     )
     paths = [plan]
-    for variant, current in (("parent", 1.0), ("child", child_current)):
+    for variant, current in (("version1", 1.0), ("version2", version2_current)):
         path = out_dir / "results" / variant / "beacon.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -60,7 +60,7 @@ def _write_downloaded_diff_artifacts(out_dir: Path, *, child_current: float) -> 
     return paths
 
 
-def _install_diff_client(monkeypatch, out_dir: Path, *, child_current: float):
+def _install_diff_client(monkeypatch, out_dir: Path, *, version2_current: float):
     class Client:
         base_url = "http://bench.test"
 
@@ -77,7 +77,7 @@ def _install_diff_client(monkeypatch, out_dir: Path, *, child_current: float):
         def download_measurement_artifacts(self, measurement_id, requested_out_dir):
             assert measurement_id == MEASUREMENT_ID
             assert requested_out_dir == out_dir
-            return _write_downloaded_diff_artifacts(out_dir, child_current=child_current)
+            return _write_downloaded_diff_artifacts(out_dir, version2_current=version2_current)
 
     monkeypatch.setattr(cms_client, "CMSClient", lambda **kwargs: Client())
     monkeypatch.setattr(
@@ -92,7 +92,7 @@ def _install_diff_client(monkeypatch, out_dir: Path, *, child_current: float):
 def test_diff_client_saves_report_and_renders_table_after_successful_execution(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    _install_diff_client(monkeypatch, tmp_path, child_current=1.016)
+    _install_diff_client(monkeypatch, tmp_path, version2_current=1.016)
 
     exit_code = cms_client.main(
         ["test", "--mode", "diff", "--feature", "all", "--out-dir", str(tmp_path)]
@@ -101,13 +101,13 @@ def test_diff_client_saves_report_and_renders_table_after_successful_execution(
     output = capsys.readouterr().out
     assert exit_code == int(cms_client.CMSCLIExitCode.SUCCESS)
     assert (tmp_path / "diff_comparison.json").is_file()
-    assert "| Variable | Child | Parent | Delta (child-parent) | Percent | Status |" in output
+    assert "| Variable | Version2 | Version1 | Delta (version2-version1) | Percent | Status |" in output
 
 
 def test_diff_client_returns_regression_exit_code_after_successful_execution(
     tmp_path: Path, monkeypatch
 ) -> None:
-    _install_diff_client(monkeypatch, tmp_path, child_current=1.02)
+    _install_diff_client(monkeypatch, tmp_path, version2_current=1.02)
 
     exit_code = cms_client.main(
         ["test", "--mode", "diff", "--feature", "all", "--out-dir", str(tmp_path)]
@@ -119,7 +119,7 @@ def test_diff_client_returns_regression_exit_code_after_successful_execution(
 def test_diff_client_renders_the_saved_report_not_the_in_memory_report(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    _install_diff_client(monkeypatch, tmp_path, child_current=1.016)
+    _install_diff_client(monkeypatch, tmp_path, version2_current=1.016)
 
     def write_replaced_report(report, output_path):
         output_path.parent.mkdir(parents=True, exist_ok=True)

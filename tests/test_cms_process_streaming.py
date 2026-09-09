@@ -118,27 +118,27 @@ def test_managed_process_large_output_does_not_deadlock(tmp_path: Path) -> None:
 
 def test_managed_process_relays_variant_labelled_console_output(tmp_path: Path) -> None:
     local_events = MeasurementEventStream(
-        "measurement-123", MeasurementRuntimePaths.from_root(tmp_path / "parent")
+        "measurement-123", MeasurementRuntimePaths.from_root(tmp_path / "version1")
     )
     relay_events = MeasurementEventStream(
         "measurement-123", MeasurementRuntimePaths.from_root(tmp_path / "top-level")
     )
 
     completed = cms_bench._run_managed_process(
-        _fake_command("stdout:parent output", "stderr:parent error"),
+        _fake_command("stdout:version1 output", "stderr:version1 error"),
         cwd=Path("."),
-        stdout_path=tmp_path / "parent" / "stdout.log",
-        stderr_path=tmp_path / "parent" / "stderr.log",
+        stdout_path=tmp_path / "version1" / "stdout.log",
+        stderr_path=tmp_path / "version1" / "stderr.log",
         event_stream=local_events,
         relay_event_stream=relay_events,
-        relay_variant="parent",
+        relay_variant="version1",
     )
 
     assert completed.returncode == 0
     console_events = [event for event in relay_events.read_events() if event["type"] == "console"]
     assert {(event["source"], event["variant"]) for event in console_events} == {
-        ("stdout", "parent"),
-        ("stderr", "parent"),
+        ("stdout", "version1"),
+        ("stderr", "version1"),
     }
 
 
@@ -148,7 +148,7 @@ def test_independent_event_stream_writers_keep_cursors_strictly_increasing(tmp_p
     second = MeasurementEventStream("measurement-123", paths)
 
     first.append_lifecycle("differential_status")
-    second.append_console("stdout", "parent output\n", variant="parent")
+    second.append_console("stdout", "version1 output\n", variant="version1")
 
     assert [event["cursor"] for event in MeasurementEventStream("measurement-123", paths).read_events()] == [1, 2]
 

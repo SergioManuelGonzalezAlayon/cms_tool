@@ -114,7 +114,7 @@ def test_pytest_runtime_metadata_contains_measurement_identity(tmp_path, monkeyp
 
 
 def test_differential_session_validates_firmware_from_its_active_root(tmp_path, monkeypatch):
-    session = _session(tmp_path / "results" / "parent")
+    session = _session(tmp_path / "results" / "version1")
     active_root = tmp_path / "active"
     active_root.mkdir()
     session.active_firmware_dir = active_root
@@ -138,8 +138,8 @@ def test_differential_session_validates_firmware_from_its_active_root(tmp_path, 
 
 
 def test_setup_failure_retains_variant_status_summary_and_diagnostics(tmp_path, monkeypatch):
-    session = _session(tmp_path / "results" / "parent")
-    session.variant = "parent"
+    session = _session(tmp_path / "results" / "version1")
+    session.variant = "version1"
     bench = CMSBench()
     bench.initialized = True
     monkeypatch.setattr(bench, "test_smoke", lambda session: (_ for _ in ()).throw(RuntimeError("missing active DUT image")))
@@ -150,7 +150,7 @@ def test_setup_failure_retains_variant_status_summary_and_diagnostics(tmp_path, 
     run_summary = json.loads((session.runtime_dir / "cms_test_run.json").read_text(encoding="utf-8"))
     assert result.state is MeasurementState.FAILED
     assert result.message == "missing active DUT image"
-    assert setup_status["variant"] == "parent"
+    assert setup_status["variant"] == "version1"
     assert setup_status["phase"] == "validation"
     assert setup_status["pytest_launched"] is False
     assert setup_status["error"] == "missing active DUT image"
@@ -408,7 +408,7 @@ def test_bench_passes_variable_filters_to_orchestrator(tmp_path, monkeypatch):
 
 def test_bench_passes_frozen_plan_and_variant_to_generic_orchestrator(tmp_path, monkeypatch):
     session = _session(tmp_path, feature="all")
-    session.variant = "parent"
+    session.variant = "version1"
     session.job_plan_path = tmp_path / "paired_default_plan.json"
     captured = {}
 
@@ -425,7 +425,7 @@ def test_bench_passes_frozen_plan_and_variant_to_generic_orchestrator(tmp_path, 
     )
 
     assert _option_value(captured["command"], "--job-plan") == str(session.job_plan_path)
-    assert _option_value(captured["command"], "--variant") == "parent"
+    assert _option_value(captured["command"], "--variant") == "version1"
 
 
 def test_generic_runner_passes_campaign_active_root_to_runtime_preparation(tmp_path, monkeypatch):

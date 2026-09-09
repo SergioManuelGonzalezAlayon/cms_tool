@@ -180,6 +180,7 @@ class MeasurementEventStream:
         self._console_segments = _console_segment_paths(paths.console_events)
         self._console_segment_bytes = sum(path.stat().st_size for path in self._console_segments)
         self._cursor = EventCursor(_last_event_cursor(paths))
+        self._has_written = False
         self._oldest_retained_cursor = _first_console_cursor(self._console_segments)
         if self._oldest_retained_cursor == 0 and self._cursor.value:
             self._oldest_retained_cursor = 1
@@ -261,14 +262,17 @@ class MeasurementEventStream:
             os.replace(temporary_path, self.paths.status)
 
     def _next_record_locked(self, event_type: str, **details: Any) -> dict[str, Any]:
-        self._cursor = EventCursor(_last_event_cursor(self.paths))
-        return {
+        if not self._has_written:
+            self._cursor = EventCursor(_last_event_cursor(self.paths))
+            self._has_written = True
+        record = {
             **details,
             "measurement_id": self.measurement_id,
             "cursor": self._cursor.next().value,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": event_type,
         }
+        return record
     def _append_structured_locked(self, state: str, **details: Any) -> dict[str, Any]:
         record = self._next_record_locked("lifecycle", state=state, **details)
         self.paths.root.mkdir(parents=True, exist_ok=True)
@@ -353,11 +357,11 @@ class DifferentialCampaignSession:
     measurement_id: str
     staged_runtime_dir: Path
     execution_runtime_dir: Path
-    run_order: tuple[str, ...] = ("parent", "child")
+    run_order: tuple[str, ...] = ("version1", "version2")
 
     def __post_init__(self) -> None:
-        if self.run_order != ("parent", "child"):
-            raise ValueError("differential campaign run order must be parent then child")
+        if self.run_order != ("version1", "version2"):
+            raise ValueError("differential campaign run order must be version1 then version2")
 
     @property
     def active_root(self) -> Path:
@@ -663,7 +667,7 @@ class CMSBench:
         differential = request.differential_firmware
         if differential is None:
             raise RuntimeError("differential firmware was not supplied")
-        for variant_name, firmware in (("child", differential.child), ("parent", differential.parent)):
+        for variant_name, firmware in (("version1", differential.version1), ("version2", differential.version2)):
             if firmware.board and firmware.board.lower() != self.resources.board.lower():
                 raise RuntimeError(
                     f"{variant_name} firmware board {firmware.board} does not match bench board {self.resources.board}"
@@ -697,7 +701,7 @@ class CMSBench:
             session = BenchSession(
                 measurement_id=request.request_id,
                 runtime_dir=runtime_dir,
-                manifest=differential.child,
+                manifest=differential.version2,
                 request=request,
             )
             config_path = _requested_test_config_path(session)
@@ -759,7 +763,7 @@ class CMSBench:
     ) -> Path:
         """Create fresh per-pass metadata while retaining the one shared paired plan."""
 
-        if variant not in {"child", "parent"}:
+        if variant not in {"version1", "version2"}:
             raise RuntimeError(f"unknown differential firmware variant: {variant}")
         plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
         if not plan_path.is_file():
@@ -784,7 +788,7 @@ class CMSBench:
     def differential_variant_result_root(self, runtime_dir: Path, variant: str) -> Path:
         """Return the isolated result root for one side of a paired campaign."""
 
-        if variant not in {"child", "parent"}:
+        if variant not in {"version1", "version2"}:
             raise RuntimeError(f"unknown differential firmware variant: {variant}")
         result_root = runtime_dir / "results" / variant
         result_root.mkdir(parents=True, exist_ok=True)
@@ -800,11 +804,11 @@ class CMSBench:
     ) -> BenchSession:
         """Materialize one staged firmware set for the normal generic runner."""
 
-        if variant not in {"parent", "child"}:
+        if variant not in {"version1", "version2"}:
             raise RuntimeError(f"unknown differential firmware variant: {variant}")
         differential = request.differential_firmware
         if differential is None:
-            raise RuntimeError("differential variant activation requires parent and child firmware")
+            raise RuntimeError("differential variant activation requires version1 and version2 firmware")
         firmware = getattr(differential, variant)
         role_images = {item.project_name: item for item in firmware.role_images}
         required_projects = {"ncp_ble_dut_dcdc", "ncp_ble_dut", "ncp_ble_tester"}
@@ -879,12 +883,12 @@ class CMSBench:
         return record_path
 
     def record_differential_campaign_order(
-        self, runtime_dir: Path, order: tuple[str, ...] = ("parent", "child")
+        self, runtime_dir: Path, order: tuple[str, ...] = ("version1", "version2")
     ) -> Path:
         """Retain the paired-pass order and bench identity for reproducibility."""
 
-        if set(order) != {"parent", "child"}:
-            raise RuntimeError("differential campaign order must contain parent and child exactly once")
+        if set(order) != {"version1", "version2"}:
+            raise RuntimeError("differential campaign order must contain version1 and version2 exactly once")
         path = runtime_dir / "results" / "differential_campaign.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(

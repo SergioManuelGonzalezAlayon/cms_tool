@@ -43,14 +43,14 @@ def _differential_request() -> tuple[MeasurementRequest, dict[str, str]]:
             ),
         )
 
-    child = variant("child")
-    parent = variant("parent")
+    version1 = variant("version1")
+    version2 = variant("version2")
     return (
         MeasurementRequest(
             request_id="diff-payload-001",
             selector=SuiteSelector(mode="ble", feature="beacon"),
-            firmware=child,
-            differential_firmware=DifferentialFirmwareData(child=child, parent=parent),
+            firmware=version2,
+            differential_firmware=DifferentialFirmwareData(version1=version1, version2=version2),
         ),
         payloads,
     )
@@ -62,17 +62,17 @@ def test_differential_payloads_publish_only_a_complete_pair(tmp_path: Path) -> N
     _write_differential_firmware_payloads(request, tmp_path, payloads)
 
     root = tmp_path / "firmware"
-    assert (root / "child" / "roles" / "dut" / "ncp_ble_dut_dcdc" / "child-dut.s37").read_bytes() == b"child-dut"
-    assert (root / "parent" / "xapi" / "parent-sl_bt.xapi").read_bytes() == b"parent-xapi"
-    assert json.loads((root / "manifest.json").read_text(encoding="utf-8"))["variants"]["child"]["sisdk_version"] == ""
+    assert (root / "version2" / "roles" / "dut" / "ncp_ble_dut_dcdc" / "version2-dut.s37").read_bytes() == b"version2-dut"
+    assert (root / "version1" / "xapi" / "version1-sl_bt.xapi").read_bytes() == b"version1-xapi"
+    assert json.loads((root / "manifest.json").read_text(encoding="utf-8"))["variants"]["version2"]["sisdk_version"] == ""
     assert not list(tmp_path.glob(".firmware-staging-*"))
 
 
 def test_differential_payload_failure_does_not_publish_a_partial_pair(tmp_path: Path) -> None:
     request, payloads = _differential_request()
-    payloads.pop("differential_firmware.parent.xapi_file")
+    payloads.pop("differential_firmware.version1.xapi_file")
 
-    with pytest.raises(RuntimeError, match="parent.xapi_file"):
+    with pytest.raises(RuntimeError, match="version1.xapi_file"):
         _write_differential_firmware_payloads(request, tmp_path, payloads)
 
     assert not (tmp_path / "firmware").exists()
@@ -105,4 +105,4 @@ def test_differential_staging_validates_before_becoming_runnable(
     assert "bench validated" in result.message
     assert daemon.last_firmware_request is None
     assert validated == [(request, daemon.create_runtime_workspace(request.request_id))]
-    assert (daemon.create_runtime_workspace(request.request_id) / "firmware" / "child").is_dir()
+    assert (daemon.create_runtime_workspace(request.request_id) / "firmware" / "version2").is_dir()

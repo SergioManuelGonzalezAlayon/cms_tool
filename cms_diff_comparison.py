@@ -1,7 +1,7 @@
-"""Stable parent/child result pairing for CMS differential campaigns.
+"""Stable version1/version2 result pairing for CMS differential campaigns.
 
 This module intentionally performs no network or CLI work.  It consumes the
-already downloaded ``results/parent`` and ``results/child`` artifact roots,
+already downloaded ``results/version1`` and ``results/version2`` artifact roots,
 then uses the retained paired job plan to supply the explicit partition and
 DUT firmware role for every raw measurement result.
 """
@@ -33,7 +33,7 @@ class ComparisonStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class PairingIdentity:
-    """Stable identity for one parent/child measurement pair."""
+    """Stable identity for one version1/version2 measurement pair."""
 
     feature: str
     config_path: str
@@ -65,11 +65,11 @@ class VariantResult:
 
 @dataclass(frozen=True, slots=True)
 class ResultPair:
-    """The matching parent and child evidence for one stable identity."""
+    """The matching version1 and version2 evidence for one stable identity."""
 
     identity: PairingIdentity
-    parent: VariantResult
-    child: VariantResult
+    version1: VariantResult
+    version2: VariantResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,8 +77,8 @@ class PairingResult:
     """Complete pairing outcome, including evidence unavailable on one side."""
 
     pairs: tuple[ResultPair, ...]
-    unmatched_parent: tuple[VariantResult, ...]
-    unmatched_child: tuple[VariantResult, ...]
+    unmatched_version1: tuple[VariantResult, ...]
+    unmatched_version2: tuple[VariantResult, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,8 +98,8 @@ class ComparisonMetricInput:
 
     identity: PairingIdentity
     variable: str
-    parent_value: float
-    child_value: float
+    version1_value: float
+    version2_value: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,50 +198,50 @@ def prepare_comparison_inputs(pairing: PairingResult) -> ComparisonInputs:
     """Keep only comparable metrics and retain deterministic omission reasons."""
 
     diagnostics: list[ComparisonDiagnostic] = []
-    for result in pairing.unmatched_parent:
+    for result in pairing.unmatched_version1:
         diagnostics.append(
             ComparisonDiagnostic(
-                code="unmatched_parent_result",
-                message="no child result has the same stable identity",
-                variant="parent",
+                code="unmatched_version1_result",
+                message="no version2 result has the same stable identity",
+                variant="version1",
                 identity=result.identity,
             )
         )
-    for result in pairing.unmatched_child:
+    for result in pairing.unmatched_version2:
         diagnostics.append(
             ComparisonDiagnostic(
-                code="unmatched_child_result",
-                message="no parent result has the same stable identity",
-                variant="child",
+                code="unmatched_version2_result",
+                message="no version1 result has the same stable identity",
+                variant="version2",
                 identity=result.identity,
             )
         )
 
     metrics: list[ComparisonMetricInput] = []
     for pair in pairing.pairs:
-        parent_metrics = _extract_or_diagnose(pair.parent, diagnostics)
-        child_metrics = _extract_or_diagnose(pair.child, diagnostics)
-        if parent_metrics is None or child_metrics is None:
+        version1_metrics = _extract_or_diagnose(pair.version1, diagnostics)
+        version2_metrics = _extract_or_diagnose(pair.version2, diagnostics)
+        if version1_metrics is None or version2_metrics is None:
             continue
         for variable in _METRIC_FIELDS:
-            parent_reason = _metric_omission_reason(pair.parent.payload, variable)
-            child_reason = _metric_omission_reason(pair.child.payload, variable)
-            if parent_reason is not None:
-                diagnostics.append(_omission_diagnostic(pair.parent, variable, parent_reason))
-            if child_reason is not None:
-                diagnostics.append(_omission_diagnostic(pair.child, variable, child_reason))
-            if parent_reason is not None or child_reason is not None:
+            version1_reason = _metric_omission_reason(pair.version1.payload, variable)
+            version2_reason = _metric_omission_reason(pair.version2.payload, variable)
+            if version1_reason is not None:
+                diagnostics.append(_omission_diagnostic(pair.version1, variable, version1_reason))
+            if version2_reason is not None:
+                diagnostics.append(_omission_diagnostic(pair.version2, variable, version2_reason))
+            if version1_reason is not None or version2_reason is not None:
                 continue
-            parent_value = getattr(parent_metrics, variable)
-            child_value = getattr(child_metrics, variable)
-            if parent_value is None or child_value is None:
+            version1_value = getattr(version1_metrics, variable)
+            version2_value = getattr(version2_metrics, variable)
+            if version1_value is None or version2_value is None:
                 raise AssertionError("metric omission reason must exist for absent values")
             metrics.append(
                 ComparisonMetricInput(
                     identity=pair.identity,
                     variable=variable,
-                    parent_value=parent_value,
-                    child_value=child_value,
+                    version1_value=version1_value,
+                    version2_value=version2_value,
                 )
             )
     return ComparisonInputs(metrics=tuple(metrics), diagnostics=tuple(diagnostics))
@@ -264,14 +264,14 @@ def create_diff_comparison_report(
     for pair in pairing.pairs:
         entries: list[dict[str, Any]] = []
         for metric in sorted(metrics_by_identity.get(pair.identity, []), key=lambda item: item.variable):
-            percent = _percent_delta(metric.child_value, metric.parent_value)
+            percent = _percent_delta(metric.version2_value, metric.version1_value)
             status = _comparison_status(percent, thresholds)
             if percent is None:
                 diagnostics.append(
                     ComparisonDiagnostic(
-                        code="zero_parent_baseline",
+                        code="zero_version1_baseline",
                         message=(
-                            f"{metric.variable} percentage is unavailable because the parent value is zero"
+                            f"{metric.variable} percentage is unavailable because the version1 value is zero"
                         ),
                         variable=metric.variable,
                         identity=metric.identity,
@@ -280,9 +280,9 @@ def create_diff_comparison_report(
             entries.append(
                 {
                     "variable": metric.variable,
-                    "child": metric.child_value,
-                    "parent": metric.parent_value,
-                    "delta": metric.child_value - metric.parent_value,
+                    "version1": metric.version1_value,
+                    "version2": metric.version2_value,
+                    "delta": metric.version2_value - metric.version1_value,
                     "percent": percent,
                     "status": status.value,
                     "thresholds": {
@@ -295,8 +295,8 @@ def create_diff_comparison_report(
         pairs.append(
             {
                 "identity": _identity_to_dict(pair.identity),
-                "parent": _report_variant_input(pair.parent),
-                "child": _report_variant_input(pair.child),
+                "version1": _report_variant_input(pair.version1),
+                "version2": _report_variant_input(pair.version2),
                 "metrics": entries,
             }
         )
@@ -349,16 +349,16 @@ def render_diff_comparison_table(report: dict[str, Any]) -> str:
             (
                 _table_title(identity),
                 "",
-                "| Variable | Child | Parent | Delta (child-parent) | Percent | Status |",
+                "| Variable | Version2 | Version1 | Delta (version2-version1) | Percent | Status |",
                 "| --- | ---: | ---: | ---: | ---: | --- |",
             )
         )
         for metric in rows:
             tables.append(
-                "| {variable} | {child} | {parent} | {delta} | {percent} | {status} |".format(
+                "| {variable} | {version2} | {version1} | {delta} | {percent} | {status} |".format(
                     variable=metric["variable"],
-                    child=_format_number(metric.get("child")),
-                    parent=_format_number(metric.get("parent")),
+                    version2=_format_number(metric.get("version2")),
+                    version1=_format_number(metric.get("version1")),
                     delta=_format_number(metric.get("delta")),
                     percent=_format_percent(metric.get("percent")),
                     status=str(metric.get("status", "UNAVAILABLE")),
@@ -388,10 +388,10 @@ def _format_percent(value: Any) -> str:
     return f"{float(value):.3f}%"
 
 
-def _percent_delta(child_value: float, parent_value: float) -> float | None:
-    if parent_value == 0:
+def _percent_delta(version2_value: float, version1_value: float) -> float | None:
+    if version1_value == 0:
         return None
-    return 100 * (child_value - parent_value) / parent_value
+    return 100 * (version2_value - version1_value) / version1_value
 
 
 def _comparison_status(
@@ -507,43 +507,43 @@ def _optional_current(payload: dict[str, Any], field: str) -> float | None:
 
 
 def pair_downloaded_differential_results(
-    parent_root: Path,
-    child_root: Path,
+    version1_root: Path,
+    version2_root: Path,
     paired_plan_path: Path,
 ) -> PairingResult:
-    """Pair parent and child results from retained differential artifacts.
+    """Pair version1 and version2 results from retained differential artifacts.
 
     ``paired_plan_path`` is authoritative for the DUT firmware role.  Raw
     result filenames and their modification times are deliberately ignored.
     """
 
     roles = _load_firmware_roles(paired_plan_path)
-    parent_results = _load_variant_results("parent", parent_root, roles)
-    child_results = _load_variant_results("child", child_root, roles)
-    _raise_for_duplicate_identities(parent_results, "parent")
-    _raise_for_duplicate_identities(child_results, "child")
+    version1_results = _load_variant_results("version1", version1_root, roles)
+    version2_results = _load_variant_results("version2", version2_root, roles)
+    _raise_for_duplicate_identities(version1_results, "version1")
+    _raise_for_duplicate_identities(version2_results, "version2")
 
-    parents = {result.identity: result for result in parent_results}
-    children = {result.identity: result for result in child_results}
-    identities = sorted(set(parents) | set(children), key=_identity_sort_key)
+    version1_by_identity = {result.identity: result for result in version1_results}
+    version2_by_identity = {result.identity: result for result in version2_results}
+    identities = sorted(set(version1_by_identity) | set(version2_by_identity), key=_identity_sort_key)
 
     pairs: list[ResultPair] = []
-    unmatched_parent: list[VariantResult] = []
-    unmatched_child: list[VariantResult] = []
+    unmatched_version1: list[VariantResult] = []
+    unmatched_version2: list[VariantResult] = []
     for identity in identities:
-        parent = parents.get(identity)
-        child = children.get(identity)
-        if parent is not None and child is not None:
-            pairs.append(ResultPair(identity=identity, parent=parent, child=child))
-        elif parent is not None:
-            unmatched_parent.append(parent)
-        elif child is not None:
-            unmatched_child.append(child)
+        version1 = version1_by_identity.get(identity)
+        version2 = version2_by_identity.get(identity)
+        if version1 is not None and version2 is not None:
+            pairs.append(ResultPair(identity=identity, version1=version1, version2=version2))
+        elif version1 is not None:
+            unmatched_version1.append(version1)
+        elif version2 is not None:
+            unmatched_version2.append(version2)
 
     return PairingResult(
         pairs=tuple(pairs),
-        unmatched_parent=tuple(unmatched_parent),
-        unmatched_child=tuple(unmatched_child),
+        unmatched_version1=tuple(unmatched_version1),
+        unmatched_version2=tuple(unmatched_version2),
     )
 
 

@@ -287,10 +287,10 @@ class FirmwareData:
 
 @dataclass(frozen=True, slots=True)
 class DifferentialFirmwareData:
-    """The complete, independently provenanced child and parent firmware sets."""
+    """The complete, independently provenanced version1 and version2 firmware sets."""
 
-    child: FirmwareData
-    parent: FirmwareData
+    version1: FirmwareData
+    version2: FirmwareData
 
     def __post_init__(self) -> None:
         validate_differential_firmware(self)
@@ -875,26 +875,26 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
 def differential_firmware_to_dict(firmware: DifferentialFirmwareData) -> dict[str, Any]:
     validate_differential_firmware(firmware)
     return {
-        "child": firmware_data_to_dict(firmware.child),
-        "parent": firmware_data_to_dict(firmware.parent),
+        "version1": firmware_data_to_dict(firmware.version1),
+        "version2": firmware_data_to_dict(firmware.version2),
     }
 
 
 def differential_firmware_from_dict(data: dict[str, Any]) -> DifferentialFirmwareData:
-    child = data.get("child")
-    parent = data.get("parent")
-    if not isinstance(child, dict) or not isinstance(parent, dict):
-        raise ValueError("differential_firmware must contain child and parent firmware objects")
+    version1 = data.get("version1")
+    version2 = data.get("version2")
+    if not isinstance(version1, dict) or not isinstance(version2, dict):
+        raise ValueError("differential_firmware must contain version1 and version2 firmware objects")
     return DifferentialFirmwareData(
-        child=firmware_data_from_dict(child),
-        parent=firmware_data_from_dict(parent),
+        version1=firmware_data_from_dict(version1),
+        version2=firmware_data_from_dict(version2),
     )
 
 
 def validate_differential_firmware(firmware: DifferentialFirmwareData) -> None:
-    """Reject incomplete or ambiguous parent/child firmware sets before staging."""
+    """Reject incomplete or ambiguous version1/version2 firmware sets before staging."""
 
-    for variant_name, variant in (("child", firmware.child), ("parent", firmware.parent)):
+    for variant_name, variant in (("version1", firmware.version1), ("version2", firmware.version2)):
         required_images = [variant.dut_img, variant.tester_img, variant.xapi_file]
         required_images.extend(variant.dut_variants.values())
         required_images.extend(role_image.image for role_image in variant.role_images)
@@ -910,10 +910,10 @@ def validate_differential_firmware(firmware: DifferentialFirmwareData) -> None:
         project_names = [item.project_name for item in variant.role_images]
         if len(project_names) != len(set(project_names)):
             raise ValueError(f"differential {variant_name} firmware contains duplicate role project names")
-    child_target = (firmware.child.board, firmware.child.device)
-    parent_target = (firmware.parent.board, firmware.parent.device)
-    if all(child_target) and all(parent_target) and child_target != parent_target:
-        raise ValueError("differential child and parent firmware targets do not match")
+    version1_target = (firmware.version1.board, firmware.version1.device)
+    version2_target = (firmware.version2.board, firmware.version2.device)
+    if all(version1_target) and all(version2_target) and version1_target != version2_target:
+        raise ValueError("differential version1 and version2 firmware targets do not match")
 
 
 def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:

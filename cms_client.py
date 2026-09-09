@@ -334,8 +334,8 @@ def require_firmware_request_target_match(
         variants = (("firmware", request.firmware),)
     else:
         variants = (
-            ("differential child", request.differential_firmware.child),
-            ("differential parent", request.differential_firmware.parent),
+            ("differential version1", request.differential_firmware.version1),
+            ("differential version2", request.differential_firmware.version2),
         )
     comparisons: list[TargetIdentityComparison] = []
     mismatches: list[str] = []
@@ -1057,7 +1057,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         "--diff",
         action="store_true",
         help=(
-            "build configured parent and child SiSDK packages in isolated diff roots"
+            "build configured version1 and version2 SiSDK packages in isolated diff roots"
         ),
     )
     _add_bench_endpoint_arguments(build)
@@ -1084,7 +1084,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     send_fw.add_argument(
         "--diff",
         action="store_true",
-        help="stage the parent/child firmware pair from diff_fw_data.json",
+        help="stage the version1/version2 firmware pair from diff_fw_data.json",
     )
     send_fw.add_argument("--request-id", default="", help="firmware staging id")
     send_fw.add_argument("--dut-image", default="", help="DUT firmware path or URL")
@@ -1808,16 +1808,16 @@ def _request_from_diff_build_manifest(args: argparse.Namespace, build_root: Path
             role_images=tuple(item for item in all_role_images if item.role != "bootloader"),
         )
 
-    child = variant_firmware("child")
-    parent = variant_firmware("parent")
+    version1 = variant_firmware("version1")
+    version2 = variant_firmware("version2")
     request_id = args.request_id or f"cms-diff-{int(time.time())}"
     return MeasurementRequest(
         request_id=request_id,
         selector=SuiteSelector(mode="ble", feature="", config="default"),
-        firmware=child,
+        firmware=version2,
         mode=MeasurementMode.DIFF,
         requested_by=args.requested_by,
-        differential_firmware=DifferentialFirmwareData(child=child, parent=parent),
+        differential_firmware=DifferentialFirmwareData(version1=version1, version2=version2),
     )
 
 
@@ -2000,8 +2000,8 @@ def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
     payloads: dict[str, str] = {}
     if request.differential_firmware is not None:
         for variant_name, firmware in (
-            ("child", request.differential_firmware.child),
-            ("parent", request.differential_firmware.parent),
+            ("version1", request.differential_firmware.version1),
+            ("version2", request.differential_firmware.version2),
         ):
             for role_image in firmware.role_images:
                 path = Path(role_image.image.url)
@@ -2072,7 +2072,7 @@ def _print_staged_firmware(payload: dict[str, Any]) -> None:
         if isinstance(target, dict):
             print(f"  target: {target.get('board', '')} {target.get('device', '')}".rstrip())
         if stage_name == "differential":
-            for variant_name in ("parent", "child"):
+            for variant_name in ("version1", "version2"):
                 variant = stage.get(variant_name, {})
                 if isinstance(variant, dict):
                     _print_staged_firmware_variant(variant_name, variant)
@@ -2170,9 +2170,9 @@ def _create_and_render_diff_comparison(
     """Create client-side differential output only after physical execution passed."""
 
     plan_path = out_dir / "results" / "paired_default_plan.json"
-    parent_root = out_dir / "results" / "parent"
-    child_root = out_dir / "results" / "child"
-    required = (plan_path, parent_root, child_root)
+    version1_root = out_dir / "results" / "version1"
+    version2_root = out_dir / "results" / "version2"
+    required = (plan_path, version1_root, version2_root)
     if not all(path.exists() for path in required):
         missing = ", ".join(str(path) for path in required if not path.exists())
         print(f"differential comparison data is incomplete: missing {missing}", file=sys.stderr)
@@ -2182,7 +2182,7 @@ def _create_and_render_diff_comparison(
         return CMSCLIExitCode.COMPARISON_DATA_FAILURE
 
     try:
-        pairing = pair_downloaded_differential_results(parent_root, child_root, plan_path)
+        pairing = pair_downloaded_differential_results(version1_root, version2_root, plan_path)
         inputs = prepare_comparison_inputs(pairing)
         report = create_diff_comparison_report(pairing, inputs)
         report_path = write_diff_comparison_report(report, out_dir / "diff_comparison.json")

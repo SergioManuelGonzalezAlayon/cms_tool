@@ -878,7 +878,7 @@ def test_cms_orchestrator_keeps_variant_identity_out_of_pytest_arguments() -> No
             "--cms-fw-metadata",
             "cms_fw_metadata.json",
             "--variant",
-            "parent",
+            "version1",
         ]
     )
 

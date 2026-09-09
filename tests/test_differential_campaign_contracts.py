@@ -32,13 +32,13 @@ def _request() -> MeasurementRequest:
             ),
         )
 
-    child = variant("child")
-    parent = variant("parent")
+    version1 = variant("version1")
+    version2 = variant("version2")
     return MeasurementRequest(
         request_id="diff-contract-001",
         selector=SuiteSelector(mode="ble", feature="all"),
-        firmware=child,
-        differential_firmware=DifferentialFirmwareData(child=child, parent=parent),
+        firmware=version2,
+        differential_firmware=DifferentialFirmwareData(version1=version1, version2=version2),
     )
 
 
@@ -49,10 +49,10 @@ def test_paired_plan_metadata_and_records_are_variant_isolated(tmp_path: Path) -
     bench = CMSBench()
 
     plan_path = bench.build_differential_plan(request, runtime)
-    child_metadata = bench.prepare_differential_variant_metadata(request, runtime, "child")
-    parent_metadata = bench.prepare_differential_variant_metadata(request, runtime, "parent")
-    child_record = bench.record_differential_job(runtime, "child", {"job_id": "job-1", "returncode": 0})
-    parent_record = bench.record_differential_job(runtime, "parent", {"job_id": "job-1", "returncode": 1})
+    version1_metadata = bench.prepare_differential_variant_metadata(request, runtime, "version1")
+    version2_metadata = bench.prepare_differential_variant_metadata(request, runtime, "version2")
+    version1_record = bench.record_differential_job(runtime, "version1", {"job_id": "job-1", "returncode": 0})
+    version2_record = bench.record_differential_job(runtime, "version2", {"job_id": "job-1", "returncode": 1})
     campaign_path = bench.record_differential_campaign_order(runtime)
 
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -61,12 +61,12 @@ def test_paired_plan_metadata_and_records_are_variant_isolated(tmp_path: Path) -
     assert plan["record_type"] == "job_plan"
     assert plan["total_jobs"] == len(plan["jobs"])
     assert {"nodeid", "dut_slcp", "tester_slcp", "firmware_role"} <= set(plan["jobs"][0])
-    assert child_metadata.parent != parent_metadata.parent
-    assert json.loads(child_metadata.read_text(encoding="utf-8"))["variant"] == "child"
-    assert json.loads(parent_metadata.read_text(encoding="utf-8"))["variant"] == "parent"
-    assert json.loads(child_record.read_text(encoding="utf-8").splitlines()[0])["variant"] == "child"
-    assert json.loads(parent_record.read_text(encoding="utf-8").splitlines()[0])["returncode"] == 1
-    assert json.loads(campaign_path.read_text(encoding="utf-8"))["run_order"] == ["parent", "child"]
+    assert version1_metadata.parent != version2_metadata.parent
+    assert json.loads(version1_metadata.read_text(encoding="utf-8"))["variant"] == "version1"
+    assert json.loads(version2_metadata.read_text(encoding="utf-8"))["variant"] == "version2"
+    assert json.loads(version1_record.read_text(encoding="utf-8").splitlines()[0])["variant"] == "version1"
+    assert json.loads(version2_record.read_text(encoding="utf-8").splitlines()[0])["returncode"] == 1
+    assert json.loads(campaign_path.read_text(encoding="utf-8"))["run_order"] == ["version1", "version2"]
 
 
 def test_differential_plan_honors_the_submitted_feature_selector(tmp_path: Path) -> None:
@@ -84,19 +84,19 @@ def test_differential_plan_honors_the_submitted_feature_selector(tmp_path: Path)
     assert {job["feature"] for job in plan["jobs"]} == {"beacon"}
 
 
-def test_daemon_lists_parent_and_child_artifacts_without_cross_variant_loss(tmp_path: Path) -> None:
+def test_daemon_lists_version1_and_version2_artifacts_without_cross_variant_loss(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"
-    (runtime / "results" / "parent").mkdir(parents=True)
-    (runtime / "results" / "child").mkdir(parents=True)
-    (runtime / "results" / "parent" / "parent.json").write_text("{}", encoding="utf-8")
-    (runtime / "results" / "child" / "child.json").write_text("{}", encoding="utf-8")
+    (runtime / "results" / "version1").mkdir(parents=True)
+    (runtime / "results" / "version2").mkdir(parents=True)
+    (runtime / "results" / "version1" / "version1.json").write_text("{}", encoding="utf-8")
+    (runtime / "results" / "version2" / "version2.json").write_text("{}", encoding="utf-8")
     daemon = CMSDaemon(
         DaemonConfig(runtime_root=tmp_path / "daemon", artifacts_root=tmp_path / "artifacts", bench_config=tmp_path / "bench.json")
     )
 
     assert [artifact.name for artifact in daemon.differential_result_artifacts(runtime)] == [
-        "results/parent/parent.json",
-        "results/child/child.json",
+        "results/version1/version1.json",
+        "results/version2/version2.json",
     ]
 
 
@@ -149,7 +149,7 @@ def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_re
         execution_dir,
         [
             {
-                "variant": "parent",
+                "variant": "version1",
                 "state": "failed",
                 "phase": "validation",
                 "message": "missing active DUT image",
@@ -158,7 +158,7 @@ def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_re
         ],
     )
     campaign = execution_dir / "results" / "differential_campaign.json"
-    campaign.write_text('{"run_order": ["parent", "child"]}\n', encoding="utf-8")
+    campaign.write_text('{"run_order": ["version1", "version2"]}\n', encoding="utf-8")
     result = MeasurementResult(
         measurement_id="completed-diff-001",
         state=MeasurementState.PASSED,
@@ -193,8 +193,8 @@ def test_activate_differential_variant_materializes_a_normal_isolated_session(tm
     staged_runtime = tmp_path / "staged"
     execution_runtime = tmp_path / "execution"
     for variant_name, firmware in (
-        ("parent", request.differential_firmware.parent),
-        ("child", request.differential_firmware.child),
+        ("version1", request.differential_firmware.version1),
+        ("version2", request.differential_firmware.version2),
     ):
         no_dcdc = FirmwareImage(
             f"{variant_name}-no-dcdc.s37",
@@ -228,18 +228,18 @@ def test_activate_differential_variant_materializes_a_normal_isolated_session(tm
             staged_runtime_dir=staged_runtime,
             execution_runtime_dir=execution_runtime,
         ),
-        "parent",
+        "version1",
         cancel_event=Event(),
     )
 
-    assert session.variant == "parent"
-    assert session.runtime_dir == execution_runtime / "results" / "parent"
+    assert session.variant == "version1"
+    assert session.runtime_dir == execution_runtime / "results" / "version1"
     assert session.firmware_root == execution_runtime / "active"
     assert set(session.manifest.dut_variants) == {"dcdc", "no_dcdc"}
     active_root = execution_runtime / "active"
-    assert (active_root / "parent-dut.s37").is_file()
-    assert (active_root / "parent-no-dcdc.s37").is_file()
-    assert (active_root / "parent-tester.s37").is_file()
+    assert (active_root / "version1-dut.s37").is_file()
+    assert (active_root / "version1-no-dcdc.s37").is_file()
+    assert (active_root / "version1-tester.s37").is_file()
     assert not list(session.runtime_dir.glob("*.s37"))
 
 
@@ -250,10 +250,10 @@ def test_differential_campaign_session_owns_active_and_isolated_result_roots(tmp
         execution_runtime_dir=tmp_path / "execution",
     )
 
-    assert campaign.run_order == ("parent", "child")
+    assert campaign.run_order == ("version1", "version2")
     assert campaign.active_root == tmp_path / "execution" / "active"
-    assert campaign.result_root("parent") == tmp_path / "execution" / "results" / "parent"
-    assert campaign.result_root("child") == tmp_path / "execution" / "results" / "child"
+    assert campaign.result_root("version1") == tmp_path / "execution" / "results" / "version1"
+    assert campaign.result_root("version2") == tmp_path / "execution" / "results" / "version2"
 
 
 def test_variant_activation_reuses_active_root_without_overwriting_variant_evidence(tmp_path: Path) -> None:
@@ -263,7 +263,7 @@ def test_variant_activation_reuses_active_root_without_overwriting_variant_evide
         staged_runtime_dir=tmp_path / "staged",
         execution_runtime_dir=tmp_path / "execution",
     )
-    for variant_name, firmware in (("parent", request.differential_firmware.parent), ("child", request.differential_firmware.child)):
+    for variant_name, firmware in (("version1", request.differential_firmware.version1), ("version2", request.differential_firmware.version2)):
         no_dcdc = FirmwareImage(f"{variant_name}-no.s37", "", "hash")
         firmware.role_images = (*firmware.role_images, FirmwareRoleImage("dut_no_dcdc", "ncp_ble_dut", no_dcdc))
         for item in firmware.role_images:
@@ -275,14 +275,14 @@ def test_variant_activation_reuses_active_root_without_overwriting_variant_evide
         xapi.write_text(variant_name, encoding="utf-8")
 
     bench = CMSBench()
-    parent = bench.activate_differential_variant(request, campaign, "parent", cancel_event=Event())
-    (parent.runtime_dir / "parent-evidence.json").write_text("parent", encoding="utf-8")
-    child = bench.activate_differential_variant(request, campaign, "child", cancel_event=Event())
+    version1 = bench.activate_differential_variant(request, campaign, "version1", cancel_event=Event())
+    (version1.runtime_dir / "version1-evidence.json").write_text("version1", encoding="utf-8")
+    version2 = bench.activate_differential_variant(request, campaign, "version2", cancel_event=Event())
 
-    assert not (campaign.active_root / "parent-dut.s37").exists()
-    assert (campaign.active_root / "child-dut.s37").is_file()
-    assert (parent.runtime_dir / "parent-evidence.json").read_text(encoding="utf-8") == "parent"
-    assert child.runtime_dir == campaign.result_root("child")
+    assert not (campaign.active_root / "version1-dut.s37").exists()
+    assert (campaign.active_root / "version2-dut.s37").is_file()
+    assert (version1.runtime_dir / "version1-evidence.json").read_text(encoding="utf-8") == "version1"
+    assert version2.runtime_dir == campaign.result_root("version2")
 
 
 def test_differential_status_is_published_to_the_main_measurement_stream(tmp_path: Path) -> None:
@@ -298,7 +298,7 @@ def test_differential_status_is_published_to_the_main_measurement_stream(tmp_pat
 
     daemon._update_differential_status(
         measurement_id,
-        current_variant="parent",
+        current_variant="version1",
         completed_variants=0,
         current_test="beacon/default",
         passed_count=3,
@@ -308,31 +308,31 @@ def test_differential_status_is_published_to_the_main_measurement_stream(tmp_pat
     status = json.loads((daemon._runtime_workspace_path(measurement_id) / "current_status.json").read_text(encoding="utf-8"))
     events = (daemon._runtime_workspace_path(measurement_id) / "events.jsonl").read_text(encoding="utf-8")
     assert status["mode"] == "diff"
-    assert status["current_variant"] == "parent"
+    assert status["current_variant"] == "version1"
     assert status["completed_variants"] == 0
     assert "differential_status" in events
 
 
 def test_variant_prefixed_artifact_names_cannot_collide_when_published(tmp_path: Path) -> None:
     daemon = CMSDaemon(DaemonConfig(runtime_root=tmp_path / "runtime", artifacts_root=tmp_path / "artifacts", bench_config=tmp_path / "bench.json"))
-    parent = tmp_path / "runtime" / "results" / "parent" / "orchestrator_results.jsonl"
-    child = tmp_path / "runtime" / "results" / "child" / "orchestrator_results.jsonl"
-    parent.parent.mkdir(parents=True)
-    child.parent.mkdir(parents=True)
-    parent.write_text("parent\n", encoding="utf-8")
-    child.write_text("child\n", encoding="utf-8")
+    version1 = tmp_path / "runtime" / "results" / "version1" / "orchestrator_results.jsonl"
+    version2 = tmp_path / "runtime" / "results" / "version2" / "orchestrator_results.jsonl"
+    version1.parent.mkdir(parents=True)
+    version2.parent.mkdir(parents=True)
+    version1.write_text("version1\n", encoding="utf-8")
+    version2.write_text("version2\n", encoding="utf-8")
     result = MeasurementResult(
         measurement_id="diff-artifacts-001",
         state=MeasurementState.PASSED,
         artifacts=[
-            Artifacts(name="results/parent/orchestrator_results.jsonl", path=parent),
-            Artifacts(name="results/child/orchestrator_results.jsonl", path=child),
+            Artifacts(name="results/version1/orchestrator_results.jsonl", path=version1),
+            Artifacts(name="results/version2/orchestrator_results.jsonl", path=version2),
         ],
     )
 
     published = daemon.publish_results(result)
 
     assert [artifact.name for artifact in published.artifacts[:2]] == [
-        "results/parent/orchestrator_results.jsonl",
-        "results/child/orchestrator_results.jsonl",
+        "results/version1/orchestrator_results.jsonl",
+        "results/version2/orchestrator_results.jsonl",
     ]

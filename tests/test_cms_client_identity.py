@@ -321,11 +321,11 @@ def test_differential_firmware_target_check_names_the_mismatched_variant():
         device="EFR32MG24B220F1536IM48",
     )
     request = SimpleNamespace(
-        differential_firmware=SimpleNamespace(child=matching, parent=mismatching),
+        differential_firmware=SimpleNamespace(version1=matching, version2=mismatching),
         firmware=matching,
     )
 
-    with pytest.raises(RuntimeError, match="differential parent"):
+    with pytest.raises(RuntimeError, match="differential version2"):
         require_firmware_request_target_match(detected, request)
 
 
@@ -435,8 +435,8 @@ def test_diff_build_passes_preflight_flag_without_rewriting_normal_sdk_config(tm
             {
                 "target": {"sisdk": "unchanged"},
                 "diff": {
-                    "sisdk_child_path": "child-sdk",
-                    "sisdk_parent_path": "parent-sdk",
+                    "sisdk_version2_path": "version2-sdk",
+                    "sisdk_version1_path": "version1-sdk",
                 },
             }
         ),
@@ -959,7 +959,7 @@ def test_differential_request_rejects_bin_firmware_manifest(tmp_path) -> None:
     build_root = tmp_path / "fw"
     build_root.mkdir()
     variants = {}
-    for name in ("parent", "child"):
+    for name in ("version1", "version2"):
         variants[name] = {
             "manifest": {
                 "firmware": {

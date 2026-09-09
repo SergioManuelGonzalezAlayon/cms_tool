@@ -170,7 +170,7 @@ class DaemonFiles:
 
 @dataclass(frozen=True, slots=True)
 class StagedDifferentialFirmware:
-    """The one complete validated parent/child pair retained for this bench."""
+    """The one complete validated version1/version2 pair retained for this bench."""
 
     request: MeasurementRequest
     runtime_dir: Path
@@ -772,10 +772,10 @@ class CMSDaemon:
             shutil.rmtree(runtime_dir, ignore_errors=True)
 
     def differential_result_artifacts(self, runtime_dir: Path) -> list[Artifacts]:
-        """Expose retained parent and child raw evidence independently."""
+        """Expose retained version1 and version2 raw evidence independently."""
 
         artifacts: list[Artifacts] = []
-        for variant in ("parent", "child"):
+        for variant in ("version1", "version2"):
             result_root = runtime_dir / "results" / variant
             if not result_root.is_dir():
                 continue
@@ -812,7 +812,7 @@ class CMSDaemon:
         request: MeasurementRequest,
         execution_runtime_dir: Path,
     ) -> Artifacts:
-        """Retain the parent/child provenance required for client-side pairing."""
+        """Retain the version1/version2 provenance required for client-side pairing."""
 
         destination = execution_runtime_dir / "results" / "differential_comparison_inputs.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -820,7 +820,7 @@ class CMSDaemon:
             json.dumps(
                 {
                     "measurement_request": measurement_request_to_dict(request),
-                    "delta_convention": "child - parent",
+                    "delta_convention": "version2 - version1",
                 },
                 indent=2,
             )
@@ -1094,7 +1094,7 @@ class CMSDaemon:
             if request.mode is not MeasurementMode.DIFF:
                 raise ValueError("differential staging requires diff measurement mode")
             if request.differential_firmware is None:
-                raise ValueError("differential staging requires parent and child firmware")
+                raise ValueError("differential staging requires version1 and version2 firmware")
             if staged_runtime_dir != differential_staging.runtime_dir:
                 raise ValueError("differential staging runtime workspace does not match selection")
 
@@ -1182,7 +1182,7 @@ class CMSDaemon:
         runtime_dir: Path,
         staging: StagedDifferentialFirmware,
     ) -> MeasurementResult:
-        """Run parent then child through the normal Bench runner with isolated evidence."""
+        """Run version1 then version2 through the normal Bench runner with isolated evidence."""
 
         started_at = self.measurements[request.request_id].started_at
         artifacts: list[Artifacts] = []
@@ -1200,8 +1200,8 @@ class CMSDaemon:
             self.bench.validate_differential_firmware(staging.request, staging.runtime_dir)
             artifacts.append(self.retain_differential_plan_artifact(staging.runtime_dir, runtime_dir))
             artifacts.append(self.retain_differential_comparison_inputs(request, runtime_dir))
-            self._update_measurement(request.request_id, MeasurementState.RUNNING, 50, "running parent differential pass")
-            for index, variant in enumerate(("parent", "child"), start=1):
+            self._update_measurement(request.request_id, MeasurementState.RUNNING, 50, "running version1 differential pass")
+            for index, variant in enumerate(("version1", "version2"), start=1):
                 self._raise_if_cancelled(request.request_id)
                 self._update_differential_status(
                     request.request_id,
@@ -1247,10 +1247,10 @@ class CMSDaemon:
                         max_console_bytes=self.config.max_console_event_bytes,
                     ).append_lifecycle("differential_setup_failure", **pass_record)
                 if index == 1:
-                    self._update_measurement(request.request_id, MeasurementState.RUNNING, 75, "running child differential pass")
+                    self._update_measurement(request.request_id, MeasurementState.RUNNING, 75, "running version2 differential pass")
                     self._update_differential_status(
                         request.request_id,
-                        current_variant="child",
+                        current_variant="version2",
                         completed_variants=1,
                         passed_count=sum(item.state is MeasurementState.PASSED for item in pass_results),
                         failed_count=sum(item.state is not MeasurementState.PASSED for item in pass_results),
@@ -1267,7 +1267,7 @@ class CMSDaemon:
             state = MeasurementState.PASSED if all(item.state is MeasurementState.PASSED for item in pass_results) else MeasurementState.FAILED
             failed_records = [record for record in pass_records if record["state"] != MeasurementState.PASSED.value]
             message = (
-                "differential parent and child passes completed"
+                "differential version1 and version2 passes completed"
                 if not failed_records
                 else "; ".join(
                     f"{record['variant']} failed during {record['phase']}: {record['message']}"
@@ -2050,24 +2050,24 @@ def _staged_firmware_summary(
 
 
 def _staged_differential_firmware_summary(request: MeasurementRequest) -> dict[str, Any]:
-    """Serialize the one current parent/child stage for the operator view."""
+    """Serialize the one current version1/version2 stage for the operator view."""
 
     differential = request.differential_firmware
     if differential is None:
         raise RuntimeError("current differential stage is missing differential firmware")
-    child_request = measurement_request_from_dict(measurement_request_to_dict(request))
-    child_request.firmware = differential.child
-    parent_request = measurement_request_from_dict(measurement_request_to_dict(request))
-    parent_request.firmware = differential.parent
+    version1_request = measurement_request_from_dict(measurement_request_to_dict(request))
+    version1_request.firmware = differential.version1
+    version2_request = measurement_request_from_dict(measurement_request_to_dict(request))
+    version2_request.firmware = differential.version2
     return {
-        "intended_use": "differential parent/child comparison",
+        "intended_use": "differential version1/version2 comparison",
         "created_at": request.identity.created_at.isoformat() if request.identity else "",
         "target": {
-            "board": differential.child.board,
-            "device": differential.child.device,
+            "board": differential.version1.board,
+            "device": differential.version1.device,
         },
-        "parent": _staged_firmware_summary(parent_request, intended_use="parent baseline"),
-        "child": _staged_firmware_summary(child_request, intended_use="child under test"),
+        "version1": _staged_firmware_summary(version1_request, intended_use="version1 baseline"),
+        "version2": _staged_firmware_summary(version2_request, intended_use="version2 under test"),
     }
 
 
@@ -2083,7 +2083,7 @@ def _is_publishable_final_artifact(artifact: Artifacts) -> bool:
         artifact_parts = Path((artifact.name or "").replace("\\", "/")).parts
         return (
             artifact_name in PUBLISHABLE_DIAGNOSTIC_NAMES
-            or artifact_parts[:2] in {("results", "parent"), ("results", "child")}
+            or artifact_parts[:2] in {("results", "version1"), ("results", "version2")}
         )
     if artifact.result_type is ResultType.CAMPAIGN:
         return artifact_name in PUBLISHABLE_CAMPAIGN_NAMES
@@ -2188,7 +2188,7 @@ def _write_differential_firmware_payloads(
     runtime_dir: Path,
     image_payloads: dict[str, str],
 ) -> None:
-    """Publish a complete parent/child payload pair only after every asset is present."""
+    """Publish a complete version1/version2 payload pair only after every asset is present."""
 
     differential = request.differential_firmware
     if differential is None:
@@ -2201,7 +2201,7 @@ def _write_differential_firmware_payloads(
     temporary_root = Path(tempfile.mkdtemp(prefix=".firmware-staging-", dir=runtime_dir))
     try:
         staged_root = temporary_root / "firmware"
-        for variant_name, firmware in (("child", differential.child), ("parent", differential.parent)):
+        for variant_name, firmware in (("version1", differential.version1), ("version2", differential.version2)):
             for role_image in firmware.role_images:
                 role = role_image.role
                 project_name = role_image.project_name
@@ -2264,7 +2264,7 @@ def _write_differential_payload(
 def _validate_differential_asset_names(differential: Any) -> None:
     """Keep each variant's staged filenames unambiguous before any files are written."""
 
-    for variant_name, firmware in (("child", differential.child), ("parent", differential.parent)):
+    for variant_name, firmware in (("version1", differential.version1), ("version2", differential.version2)):
         images = [role_image.image for role_image in firmware.role_images]
         if firmware.xapi_file is not None:
             images.append(firmware.xapi_file)

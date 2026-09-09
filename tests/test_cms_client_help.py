@@ -56,16 +56,16 @@ def test_staged_help_and_output_expose_only_the_current_operator_view(capsys):
         {
             "normal": None,
             "differential": {
-                "intended_use": "differential parent/child comparison",
+                "intended_use": "differential version1/version2 comparison",
                 "created_at": "2026-09-08T10:00:00+00:00",
                 "target": {"board": "BRD4002A", "device": "EFR32MG22"},
-                "parent": {
-                    "sisdk": {"version": "2026.12.0", "commit": "parent"},
-                    "firmware": [{"role": "dut", "name": "parent.s37"}],
+                "version1": {
+                    "sisdk": {"version": "2026.12.0", "commit": "version1"},
+                    "firmware": [{"role": "dut", "name": "version1.s37"}],
                 },
-                "child": {
-                    "sisdk": {"version": "2026.13.0", "commit": "child"},
-                    "firmware": [{"role": "dut", "name": "child.s37"}],
+                "version2": {
+                    "sisdk": {"version": "2026.13.0", "commit": "version2"},
+                    "firmware": [{"role": "dut", "name": "version2.s37"}],
                 },
             },
         }
@@ -73,9 +73,9 @@ def test_staged_help_and_output_expose_only_the_current_operator_view(capsys):
     output = capsys.readouterr().out
 
     assert "normal: none" in output
-    assert "differential: differential parent/child comparison" in output
-    assert "parent firmware: dut=parent.s37" in output
-    assert "child firmware: dut=child.s37" in output
+    assert "differential: differential version1/version2 comparison" in output
+    assert "version1 firmware: dut=version1.s37" in output
+    assert "version2 firmware: dut=version2.s37" in output
     assert "staging_id" not in output
 
 

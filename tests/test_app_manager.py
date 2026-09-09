@@ -200,8 +200,8 @@ def test_resolve_diff_sdk_selections_records_each_variant_provenance(
         (sdk / ".properties").write_text(f"version={version}\n", encoding="utf-8")
         return sdk
 
-    child = make_sdk("child", "2026.1.0")
-    parent = make_sdk("parent", "2025.12.3")
+    version1 = make_sdk("version1", "2025.12.3")
+    version2 = make_sdk("version2", "2026.1.0")
     monkeypatch.setattr(
         app_manager,
         "_sdk_git_commit",
@@ -211,32 +211,32 @@ def test_resolve_diff_sdk_selections_records_each_variant_provenance(
     selections = app_manager.resolve_diff_sdk_selections(
         {
             "diff": {
-                "sisdk_child_path": str(child),
-                "sisdk_parent_path": str(parent),
+                "sisdk_version1_path": str(version1),
+                "sisdk_version2_path": str(version2),
             }
         }
     )
 
-    assert selections["child"].version == "2026.1.0"
-    assert selections["child"].source == "client_config_diff_child_path"
-    assert app_manager.sdk_selection_provenance(selections["child"]) == {
-        "source": "client_config_diff_child_path",
+    assert selections["version2"].version == "2026.1.0"
+    assert selections["version2"].source == "client_config_diff_version2_path"
+    assert app_manager.sdk_selection_provenance(selections["version2"]) == {
+        "source": "client_config_diff_version2_path",
         "version": "2026.1.0",
-        "package_path": str(child.resolve()),
-        "commit": "commit-child",
-        "hash": "commit-child",
-        "xapi_path": str(child / app_manager.SL_BT_XAPI_PATH),
-        "xapi_sha256": app_manager._sha256(child / app_manager.SL_BT_XAPI_PATH),
+        "package_path": str(version2.resolve()),
+        "commit": "commit-version2",
+        "hash": "commit-version2",
+        "xapi_path": str(version2 / app_manager.SL_BT_XAPI_PATH),
+        "xapi_sha256": app_manager._sha256(version2 / app_manager.SL_BT_XAPI_PATH),
     }
-    assert selections["parent"].version == "2025.12.3"
-    assert selections["parent"].xapi_path == parent / app_manager.SL_BT_XAPI_PATH
+    assert selections["version1"].version == "2025.12.3"
+    assert selections["version1"].xapi_path == version1 / app_manager.SL_BT_XAPI_PATH
 
 
 @pytest.mark.parametrize(
     ("diff", "message"),
     [
-        ({}, "sisdk_child_path is required"),
-        ({"sisdk_child_path": "missing", "sisdk_parent_path": "missing"}, "does not exist"),
+        ({}, "sisdk_version1_path is required"),
+        ({"sisdk_version1_path": "missing", "sisdk_version2_path": "missing"}, "does not exist"),
     ],
 )
 def test_resolve_diff_sdk_selections_rejects_incomplete_or_missing_paths(
@@ -250,9 +250,9 @@ def test_resolve_diff_sdk_selections_rejects_incomplete_or_missing_paths(
 
 
 def test_resolve_diff_sdk_selections_rejects_missing_xapi(tmp_path: Path) -> None:
-    child = tmp_path / "child"
-    parent = tmp_path / "parent"
-    for sdk in (child, parent):
+    version1 = tmp_path / "version1"
+    version2 = tmp_path / "version2"
+    for sdk in (version1, version2):
         sdk.mkdir()
         (sdk / ".properties").write_text("version=2026.1.0\n", encoding="utf-8")
 
@@ -260,8 +260,8 @@ def test_resolve_diff_sdk_selections_rejects_missing_xapi(tmp_path: Path) -> Non
         app_manager.resolve_diff_sdk_selections(
             {
                 "diff": {
-                    "sisdk_child_path": str(child),
-                    "sisdk_parent_path": str(parent),
+                    "sisdk_version1_path": str(version1),
+                    "sisdk_version2_path": str(version2),
                 }
             }
         )
@@ -271,18 +271,18 @@ def test_build_diff_variants_uses_isolated_roots_and_sdk_configuration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     build_root = tmp_path / "firmware"
-    child_sdk = tmp_path / "child-sdk"
-    parent_sdk = tmp_path / "parent-sdk"
+    version1_sdk = tmp_path / "version1-sdk"
+    version2_sdk = tmp_path / "version2-sdk"
     selections = {
-        "child": app_manager.SDKSelection(
-            path=child_sdk,
-            version="2026.1.0",
-            source="client_config_diff_child_path",
-        ),
-        "parent": app_manager.SDKSelection(
-            path=parent_sdk,
+        "version1": app_manager.SDKSelection(
+            path=version1_sdk,
             version="2025.12.3",
-            source="client_config_diff_parent_path",
+            source="client_config_diff_version1_path",
+        ),
+        "version2": app_manager.SDKSelection(
+            path=version2_sdk,
+            version="2026.1.0",
+            source="client_config_diff_version2_path",
         ),
     }
     captured: list[tuple[argparse.Namespace, dict, Path, app_manager.SDKSelection, frozenset[str]]] = []
@@ -312,18 +312,18 @@ def test_build_diff_variants_uses_isolated_roots_and_sdk_configuration(
 
     assert app_manager.build_diff_variants(parsed, client_config, build_root) == 0
     assert [root for _, _, root, _, _ in captured] == [
-        build_root / "diff" / "child",
-        build_root / "diff" / "parent",
+        build_root / "diff" / "version1",
+        build_root / "diff" / "version2",
     ]
     assert [config["firmware"]["sisdk"] for _, config, _, _, _ in captured] == [
-        "2026.1.0",
         "2025.12.3",
+        "2026.1.0",
     ]
     assert [config["firmware"]["sisdk_package_path"] for _, config, _, _, _ in captured] == [
-        str(child_sdk),
-        str(parent_sdk),
+        str(version1_sdk),
+        str(version2_sdk),
     ]
-    assert [selection for _, _, _, selection, _ in captured] == [selections["child"], selections["parent"]]
+    assert [selection for _, _, _, selection, _ in captured] == [selections["version1"], selections["version2"]]
     assert [roles for _, _, _, _, roles in captured] == [
         app_manager.REQUIRED_DIFF_FIRMWARE_ROLES,
         app_manager.REQUIRED_DIFF_FIRMWARE_ROLES,
@@ -816,7 +816,7 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
     target = {"board": "brd4182a", "board_rev": "a06", "device": "EFR32MG22C224F512IM40"}
     roles = sorted(app_manager.REQUIRED_DIFF_FIRMWARE_ROLES)
     selections: dict[str, app_manager.SDKSelection] = {}
-    for variant, version in (("child", "2026.1.0"), ("parent", "2025.12.3")):
+    for variant, version in (("version1", "2025.12.3"), ("version2", "2026.1.0")):
         variant_root = build_root / "diff" / variant
         variant_root.mkdir(parents=True)
         sdk_path = tmp_path / f"{variant}-sdk"
@@ -857,11 +857,11 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
     manifest = json.loads(diff_path.read_text(encoding="utf-8"))
     assert manifest["schema_version"] == 1
     assert manifest["target"] == {"board": "brd4182a", "board_revision": "a06", "device": "EFR32MG22C224F512IM40"}
-    assert set(manifest["variants"]) == {"child", "parent"}
-    assert manifest["variants"]["child"]["manifest_sha256"] == app_manager._sha256(
-        build_root / "diff" / "child" / app_manager.FW_DATA_FILENAME
+    assert set(manifest["variants"]) == {"version1", "version2"}
+    assert manifest["variants"]["version2"]["manifest_sha256"] == app_manager._sha256(
+        build_root / "diff" / "version2" / app_manager.FW_DATA_FILENAME
     )
-    assert manifest["variants"]["parent"]["sdk"]["version"] == "2025.12.3"
+    assert manifest["variants"]["version1"]["sdk"]["version"] == "2025.12.3"
 
 
 def test_load_effective_config_layers_role_specific_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
