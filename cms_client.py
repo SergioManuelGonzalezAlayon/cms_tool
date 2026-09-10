@@ -435,8 +435,36 @@ class CMSClient:
         """Stage firmware and metadata on the remote bench."""
         payload = measurement_request_to_dict(request)
         payload["image_payloads"] = _local_firmware_payloads(request)
-        payload = self._request_json("POST", "/firmware", payload)
+        try:
+            payload = self._request_json("POST", "/firmware", payload)
+        except CMSConnectionError as exc:
+            if str(exc) != "CMS daemon request timed out":
+                raise
+            reconciled = self._reconcile_timed_out_firmware_stage(request)
+            if reconciled is None:
+                raise
+            return reconciled
         return measurement_result_from_dict(payload)
+
+    def _reconcile_timed_out_firmware_stage(
+        self,
+        request: MeasurementRequest,
+    ) -> MeasurementResult | None:
+        """Return a completed stage only when its request ID exactly matches the timed-out POST."""
+
+        try:
+            result = self.get_measurement(request.request_id)
+        except CMSConnectionError:
+            return None
+        if result.measurement_id != request.request_id:
+            return None
+        if result.state in {
+            MeasurementState.ACCEPTED,
+            MeasurementState.FAILED,
+            MeasurementState.REJECTED,
+        }:
+            return result
+        return None
 
     def get_staged(self) -> dict[str, Any]:
         """Return the daemon's current normal and differential firmware stages."""

@@ -12,6 +12,7 @@ from cms_client import (
     CMSClient,
     CMSClientConfig,
     CMSBenchEndpointConfig,
+    CMSConnectionError,
     CMSResolvedEndpoint,
     compare_detected_target_identity,
     refresh_and_record_bench_target,
@@ -35,10 +36,23 @@ from cms_protocol import (
     FirmwareImage,
     MeasurementIdentity,
     MeasurementMode,
+    MeasurementRequest,
     MeasurementResult,
     MeasurementState,
+    SuiteSelector,
     VariableFilter,
 )
+
+
+def _firmware_stage_request(request_id: str = "stage-001") -> MeasurementRequest:
+    return MeasurementRequest(
+        request_id=request_id,
+        selector=SuiteSelector(mode="ble", feature="beacon"),
+        firmware=FirmwareData(
+            dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut-hash"),
+            tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester-hash"),
+        ),
+    )
 
 
 def test_test_command_accepts_run_name():
@@ -60,6 +74,51 @@ def test_test_command_accepts_run_name():
     assert preview.config_name == "dcdc"
     assert filtered.variable == ["phy=2m"]
     assert all_features.feature == "all"
+
+
+def test_send_firmware_reconciles_a_timed_out_post_with_its_completed_stage(monkeypatch):
+    client = CMSClient.__new__(CMSClient)
+    request = _firmware_stage_request()
+    calls = []
+
+    def fake_request(method, path, payload=None):
+        calls.append((method, path))
+        if method == "POST":
+            raise CMSConnectionError("CMS daemon request timed out")
+        assert (method, path) == ("GET", "/measurement/stage-001")
+        return {
+            "measurement_id": "stage-001",
+            "state": "accepted",
+            "message": "firmware staged and ready for test",
+        }
+
+    monkeypatch.setattr(cms_client, "_local_firmware_payloads", lambda _: {})
+    client._request_json = fake_request
+
+    result = client.send_firmware(request)
+
+    assert result.state is MeasurementState.ACCEPTED
+    assert calls == [("POST", "/firmware"), ("GET", "/measurement/stage-001")]
+
+
+def test_send_firmware_keeps_a_timeout_when_its_stage_is_not_completed(monkeypatch):
+    client = CMSClient.__new__(CMSClient)
+    request = _firmware_stage_request()
+
+    def fake_request(method, path, payload=None):
+        if method == "POST":
+            raise CMSConnectionError("CMS daemon request timed out")
+        return {
+            "measurement_id": "stage-001",
+            "state": "validating_firmware",
+            "message": "validating staged firmware",
+        }
+
+    monkeypatch.setattr(cms_client, "_local_firmware_payloads", lambda _: {})
+    client._request_json = fake_request
+
+    with pytest.raises(CMSConnectionError, match="request timed out"):
+        client.send_firmware(request)
 
 
 def test_tests_command_hides_debug_mode(capsys, monkeypatch):
