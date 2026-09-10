@@ -110,7 +110,9 @@ def test_pytest_runtime_metadata_contains_measurement_identity(tmp_path, monkeyp
     )
     result_types = {artifact.path: artifact.result_type for artifact in result.artifacts}
     assert result_types[junit_report] is ResultType.PYTEST_JUNIT
-    assert result_types[current_result] is ResultType.CURRENT_MEASUREMENT
+    retained_result = session.runtime_dir / "measurement_artifacts" / "beacon_result.json"
+    assert result_types[retained_result] is ResultType.CURRENT_MEASUREMENT
+    assert retained_result.read_text(encoding="utf-8") == '{"result_type":"current_measurement"}\n'
 
 
 def test_differential_session_validates_firmware_from_its_active_root(tmp_path, monkeypatch):

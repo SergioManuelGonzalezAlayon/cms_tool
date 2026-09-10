@@ -1064,10 +1064,14 @@ class CMSBench:
                 )
             )
         for path in _real_test_artifacts(session, since=artifact_since):
+            relative_path = Path(_artifact_name(Path("artifacts"), path))
+            retained_path = session.runtime_dir / "measurement_artifacts" / relative_path
+            retained_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, retained_path)
             result.artifacts.append(
                 Artifacts(
-                    name=_artifact_name(Path("artifacts"), path),
-                    path=path,
+                    name=relative_path.as_posix(),
+                    path=retained_path,
                     result_type=ResultType.CURRENT_MEASUREMENT,
                 )
             )
