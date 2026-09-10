@@ -425,6 +425,44 @@ def test_build_jobs_rejects_requested_config_hash_mismatch(tmp_path, monkeypatch
         )
 
 
+def test_build_jobs_allows_a_mutable_custom_config_with_a_stale_requested_hash(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text("{}\n", encoding="utf-8")
+    (feature_dir / "custom.json").write_text("{}\n", encoding="utf-8")
+    metadata_path = tmp_path / "cms_fw_metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "request": {
+                    "selector": {
+                        "mode": "ble",
+                        "feature": "beacon",
+                        "config": "custom",
+                        "config_hash": "stale-custom-hash",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    jobs = orchestrator.build_jobs(
+        [config_root],
+        mode="default",
+        feature_filters=set(),
+        partition_filters=set(),
+        exact_config="custom",
+        cms_metadata_path=str(metadata_path),
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0].config_path.name == "custom.json"
+    assert jobs[0].config_hash == hashlib.sha256(b"{}\n").hexdigest()
+
+
 def test_orchestrator_validates_variable_filters_from_parameters_json(tmp_path, monkeypatch):
     config_root = tmp_path / "configs"
     feature_dir = config_root / "ble" / "beacon"

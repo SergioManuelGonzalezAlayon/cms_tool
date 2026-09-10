@@ -373,6 +373,22 @@ use `--config-name` for one exact config, or use one or more `--variable`
 options for a generated campaign. The bench revalidates names, values, config
 hashes, and the final selected job count before hardware execution.
 
+### Mutable Custom Configuration
+
+`custom` is a configuration name, not a measurement mode. The valid `--mode`
+values are `default`, `full_sweep`, and `diff`; select the mutable configuration
+with `--config-name custom`.
+
+```text
+cms CUSTOM --feature beacon --set advertiser.interval=100
+cms TEST --mode default --feature beacon --config-name custom --out-dir artifacts
+cms TEST --mode diff --feature beacon --config-name custom --out-dir artifacts
+```
+
+`cms CUSTOM` changes only `tests/configs/ble/<feature>/custom.json`; it does not
+modify `default.json`. A differential campaign snapshots `custom.json` when the
+campaign starts, so both firmware variants use the same frozen configuration.
+
 To make local and watched output easier to scan, color can be controlled with:
 
 ```text

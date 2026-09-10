@@ -713,7 +713,7 @@ class CMSBench:
                     variant_root / "bootloader" / firmware.bootloader_img.name,
                     firmware.bootloader_img.sha256 or firmware.bootloader_img_hash,
                 )
-        if request.selector.config_hash:
+        if request.selector.config_hash and not _is_mutable_custom_config_name(request.selector.config):
             session = BenchSession(
                 measurement_id=request.request_id,
                 runtime_dir=runtime_dir,
@@ -730,7 +730,7 @@ class CMSBench:
 
         if request.differential_firmware is None:
             raise RuntimeError("differential plan requires differential firmware")
-        from test_orchestrator import build_job_plan, build_jobs
+        from test_orchestrator import CONFIG_ROOT, build_job_plan, build_jobs
 
         feature = request.selector.feature.strip()
         if not feature:
@@ -741,8 +741,8 @@ class CMSBench:
         feature_filters = set() if feature == "all" else {feature}
         exact_config = "" if config == "default" else config
         jobs = build_jobs(
-            [Path("tests") / "configs" / "ble"],
-            mode="default",
+            [CONFIG_ROOT / "ble"],
+            mode="all" if exact_config else "default",
             feature_filters=feature_filters,
             partition_filters=set(),
             exact_config=exact_config,
@@ -750,6 +750,26 @@ class CMSBench:
         if not jobs:
             raise RuntimeError("differential selected zero jobs")
         plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
+        custom_snapshot: dict[str, str] | None = None
+        if _is_mutable_custom_config_name(config):
+            source_config = jobs[0].config_path
+            snapshot_path = plan_path.with_name("custom_config_snapshot.json")
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_config, snapshot_path)
+            snapshot_hash = _sha256_file(snapshot_path)
+            jobs = [
+                replace(
+                    job,
+                    config_path=snapshot_path,
+                    cfg_arg=str(snapshot_path),
+                    config_hash=snapshot_hash,
+                )
+                for job in jobs
+            ]
+            custom_snapshot = {
+                "path": str(snapshot_path),
+                "sha256": snapshot_hash,
+            }
         plan = build_job_plan(jobs)
         for job_record in plan["jobs"]:
             dut_project = Path(str(job_record["dut_slcp"])).stem
@@ -768,6 +788,8 @@ class CMSBench:
             "config": config,
             "config_hash": request.selector.config_hash,
         }
+        if custom_snapshot is not None:
+            plan["custom_config_snapshot"] = custom_snapshot
         plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
         return plan_path
 
@@ -1825,6 +1847,8 @@ def _validate_variable_filtered_campaign(session: BenchSession) -> None:
 
 
 def _orchestrator_mode(session: BenchSession) -> str:
+    if session.request.selector.config != "default":
+        return "all"
     mode = session.request.mode.value
     return "full_sweep" if mode == "full_sweep" else "default"
 
@@ -1968,6 +1992,11 @@ def _requested_test_config_dir(session: BenchSession) -> Path:
 
 
 def _requested_test_config_path(session: BenchSession) -> Path:
+    if _is_mutable_custom_config_name(session.request.selector.config) and session.job_plan_path is not None:
+        snapshot_path = session.job_plan_path.with_name("custom_config_snapshot.json")
+        if not snapshot_path.is_file():
+            raise RuntimeError("differential custom config snapshot is missing")
+        return snapshot_path
     config_dir = _requested_test_config_dir(session)
     config_name = session.request.selector.config or "default"
     config_name = config_name.strip().replace("\\", "/")
@@ -1984,6 +2013,10 @@ def _requested_test_config_path(session: BenchSession) -> Path:
     except ValueError as exc:
         raise RuntimeError("test config must stay beneath the selected feature directory") from exc
     return resolved
+
+
+def _is_mutable_custom_config_name(config: str) -> bool:
+    return config.strip().replace("\\", "/").lower() in {"custom", "custom.json"}
 
 
 def _real_test_artifacts(session: BenchSession, *, since: float | None = None) -> list[Path]:

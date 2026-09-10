@@ -483,7 +483,11 @@ class CMSClient:
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
 
-        config_hash = "" if feature == "all" else _validate_local_test_config(feature, config)
+        config_hash = (
+            ""
+            if feature == "all" or _is_mutable_custom_config_name(config)
+            else _validate_local_test_config(feature, config)
+        )
         payload = self._request_json(
             "POST",
             "/test",
@@ -1237,6 +1241,28 @@ def build_cli_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="seconds between observation polls",
     )
+    custom = subparsers.add_parser(
+        "custom",
+        aliases=["CUSTOM"],
+        help="update a feature's mutable custom.json configuration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms CUSTOM --feature beacon --set advertiser.interval=100\n"
+            "  cms CUSTOM --feature beacon --set advertiser.phy=2m --set hw.supply_v=3.3\n\n"
+            "Values are parsed as JSON when possible; unquoted text is stored as a string.\n"
+            "Only tests/configs/ble/<feature>/custom.json is modified."
+        ),
+    )
+    _add_color_argument(custom)
+    custom.add_argument("--feature", "-f", required=True, help="BLE feature whose custom.json is updated")
+    custom.add_argument(
+        "--set",
+        action="append",
+        required=True,
+        metavar="PATH=VALUE",
+        help="replace an existing custom.json value using a dotted object path; repeat as needed",
+    )
     measurement = subparsers.add_parser(
         "measurement",
         help="show measurement status",
@@ -1577,6 +1603,11 @@ def _main(argv: list[str] | None = None) -> int:
             _print_test_preview(args, variable_filters)
             return CMSCLIExitCode.SUCCESS
         return _run_test_feature(client, args, variable_filters, colors)
+
+    if args.command in {"custom", "CUSTOM"}:
+        path = update_custom_test_config(args.feature, args.set)
+        print(path)
+        return CMSCLIExitCode.SUCCESS
 
     if args.command in {"cancel", "CANCEL"}:
         result = client.cancel_active_test()
@@ -1999,6 +2030,46 @@ def _validate_local_test_config(feature: str, config: str) -> str:
         if section in config_data and not isinstance(config_data[section], dict):
             raise RuntimeError(f"test config section must be an object: {section}")
     return _sha256_text_file_lf_normalized(config_path)
+
+
+def _is_mutable_custom_config_name(config: str) -> bool:
+    return config.strip().replace("\\", "/").lower() in {"custom", "custom.json"}
+
+
+def update_custom_test_config(feature: str, assignments: list[str]) -> Path:
+    """Apply explicit dotted-path updates to one feature's mutable custom config."""
+
+    config_path = _local_test_config_path(feature, "custom")
+    if not config_path.exists():
+        raise RuntimeError(f"custom test config does not exist: {config_path}")
+    try:
+        config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"custom test config is not valid JSON: {config_path}") from exc
+    if not isinstance(config_data, dict):
+        raise RuntimeError(f"custom test config must be a JSON object: {config_path}")
+
+    for assignment in assignments:
+        path, separator, raw_value = assignment.partition("=")
+        parts = path.split(".")
+        if not separator or not raw_value or not path or any(not part for part in parts):
+            raise RuntimeError("custom updates must use PATH=VALUE with a dotted object path")
+        current: dict[str, Any] = config_data
+        for part in parts[:-1]:
+            child = current.get(part)
+            if not isinstance(child, dict):
+                raise RuntimeError(f"custom config path does not exist: {path}")
+            current = child
+        if parts[-1] not in current:
+            raise RuntimeError(f"custom config path does not exist: {path}")
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            value = raw_value
+        current[parts[-1]] = value
+
+    config_path.write_text(json.dumps(config_data, indent=4) + "\n", encoding="utf-8")
+    return config_path
 
 
 def _local_test_config_path(feature: str, config: str) -> Path:

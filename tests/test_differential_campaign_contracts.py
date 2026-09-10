@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 from threading import Event
 
@@ -89,6 +90,39 @@ def test_differential_plan_honors_the_submitted_feature_selector(tmp_path: Path)
     assert plan["selector"] == {"feature": "beacon", "config": "default", "config_hash": ""}
     assert plan["jobs"]
     assert {job["feature"] for job in plan["jobs"]} == {"beacon"}
+
+
+def test_differential_custom_config_is_frozen_for_both_firmware_passes(tmp_path: Path, monkeypatch) -> None:
+    request = _request()
+    request.selector.feature = "beacon"
+    request.selector.config = "custom"
+    config_dir = tmp_path / "tests" / "configs" / "ble" / "beacon"
+    config_dir.mkdir(parents=True)
+    (config_dir / "parameters.json").write_text("{}\n", encoding="utf-8")
+    source_config = config_dir / "custom.json"
+    original_content = '{"firmware":{"dut_slcp":"apps/ncp_ble_dut_dcdc.slcp","tester_slcp":"apps/ncp_ble_tester.slcp"},"hw":{"supply_v":3.0}}\n'
+    source_config.write_text(original_content, encoding="utf-8")
+    runtime = tmp_path / "runtime"
+    (runtime / "firmware").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    import test_orchestrator
+
+    monkeypatch.setattr(test_orchestrator, "CONFIG_ROOT", tmp_path / "tests" / "configs")
+
+    plan_path = CMSBench().build_differential_plan(request, runtime)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    snapshot_path = runtime / "firmware" / "custom_config_snapshot.json"
+    source_config.write_text('{"firmware":{"dut_slcp":"changed.slcp"}}\n', encoding="utf-8")
+    jobs = test_orchestrator.load_job_plan(plan_path)
+
+    assert snapshot_path.read_text(encoding="utf-8") == original_content
+    assert plan["custom_config_snapshot"] == {
+        "path": str(snapshot_path),
+        "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+    }
+    assert jobs[0].config_path == snapshot_path
+    assert jobs[0].cfg_arg == str(snapshot_path)
+    assert jobs[0].config_hash == hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
 
 
 def test_daemon_lists_version1_and_version2_artifacts_without_cross_variant_loss(tmp_path: Path) -> None:
@@ -239,8 +273,9 @@ def test_activate_differential_variant_materializes_a_normal_isolated_session(tm
             f"{variant_name}-no-dcdc.s37",
             f"{variant_name}-no-dcdc-hash",
         )
+        firmware.dut_variants["no_dcdc"] = no_dcdc
         firmware.role_images = (
-            *firmware.role_images,
+            *(item for item in firmware.role_images if item.project_name != "ncp_ble_dut"),
             FirmwareRoleImage("dut_no_dcdc", "ncp_ble_dut", no_dcdc),
         )
         for role_image in firmware.role_images:

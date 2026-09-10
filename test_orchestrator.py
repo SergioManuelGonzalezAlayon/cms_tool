@@ -228,7 +228,11 @@ def build_jobs(
             dut_slcp = str(cms_firmware.get("dut_slcp") or firmware.get("dut_slcp", ""))
             tester_slcp = str(cms_firmware.get("tester_slcp") or firmware.get("tester_slcp", ""))
             config_hash = sha256_file(config_path)
-            if requested_config_hash and config_hash.lower() != requested_config_hash.lower():
+            if (
+                requested_config_hash
+                and config_path.name.lower() != "custom.json"
+                and config_hash.lower() != requested_config_hash.lower()
+            ):
                 raise ValueError(
                     "requested config hash does not match selected config: "
                     f"{cfg_argument(config_path, config_dir)}"

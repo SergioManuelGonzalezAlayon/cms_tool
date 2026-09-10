@@ -22,6 +22,7 @@ from cms_client import (
     _print_measurement_result,
     _request_from_send_fw_args,
     _run_local_build,
+    update_custom_test_config,
     build_cli_parser,
     load_client_config,
     resolve_client_endpoint,
@@ -74,6 +75,29 @@ def test_test_command_accepts_run_name():
     assert preview.config_name == "dcdc"
     assert filtered.variable == ["phy=2m"]
     assert all_features.feature == "all"
+
+
+def test_custom_command_updates_only_an_existing_custom_config(tmp_path, monkeypatch):
+    config_dir = tmp_path / "tests" / "configs" / "ble" / "beacon"
+    config_dir.mkdir(parents=True)
+    default_path = config_dir / "default.json"
+    custom_path = config_dir / "custom.json"
+    default_path.write_text('{"advertiser": {"interval": 200, "phy": "1m"}}\n', encoding="utf-8")
+    custom_path.write_text(default_path.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    updated_path = update_custom_test_config(
+        "beacon",
+        ["advertiser.interval=100", "advertiser.phy=2m"],
+    )
+
+    assert updated_path == custom_path.resolve()
+    assert json.loads(custom_path.read_text(encoding="utf-8")) == {
+        "advertiser": {"interval": 100, "phy": "2m"}
+    }
+    assert json.loads(default_path.read_text(encoding="utf-8")) == {
+        "advertiser": {"interval": 200, "phy": "1m"}
+    }
 
 
 def test_send_firmware_reconciles_a_timed_out_post_with_its_completed_stage(monkeypatch):
@@ -580,6 +604,22 @@ def test_run_all_features_does_not_send_a_single_config_hash():
 
     assert captured["feature"] == "all"
     assert captured["config"] == "default"
+    assert captured["config_hash"] == ""
+
+
+def test_run_custom_config_does_not_send_a_config_hash():
+    captured = {}
+    client = CMSClient.__new__(CMSClient)
+
+    def fake_request(method, path, payload):
+        captured.update(payload)
+        return {"measurement_id": "generated-id", "state": "accepted"}
+
+    client._request_json = fake_request
+
+    client.run_test(MeasurementMode.DEFAULT, "beacon", config="custom")
+
+    assert captured["config"] == "custom"
     assert captured["config_hash"] == ""
 
 

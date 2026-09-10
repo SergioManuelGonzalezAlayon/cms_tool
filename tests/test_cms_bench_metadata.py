@@ -273,6 +273,23 @@ def test_pytest_runtime_records_selected_config_evidence_in_measurement_workspac
     assert evidence_path not in cms_bench._run_diagnostic_artifacts(session)
 
 
+def test_custom_config_evidence_records_the_observed_hash(tmp_path, monkeypatch):
+    config_root = tmp_path / "tests" / "configs" / "ble" / "beacon"
+    config_root.mkdir(parents=True)
+    config_path = config_root / "custom.json"
+    config_path.write_text('{"advertiser":{"interval":100}}\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    session = _session(tmp_path / "runtime", config="custom")
+
+    evidence_paths = cms_bench._write_selected_config_evidence(session)
+    evidence = json.loads(evidence_paths["metadata_path"].read_text(encoding="utf-8"))
+
+    assert evidence["selected_config"] == "custom.json"
+    assert evidence["requested_config_hash"] == ""
+    assert evidence["observed_config_hash"] == cms_bench._sha256_text_file_lf_normalized(config_path)
+    assert evidence_paths["snapshot_path"].read_text(encoding="utf-8") == config_path.read_text(encoding="utf-8")
+
+
 def test_config_hash_is_stable_across_line_endings(tmp_path):
     lf_config = tmp_path / "lf.json"
     crlf_config = tmp_path / "crlf.json"
