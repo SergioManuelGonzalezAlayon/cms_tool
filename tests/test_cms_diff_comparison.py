@@ -75,6 +75,23 @@ def test_pairs_version1_and_version2_by_stable_identity_not_filename_or_order(tm
     assert not pairing.unmatched_version2
 
 
+def test_pairs_absolute_plan_config_paths_with_repo_relative_result_paths(tmp_path: Path) -> None:
+    version1_root = tmp_path / "results" / "version1"
+    version2_root = tmp_path / "results" / "version2"
+    plan_path = tmp_path / "paired_default_plan.json"
+    _write_plan(plan_path)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    plan["jobs"][0]["config_path"] = "/home/admin/current_measurement_tool/tests/configs/ble/beacon/default.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    _write_result(version1_root, "version1.json")
+    _write_result(version2_root, "version2.json")
+
+    pairing = pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+    assert len(pairing.pairs) == 1
+    assert pairing.pairs[0].identity.config_path == "tests/configs/ble/beacon/default.json"
+
+
 def test_resolves_missing_result_partition_from_the_paired_plan(tmp_path: Path) -> None:
     version1_root = tmp_path / "results" / "version1"
     version2_root = tmp_path / "results" / "version2"

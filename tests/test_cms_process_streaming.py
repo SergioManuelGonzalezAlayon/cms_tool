@@ -153,6 +153,18 @@ def test_independent_event_stream_writers_keep_cursors_strictly_increasing(tmp_p
     assert [event["cursor"] for event in MeasurementEventStream("measurement-123", paths).read_events()] == [1, 2]
 
 
+def test_interleaved_event_stream_writers_share_one_cursor_sequence(tmp_path: Path) -> None:
+    paths = MeasurementRuntimePaths.from_root(tmp_path)
+    first = MeasurementEventStream("measurement-123", paths)
+    second = MeasurementEventStream("measurement-123", paths)
+
+    first.append_lifecycle("first")
+    second.append_lifecycle("second")
+    first.append_lifecycle("first-again")
+
+    assert [event["cursor"] for event in MeasurementEventStream("measurement-123", paths).read_events()] == [1, 2, 3]
+
+
 def test_managed_process_times_out_and_preserves_live_diagnostics(tmp_path: Path) -> None:
     event_stream = MeasurementEventStream(
         "measurement-123",

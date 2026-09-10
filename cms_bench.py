@@ -55,6 +55,7 @@ DEFAULT_CONSOLE_EVENT_MAX_BYTES = 4 * 1024 * 1024
 # CMS measurements may run for days; cancellation is the normal stop mechanism.
 DEFAULT_EXECUTION_TIMEOUT_S: float | None = None
 _EVENT_STREAM_LOCKS: dict[str, threading.RLock] = {}
+_EVENT_STREAM_CURSORS: dict[str, EventCursor] = {}
 _EVENT_STREAM_LOCKS_GUARD = threading.Lock()
 PROCESS_TERMINATE_GRACE_S = 5.0
 MAX_CONSOLE_EVENT_SEGMENT_BYTES = 64 * 1024
@@ -67,6 +68,18 @@ def _event_stream_lock(root: Path) -> threading.RLock:
     key = str(root.resolve())
     with _EVENT_STREAM_LOCKS_GUARD:
         return _EVENT_STREAM_LOCKS.setdefault(key, threading.RLock())
+
+
+def _event_stream_cursor(root: Path, paths: "MeasurementRuntimePaths") -> EventCursor:
+    """Return the shared in-process cursor for one measurement workspace."""
+
+    key = str(root.resolve())
+    with _EVENT_STREAM_LOCKS_GUARD:
+        cursor = _EVENT_STREAM_CURSORS.get(key)
+        if cursor is None:
+            cursor = EventCursor(_last_event_cursor(paths))
+            _EVENT_STREAM_CURSORS[key] = cursor
+        return cursor
 
 
 @dataclass(slots=True)
@@ -179,8 +192,7 @@ class MeasurementEventStream:
         self._lock = _event_stream_lock(paths.root)
         self._console_segments = _console_segment_paths(paths.console_events)
         self._console_segment_bytes = sum(path.stat().st_size for path in self._console_segments)
-        self._cursor = EventCursor(_last_event_cursor(paths))
-        self._has_written = False
+        self._cursor = _event_stream_cursor(paths.root, paths)
         self._oldest_retained_cursor = _first_console_cursor(self._console_segments)
         if self._oldest_retained_cursor == 0 and self._cursor.value:
             self._oldest_retained_cursor = 1
@@ -262,13 +274,17 @@ class MeasurementEventStream:
             os.replace(temporary_path, self.paths.status)
 
     def _next_record_locked(self, event_type: str, **details: Any) -> dict[str, Any]:
-        if not self._has_written:
-            self._cursor = EventCursor(_last_event_cursor(self.paths))
-            self._has_written = True
+        key = str(self.paths.root.resolve())
+        with _EVENT_STREAM_LOCKS_GUARD:
+            cursor = _EVENT_STREAM_CURSORS.get(key)
+            if cursor is None:
+                cursor = EventCursor(_last_event_cursor(self.paths))
+            self._cursor = cursor.next()
+            _EVENT_STREAM_CURSORS[key] = self._cursor
         record = {
             **details,
             "measurement_id": self.measurement_id,
-            "cursor": self._cursor.next().value,
+            "cursor": self._cursor.value,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": event_type,
         }

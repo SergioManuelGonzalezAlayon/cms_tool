@@ -682,7 +682,10 @@ def _text_or_empty(payload: dict[str, Any], field: str, *, source: str) -> str:
 
 
 def _normalised_path(value: str) -> str:
-    return value.replace("\\", "/")
+    normalised = value.replace("\\", "/")
+    marker = "tests/configs/"
+    marker_index = normalised.lower().find(marker)
+    return normalised[marker_index:] if marker_index >= 0 else normalised
 
 
 def _raise_for_duplicate_identities(results: list[VariantResult], variant: str) -> None:
