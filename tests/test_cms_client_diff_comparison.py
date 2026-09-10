@@ -12,7 +12,8 @@ MEASUREMENT_ID = "diff-comparison-001"
 
 
 def _write_downloaded_diff_artifacts(out_dir: Path, *, version2_current: float) -> list[Path]:
-    plan = out_dir / "results" / "paired_default_plan.json"
+    evidence_root = out_dir / "ble" / "all" / "diff" / MEASUREMENT_ID
+    plan = evidence_root / "paired_default_plan.json"
     plan.parent.mkdir(parents=True)
     plan.write_text(
         json.dumps(
@@ -33,7 +34,7 @@ def _write_downloaded_diff_artifacts(out_dir: Path, *, version2_current: float) 
     )
     paths = [plan]
     for variant, current in (("version1", 1.0), ("version2", version2_current)):
-        path = out_dir / "results" / variant / "beacon.json"
+        path = evidence_root / variant / "beacon.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(
@@ -71,7 +72,7 @@ def _install_diff_client(monkeypatch, out_dir: Path, *, version2_current: float)
             return MeasurementResult(
                 measurement_id=measurement_id,
                 state=MeasurementState.PASSED,
-                artifacts=[Artifacts(name="results/paired_default_plan.json")],
+                artifacts=[Artifacts(name=f"ble/all/diff/{MEASUREMENT_ID}/paired_default_plan.json")],
             )
 
         def download_measurement_artifacts(self, measurement_id, requested_out_dir):
@@ -100,7 +101,7 @@ def test_diff_client_saves_report_and_renders_table_after_successful_execution(
 
     output = capsys.readouterr().out
     assert exit_code == int(cms_client.CMSCLIExitCode.SUCCESS)
-    assert (tmp_path / "diff_comparison.json").is_file()
+    assert (tmp_path / "ble" / "all" / "diff" / MEASUREMENT_ID / "diff_comparison.json").is_file()
     assert "| Variable | Version2 | Version1 | Delta (version2-version1) | Percent | Status |" in output
 
 

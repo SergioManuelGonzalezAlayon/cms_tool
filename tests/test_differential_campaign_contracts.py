@@ -21,13 +21,20 @@ from cmsd import CMSDaemon, DaemonConfig, StagedDifferentialFirmware
 def _request() -> MeasurementRequest:
     def variant(name: str) -> FirmwareData:
         dut = FirmwareImage(f"{name}-dut.s37", f"{name}-dut.s37", f"{name}-dut-hash")
+        dut_no_dcdc = FirmwareImage(
+            f"{name}-dut-no-dcdc.s37",
+            f"{name}-dut-no-dcdc.s37",
+            f"{name}-dut-no-dcdc-hash",
+        )
         tester = FirmwareImage(f"{name}-tester.s37", f"{name}-tester.s37", f"{name}-tester-hash")
         return FirmwareData(
             dut_img=dut,
             tester_img=tester,
+            dut_variants={"dcdc": dut, "no_dcdc": dut_no_dcdc},
             xapi_file=FirmwareImage(f"{name}.xapi", f"{name}.xapi", f"{name}-xapi-hash"),
             role_images=(
                 FirmwareRoleImage("dut_dcdc", "ncp_ble_dut_dcdc", dut),
+                FirmwareRoleImage("dut_no_dcdc", "ncp_ble_dut", dut_no_dcdc),
                 FirmwareRoleImage("tester", "ncp_ble_tester", tester),
             ),
         )
@@ -85,6 +92,7 @@ def test_differential_plan_honors_the_submitted_feature_selector(tmp_path: Path)
 
 
 def test_daemon_lists_version1_and_version2_artifacts_without_cross_variant_loss(tmp_path: Path) -> None:
+    request = _request()
     runtime = tmp_path / "runtime"
     (runtime / "results" / "version1").mkdir(parents=True)
     (runtime / "results" / "version2").mkdir(parents=True)
@@ -94,9 +102,9 @@ def test_daemon_lists_version1_and_version2_artifacts_without_cross_variant_loss
         DaemonConfig(runtime_root=tmp_path / "daemon", artifacts_root=tmp_path / "artifacts", bench_config=tmp_path / "bench.json")
     )
 
-    assert [artifact.name for artifact in daemon.differential_result_artifacts(runtime)] == [
-        "results/version1/version1.json",
-        "results/version2/version2.json",
+    assert [artifact.name for artifact in daemon.differential_result_artifacts(request, runtime)] == [
+        "ble/all/diff/diff-contract-001/version1/version1.json",
+        "ble/all/diff/diff-contract-001/version2/version2.json",
     ]
 
 
@@ -114,12 +122,40 @@ def test_daemon_retains_paired_plan_as_a_completed_measurement_artifact(tmp_path
         )
     )
 
-    artifact = daemon.retain_differential_plan_artifact(staged_runtime, execution_runtime)
+    request = _request()
+    artifact = daemon.retain_differential_plan_artifact(request, staged_runtime, execution_runtime)
 
-    assert artifact.name == "results/paired_default_plan.json"
+    assert artifact.name == "ble/all/diff/diff-contract-001/paired_default_plan.json"
     assert artifact.result_type is ResultType.CAMPAIGN
-    assert artifact.path == execution_runtime / "results" / "paired_default_plan.json"
+    assert artifact.path == execution_runtime / "evidence" / "ble" / "all" / "diff" / "diff-contract-001" / "paired_default_plan.json"
     assert artifact.path.read_text(encoding="utf-8") == '{"jobs": []}\n'
+
+
+def test_daemon_retains_all_six_differential_role_images_by_measurement_id(tmp_path: Path) -> None:
+    request = _request()
+    staged_runtime = tmp_path / "staged"
+    execution_runtime = tmp_path / "execution"
+    for variant in ("version1", "version2"):
+        for role_image in getattr(request.differential_firmware, variant).role_images:
+            source = (
+                staged_runtime / "firmware" / variant / "roles" / role_image.role
+                / role_image.project_name / role_image.image.name
+            )
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(role_image.image.sha256, encoding="utf-8")
+
+    artifacts = CMSDaemon().retain_differential_firmware_evidence(
+        request, staged_runtime, execution_runtime
+    )
+
+    assert len(artifacts) == 6
+    assert {artifact.name.split("/")[5] for artifact in artifacts} == {
+        "dut_dcdc",
+        "dut_no_dcdc",
+        "tester",
+    }
+    assert all(artifact.name.startswith("ble/all/diff/diff-contract-001/") for artifact in artifacts)
+    assert all(artifact.path is not None and artifact.path.is_file() for artifact in artifacts)
 
 
 def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_released(
@@ -143,9 +179,10 @@ def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_re
     execution_dir = tmp_path / "execution"
     plan_source = staging_dir / "firmware" / "paired_default_plan.json"
     plan_source.write_text('{"jobs": []}\n', encoding="utf-8")
-    plan = daemon.retain_differential_plan_artifact(staging_dir, execution_dir)
+    plan = daemon.retain_differential_plan_artifact(request, staging_dir, execution_dir)
     inputs = daemon.retain_differential_comparison_inputs(request, execution_dir)
     passes = daemon.retain_differential_pass_records(
+        request,
         execution_dir,
         [
             {
@@ -157,7 +194,8 @@ def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_re
             }
         ],
     )
-    campaign = execution_dir / "results" / "differential_campaign.json"
+    campaign = execution_dir / "evidence" / "ble" / "all" / "diff" / "diff-contract-001" / "differential_campaign.json"
+    campaign.parent.mkdir(parents=True, exist_ok=True)
     campaign.write_text('{"run_order": ["version1", "version2"]}\n', encoding="utf-8")
     result = MeasurementResult(
         measurement_id="completed-diff-001",
@@ -167,7 +205,7 @@ def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_re
             inputs,
             passes,
             Artifacts(
-                name="results/differential_campaign.json",
+                name="ble/all/diff/diff-contract-001/differential_campaign.json",
                 path=campaign,
                 result_type=ResultType.CAMPAIGN,
             ),
@@ -177,10 +215,10 @@ def test_differential_terminal_artifacts_publish_before_the_consumed_stage_is_re
     published = daemon.publish_results(result)
 
     assert {artifact.name for artifact in published.artifacts} >= {
-        "results/paired_default_plan.json",
-        "results/differential_comparison_inputs.json",
-        "results/differential_passes.json",
-        "results/differential_campaign.json",
+        "ble/all/diff/diff-contract-001/paired_default_plan.json",
+        "ble/all/diff/diff-contract-001/differential_comparison_inputs.json",
+        "ble/all/diff/diff-contract-001/differential_passes.json",
+        "ble/all/diff/diff-contract-001/differential_campaign.json",
     }
     assert staging_dir.is_dir()
     daemon._release_consumed_differential_stage(stage)

@@ -2169,23 +2169,24 @@ def _create_and_render_diff_comparison(
 ) -> CMSCLIExitCode:
     """Create client-side differential output only after physical execution passed."""
 
-    plan_path = out_dir / "results" / "paired_default_plan.json"
-    version1_root = out_dir / "results" / "version1"
-    version2_root = out_dir / "results" / "version2"
+    plan_paths = [path for path in downloaded_paths if path.name == "paired_default_plan.json"]
+    if len(plan_paths) != 1:
+        print("differential comparison data did not include one paired_default_plan.json", file=sys.stderr)
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
+    evidence_root = plan_paths[0].parent
+    plan_path = evidence_root / "paired_default_plan.json"
+    version1_root = evidence_root / "version1"
+    version2_root = evidence_root / "version2"
     required = (plan_path, version1_root, version2_root)
     if not all(path.exists() for path in required):
         missing = ", ".join(str(path) for path in required if not path.exists())
         print(f"differential comparison data is incomplete: missing {missing}", file=sys.stderr)
         return CMSCLIExitCode.COMPARISON_DATA_FAILURE
-    if not any(path == plan_path or plan_path in path.parents for path in downloaded_paths):
-        print("differential comparison data did not include paired_default_plan.json", file=sys.stderr)
-        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
-
     try:
         pairing = pair_downloaded_differential_results(version1_root, version2_root, plan_path)
         inputs = prepare_comparison_inputs(pairing)
         report = create_diff_comparison_report(pairing, inputs)
-        report_path = write_diff_comparison_report(report, out_dir / "diff_comparison.json")
+        report_path = write_diff_comparison_report(report, evidence_root / "diff_comparison.json")
         print(f"saved {report_path}")
         saved_report = json.loads(report_path.read_text(encoding="utf-8"))
         print(render_diff_comparison_table(saved_report))

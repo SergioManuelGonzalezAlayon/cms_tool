@@ -771,10 +771,13 @@ class CMSDaemon:
         if runtime_dir.exists():
             shutil.rmtree(runtime_dir, ignore_errors=True)
 
-    def differential_result_artifacts(self, runtime_dir: Path) -> list[Artifacts]:
+    def differential_result_artifacts(
+        self, request: MeasurementRequest, runtime_dir: Path
+    ) -> list[Artifacts]:
         """Expose retained version1 and version2 raw evidence independently."""
 
         artifacts: list[Artifacts] = []
+        evidence_root = _differential_evidence_root(request)
         for variant in ("version1", "version2"):
             result_root = runtime_dir / "results" / variant
             if not result_root.is_dir():
@@ -783,7 +786,7 @@ class CMSDaemon:
                 if path.is_file():
                     artifacts.append(
                         Artifacts(
-                            name=(Path("results") / variant / path.relative_to(result_root)).as_posix(),
+                            name=(evidence_root / variant / path.relative_to(result_root)).as_posix(),
                             path=path,
                             result_type=ResultType.DIAGNOSTIC,
                         )
@@ -791,18 +794,18 @@ class CMSDaemon:
         return artifacts
 
     def retain_differential_plan_artifact(
-        self, staged_runtime_dir: Path, execution_runtime_dir: Path
+        self, request: MeasurementRequest, staged_runtime_dir: Path, execution_runtime_dir: Path
     ) -> Artifacts:
         """Retain the exact paired plan after the staging workspace is gone."""
 
         source = staged_runtime_dir / "firmware" / "paired_default_plan.json"
         if not source.is_file():
             raise RuntimeError("differential paired plan is missing from staged firmware")
-        destination = execution_runtime_dir / "results" / "paired_default_plan.json"
+        destination = execution_runtime_dir / "evidence" / _differential_evidence_root(request) / "paired_default_plan.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
         return Artifacts(
-            name="results/paired_default_plan.json",
+            name=(_differential_evidence_root(request) / "paired_default_plan.json").as_posix(),
             path=destination,
             result_type=ResultType.CAMPAIGN,
         )
@@ -814,7 +817,7 @@ class CMSDaemon:
     ) -> Artifacts:
         """Retain the version1/version2 provenance required for client-side pairing."""
 
-        destination = execution_runtime_dir / "results" / "differential_comparison_inputs.json"
+        destination = execution_runtime_dir / "evidence" / _differential_evidence_root(request) / "differential_comparison_inputs.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(
             json.dumps(
@@ -828,7 +831,7 @@ class CMSDaemon:
             encoding="utf-8",
         )
         return Artifacts(
-            name="results/differential_comparison_inputs.json",
+            name=(_differential_evidence_root(request) / "differential_comparison_inputs.json").as_posix(),
             path=destination,
             result_type=ResultType.CAMPAIGN,
         )
@@ -842,22 +845,55 @@ class CMSDaemon:
 
     def retain_differential_pass_records(
         self,
+        request: MeasurementRequest,
         execution_runtime_dir: Path,
         pass_records: list[dict[str, Any]],
     ) -> Artifacts:
         """Retain each variant's terminal execution truth for reconnect and diagnosis."""
 
-        destination = execution_runtime_dir / "results" / "differential_passes.json"
+        destination = execution_runtime_dir / "evidence" / _differential_evidence_root(request) / "differential_passes.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(
             json.dumps({"schema_version": 1, "passes": pass_records}, indent=2) + "\n",
             encoding="utf-8",
         )
         return Artifacts(
-            name="results/differential_passes.json",
+            name=(_differential_evidence_root(request) / "differential_passes.json").as_posix(),
             path=destination,
             result_type=ResultType.CAMPAIGN,
         )
+
+    def retain_differential_firmware_evidence(
+        self,
+        request: MeasurementRequest,
+        staged_runtime_dir: Path,
+        execution_runtime_dir: Path,
+    ) -> list[Artifacts]:
+        """Retain the complete six-role pair before staging is released."""
+
+        differential = request.differential_firmware
+        if differential is None:
+            raise RuntimeError("differential firmware evidence requires version1 and version2")
+        evidence_root = _differential_evidence_root(request)
+        artifacts: list[Artifacts] = []
+        for variant in ("version1", "version2"):
+            for role_image in getattr(differential, variant).role_images:
+                relative_path = (
+                    evidence_root / variant / role_image.role / role_image.project_name / role_image.image.name
+                )
+                source = (
+                    staged_runtime_dir / "firmware" / variant / "roles" / role_image.role
+                    / role_image.project_name / role_image.image.name
+                )
+                if not source.is_file():
+                    raise RuntimeError(f"staged differential firmware evidence is missing: {source}")
+                destination = execution_runtime_dir / "evidence" / relative_path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                artifacts.append(
+                    Artifacts(name=relative_path.as_posix(), path=destination, result_type=ResultType.DIAGNOSTIC)
+                )
+        return artifacts
 
     def run_staged_test(
         self,
@@ -1198,8 +1234,13 @@ class CMSDaemon:
                 self.bench = CMSBench(config_path=self.config.bench_config)
                 self.bench.initialize()
             self.bench.validate_differential_firmware(staging.request, staging.runtime_dir)
-            artifacts.append(self.retain_differential_plan_artifact(staging.runtime_dir, runtime_dir))
+            artifacts.append(
+                self.retain_differential_plan_artifact(request, staging.runtime_dir, runtime_dir)
+            )
             artifacts.append(self.retain_differential_comparison_inputs(request, runtime_dir))
+            artifacts.extend(
+                self.retain_differential_firmware_evidence(request, staging.runtime_dir, runtime_dir)
+            )
             self._update_measurement(request.request_id, MeasurementState.RUNNING, 50, "running version1 differential pass")
             for index, variant in enumerate(("version1", "version2"), start=1):
                 self._raise_if_cancelled(request.request_id)
@@ -1225,7 +1266,7 @@ class CMSDaemon:
                 pass_record = _differential_pass_record(variant, pass_result, session.runtime_dir)
                 pass_records.append(pass_record)
                 for artifact in pass_result.artifacts:
-                    artifact.name = (Path("results") / variant / artifact.name).as_posix()
+                    artifact.name = (_differential_evidence_root(request) / variant / artifact.name).as_posix()
                     artifacts.append(artifact)
                 passed_count = sum(item.state is MeasurementState.PASSED for item in pass_results)
                 failed_count = len(pass_results) - passed_count
@@ -1256,12 +1297,18 @@ class CMSDaemon:
                         failed_count=sum(item.state is not MeasurementState.PASSED for item in pass_results),
                     )
             campaign_path = self.bench.record_differential_campaign_order(runtime_dir)
-            artifacts.append(Artifacts(name="results/differential_campaign.json", path=campaign_path, result_type=ResultType.DIAGNOSTIC))
-            artifacts.append(self.retain_differential_pass_records(runtime_dir, pass_records))
+            artifacts.append(
+                Artifacts(
+                    name=(_differential_evidence_root(request) / "differential_campaign.json").as_posix(),
+                    path=campaign_path,
+                    result_type=ResultType.DIAGNOSTIC,
+                )
+            )
+            artifacts.append(self.retain_differential_pass_records(request, runtime_dir, pass_records))
             known_artifact_paths = {artifact.path for artifact in artifacts}
             artifacts.extend(
                 artifact
-                for artifact in self.differential_result_artifacts(runtime_dir)
+                for artifact in self.differential_result_artifacts(request, runtime_dir)
                 if artifact.path not in known_artifact_paths
             )
             state = MeasurementState.PASSED if all(item.state is MeasurementState.PASSED for item in pass_results) else MeasurementState.FAILED
@@ -2006,6 +2053,12 @@ def _safe_artifact_name(name: str) -> str:
     return normalized.as_posix()
 
 
+def _differential_evidence_root(request: MeasurementRequest) -> Path:
+    """Return the client-visible evidence root for one differential measurement."""
+
+    return Path("ble") / (request.selector.feature.strip() or "all") / "diff" / request.request_id
+
+
 def _staged_firmware_summary(
     request: MeasurementRequest,
     *,
@@ -2084,6 +2137,9 @@ def _is_publishable_final_artifact(artifact: Artifacts) -> bool:
         return (
             artifact_name in PUBLISHABLE_DIAGNOSTIC_NAMES
             or artifact_parts[:2] in {("results", "version1"), ("results", "version2")}
+            or len(artifact_parts) >= 4
+            and artifact_parts[0] == "ble"
+            and artifact_parts[2] == "diff"
         )
     if artifact.result_type is ResultType.CAMPAIGN:
         return artifact_name in PUBLISHABLE_CAMPAIGN_NAMES
