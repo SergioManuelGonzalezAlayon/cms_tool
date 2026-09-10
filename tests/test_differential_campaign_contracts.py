@@ -280,6 +280,14 @@ def test_activate_differential_variant_materializes_a_normal_isolated_session(tm
     assert (active_root / "version1-tester.s37").is_file()
     assert not list(session.runtime_dir.glob("*.s37"))
 
+    selections = CMSBench().report_differential_firmware_selection(session)
+
+    assert len(selections) == 3
+    assert all("version=version1" in line for line in selections)
+    assert any("role=dut_dcdc project=ncp_ble_dut_dcdc" in line for line in selections)
+    assert any("role=dut_no_dcdc project=ncp_ble_dut" in line for line in selections)
+    assert any("role=tester project=ncp_ble_tester" in line for line in selections)
+
 
 def test_differential_campaign_session_owns_active_and_isolated_result_roots(tmp_path: Path) -> None:
     campaign = DifferentialCampaignSession(

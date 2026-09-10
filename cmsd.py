@@ -1261,6 +1261,7 @@ class CMSDaemon:
                     cancel_event=self.cancellation_events[request.request_id],
                 )
                 session.console_relay = top_level_events
+                self.bench.report_differential_firmware_selection(session)
                 pass_result = self.bench.measurement_run(session, active_root=campaign.active_root)
                 pass_results.append(pass_result)
                 pass_record = _differential_pass_record(variant, pass_result, session.runtime_dir)

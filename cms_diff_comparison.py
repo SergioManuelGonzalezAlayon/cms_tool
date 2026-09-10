@@ -323,7 +323,7 @@ def write_diff_comparison_report(report: dict[str, Any], output_path: Path) -> P
 
 
 def render_diff_comparison_table(report: dict[str, Any]) -> str:
-    """Render the concise Markdown table exclusively from a JSON report."""
+    """Render a terminal-friendly differential comparison table from a JSON report."""
 
     pairs = report.get("pairs")
     if not isinstance(pairs, list):
@@ -345,26 +345,27 @@ def render_diff_comparison_table(report: dict[str, Any]) -> str:
         rows = [metric_by_name[name] for name in _TABLE_METRIC_ORDER if name in metric_by_name]
         if not rows:
             continue
+        table_rows = [
+            (
+                _format_metric_name(str(metric["variable"])),
+                _format_number(metric.get("version2")),
+                _format_number(metric.get("version1")),
+                _format_number(metric.get("delta"), signed=True),
+                _format_percent(metric.get("percent")),
+                _format_status(str(metric.get("status", "UNAVAILABLE"))),
+            )
+            for metric in rows
+        ]
         tables.extend(
             (
                 _table_title(identity),
+                _render_terminal_table_with_sisdk(pair, 
+                    ("Metric [mA]", "Version 2", "Version 1", "Δ (v2 − v1)", "Change", "Result"),
+                    table_rows,
+                ),
                 "",
-                "| Variable | Version2 | Version1 | Delta (version2-version1) | Percent | Status |",
-                "| --- | ---: | ---: | ---: | ---: | --- |",
             )
         )
-        for metric in rows:
-            tables.append(
-                "| {variable} | {version2} | {version1} | {delta} | {percent} | {status} |".format(
-                    variable=metric["variable"],
-                    version2=_format_number(metric.get("version2")),
-                    version1=_format_number(metric.get("version1")),
-                    delta=_format_number(metric.get("delta")),
-                    percent=_format_percent(metric.get("percent")),
-                    status=str(metric.get("status", "UNAVAILABLE")),
-                )
-            )
-        tables.append("")
     return "\n".join(tables).rstrip() if tables else "No comparable metrics."
 
 
@@ -376,16 +377,83 @@ def _table_title(identity: dict[str, Any]) -> str:
     )
 
 
-def _format_number(value: Any) -> str:
+def _format_metric_name(variable: str) -> str:
+    """Make known current metric names concise without changing report keys."""
+
+    return variable.removesuffix("_current_ma").replace("_", " ")
+
+
+def _render_terminal_table_with_sisdk(
+    pair: dict[str, Any], headers: tuple[str, ...], rows: list[tuple[str, ...]]
+) -> str:
+    """Replace generic variant labels with their recorded SiSDK versions."""
+
+    concrete_headers = list(headers)
+    concrete_headers[1] = _sisdk_column_label(pair, "version2", concrete_headers[1])
+    concrete_headers[2] = _sisdk_column_label(pair, "version1", concrete_headers[2])
+    return _render_terminal_table(tuple(concrete_headers), rows)
+
+
+def _sisdk_column_label(pair: dict[str, Any], variant: str, fallback: str) -> str:
+    """Return the concrete SiSDK version recorded for one comparison input."""
+
+    variant_input = pair.get(variant)
+    if not isinstance(variant_input, dict):
+        return fallback
+    provenance = variant_input.get("provenance")
+    if not isinstance(provenance, dict):
+        return fallback
+    sisdk = provenance.get("sisdk_version")
+    if not sisdk and isinstance(provenance.get("sisdk"), dict):
+        sisdk = provenance["sisdk"].get("version")
+    return f"SiSDK {sisdk}" if isinstance(sisdk, str) and sisdk else fallback
+
+
+def _format_number(value: Any, *, signed: bool = False) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "N/A"
-    return f"{float(value):.6g}"
+    number = float(value)
+    if number == 0:
+        return "0"
+    rendered = f"{abs(number):.6f}".rstrip("0").rstrip(".")
+    if signed:
+        return f"{'+' if number > 0 else '-'}{rendered}"
+    return f"{'-' if number < 0 else ''}{rendered}"
 
 
 def _format_percent(value: Any) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "N/A"
-    return f"{float(value):.3f}%"
+    number = float(value)
+    return f"{number:+.2f}%" if number else "0.00%"
+
+
+def _format_status(status: str) -> str:
+    return {
+        "PASS": "✓ PASS",
+        "WARNING": "! WARN",
+        "FAIL": "✗ FAIL",
+        "UNAVAILABLE": "— N/A",
+    }.get(status, status)
+
+
+def _render_terminal_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
+    """Return a compact aligned box table suitable for PowerShell and CI logs."""
+
+    widths = [max(len(header), *(len(row[index]) for row in rows)) for index, header in enumerate(headers)]
+    border = lambda left, fill, join, right: left + join.join(fill * (width + 2) for width in widths) + right
+    render_row = lambda values: "│" + "│".join(
+        f" {value:<{width}} " for value, width in zip(values, widths)
+    ) + "│"
+    return "\n".join(
+        (
+            border("┌", "─", "┬", "┐"),
+            render_row(headers),
+            border("├", "─", "┼", "┤"),
+            *(render_row(row) for row in rows),
+            border("└", "─", "┴", "┘"),
+        )
+    )
 
 
 def _percent_delta(version2_value: float, version1_value: float) -> float | None:

@@ -898,6 +898,27 @@ class CMSBench:
             output.write(json.dumps(payload, sort_keys=True) + "\n")
         return record_path
 
+    def report_differential_firmware_selection(self, session: BenchSession) -> tuple[str, ...]:
+        """Publish the exact active images selected for one differential version."""
+
+        if not session.variant or session.active_firmware_dir is None:
+            raise RuntimeError("differential firmware reporting requires an active variant session")
+        selections: list[str] = []
+        for role_image in session.manifest.role_images:
+            active_image = session.active_firmware_dir / role_image.image.name
+            observed_sha256 = _sha256_file(active_image)
+            line = (
+                "CMS differential firmware selected: "
+                f"version={session.variant} role={role_image.role} "
+                f"project={role_image.project_name} image={active_image} "
+                f"sha256={observed_sha256} expected_sha256={role_image.image.sha256}"
+            )
+            session.event_stream.append_console("stdout", line + "\n")
+            if session.console_relay is not None:
+                session.console_relay.append_console("stdout", line + "\n", variant=session.variant)
+            selections.append(line)
+        return tuple(selections)
+
     def record_differential_campaign_order(
         self, runtime_dir: Path, order: tuple[str, ...] = ("version1", "version2")
     ) -> Path:

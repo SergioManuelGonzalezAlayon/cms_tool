@@ -328,6 +328,8 @@ def test_renders_requested_markdown_table_from_report_only(tmp_path: Path) -> No
                     "config_path": "tests/configs/ble/beacon/default.json",
                     "firmware_role": "dcdc",
                 },
+                "version1": {"provenance": {"sisdk_version": "2025.12.3"}},
+                "version2": {"provenance": {"sisdk_version": "2025.12.2"}},
                 "metrics": [
                     {"variable": "tx_current_ma", "version2": 1.016, "version1": 1.0, "delta": 0.016, "percent": 1.6, "status": "WARNING"},
                     {"variable": "avg_current_ma", "version2": 0.5, "version1": 0.5, "delta": 0.0, "percent": 0.0, "status": "PASS"},
@@ -339,12 +341,15 @@ def test_renders_requested_markdown_table_from_report_only(tmp_path: Path) -> No
 
     table = render_diff_comparison_table(report)
 
-    assert "| Variable | Version2 | Version1 | Delta (version2-version1) | Percent | Status |" in table
-    assert "| avg_current_ma | 0.5 | 0.5 | 0 | 0.000% | PASS |" in table
-    assert "| tx_current_ma | 1.016 | 1 | 0.016 | 1.600% | WARNING |" in table
-    assert "| sleep_current_ma | 0 | 0 | 0 | N/A | UNAVAILABLE |" in table
+    assert "SiSDK 2025.12.2" in table
+    assert "SiSDK 2025.12.3" in table
+    assert "Metric [mA]" in table
+    assert "avg" in table
+    assert "+0.016" in table
+    assert "+1.60%" in table
+    assert "! WARN" in table
     assert "peak_current_ma" not in table
-    assert table.index("avg_current_ma") < table.index("tx_current_ma") < table.index("sleep_current_ma")
+    assert table.index("avg") < table.index("tx") < table.index("sleep")
     with pytest.raises(ResultMetricParseError, match="multiple Interval"):
         extract_measurement_metrics(
             {

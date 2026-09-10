@@ -102,7 +102,7 @@ def test_diff_client_saves_report_and_renders_table_after_successful_execution(
     output = capsys.readouterr().out
     assert exit_code == int(cms_client.CMSCLIExitCode.SUCCESS)
     assert (tmp_path / "ble" / "all" / "diff" / MEASUREMENT_ID / "diff_comparison.json").is_file()
-    assert "| Variable | Version2 | Version1 | Delta (version2-version1) | Percent | Status |" in output
+    assert "│ Metric [mA] │ Version 2 │ Version 1 │ Δ (v2 − v1) │ Change │ Result │" in output
 
 
 def test_diff_client_returns_regression_exit_code_after_successful_execution(
