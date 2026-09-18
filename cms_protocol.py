@@ -283,6 +283,7 @@ class FirmwareData:
     sisdk_commit: str = ""
     sisdk_hash: str = ""
     role_images: tuple[FirmwareRoleImage, ...] = ()
+    vcom: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -826,6 +827,8 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
             firmware_role_image_to_dict(role_image)
             for role_image in firmware.role_images
         ]
+    if firmware.vcom:
+        payload["vcom"] = firmware.vcom
     return payload
 
 
@@ -850,6 +853,11 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
     raw_role_images = data.get("role_images", [])
     if not isinstance(raw_role_images, list):
         raise ValueError("role_images must be a list")
+    raw_vcom = data.get("vcom", {})
+    if raw_vcom is None:
+        raw_vcom = {}
+    if not isinstance(raw_vcom, dict):
+        raise ValueError("firmware vcom must be an object")
     return FirmwareData(
         dut_img=dut_img,
         tester_img=tester_img,
@@ -869,6 +877,7 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         sisdk_commit=str(data.get("sisdk_commit", "")),
         sisdk_hash=str(data.get("sisdk_hash", "")),
         role_images=tuple(firmware_role_image_from_dict(item) for item in raw_role_images),
+        vcom=dict(raw_vcom),
     )
 
 

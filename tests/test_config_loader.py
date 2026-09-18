@@ -14,7 +14,10 @@ def test_effective_dev_config_accepts_pytest_string_paths(tmp_path: Path) -> Non
                     "board": "brd4182a",
                     "device": "EFR32MG22C224F512IM40",
                 },
-                "tools": {"commander": "/opt/silabs/commander"},
+                "tools": {
+                    "commander": "/opt/silabs/commander",
+                    "jlink_library": "/opt/silabs/libjlinkarm.so",
+                },
                 "ble": {
                     "sdk": {
                         "name": "com.silabs.sdk.stack.sisdk",
@@ -30,7 +33,18 @@ def test_effective_dev_config_accepts_pytest_string_paths(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     metadata_path.write_text(
-        json.dumps({"firmware": {"sisdk": "2025.12.3"}}),
+        json.dumps(
+            {
+                "firmware": {"sisdk": "2025.12.3"},
+                "vcom": {
+                    "enabled": True,
+                    "gpio": {
+                        "dout_address": "0x5003C040",
+                        "pin_mask": "0x00000010",
+                    },
+                },
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -40,8 +54,10 @@ def test_effective_dev_config_accepts_pytest_string_paths(tmp_path: Path) -> Non
     )
 
     assert config["tools"]["commander"] == "/opt/silabs/commander"
+    assert config["tools"]["jlink_library"] == "/opt/silabs/libjlinkarm.so"
     assert config["firmware"]["board"] == "brd4182a"
     assert config["firmware"]["sisdk"] == "2025.12.3"
     assert config["firmware"]["sisdk_name"] == "com.silabs.sdk.stack.sisdk"
     assert config["firmware"]["sisdk_version"] == "2025.12.3"
     assert config["firmware"]["xapi_file_hash"] == "xapi-hash"
+    assert config["vcom"]["gpio"]["dout_address"] == "0x5003C040"

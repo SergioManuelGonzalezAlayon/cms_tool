@@ -78,6 +78,7 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
         },
         "tools": {
             "commander": tools.get("commander") or metadata.get("tools", {}).get("commander"),
+            "jlink_library": tools.get("jlink_library") or metadata.get("tools", {}).get("jlink_library"),
         },
         "ble": {
             "xapi": metadata.get("ble", {}).get("xapi") or ble.get("xapi"),
@@ -111,6 +112,7 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
             "sisdk_hash": fw_metadata.get("sisdk_hash") or sdk.get("hash"),
             "xapi_file_hash": fw_metadata.get("xapi_file_hash") or sdk.get("xapi_sha256"),
         },
+        "vcom": metadata.get("vcom", runtime.get("vcom", {})),
     }
 
 def get_effective_config_paths(*, role: str | None = None) -> list[Path]:
@@ -137,4 +139,3 @@ def load_effective_config(*, role: str | None = None) -> dict:
     for path in get_effective_config_paths(role=role):
         config = _deep_merge(config, _read_json_file(path))
     return config
-

@@ -967,8 +967,14 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     tester_image.write_bytes(b"exact-tester-s37")
     dut_hash = hashlib.sha256(dut_image.read_bytes()).hexdigest()
     tester_hash = hashlib.sha256(tester_image.read_bytes()).hexdigest()
-    xapi = runtime / "sl_bt.xapi"
+    sdk_path = tmp_path / "sdk"
+    xapi = sdk_path / "bluetooth_le_host" / "api" / "sl_bt.xapi"
+    xapi.parent.mkdir(parents=True, exist_ok=True)
     xapi.write_bytes(b"exact-sdk-xapi")
+    (sdk_path / ".properties").write_text(
+        "id=com.silabs.sdk.stack.sisdk\nversion=2026.1.0\n",
+        encoding="utf-8",
+    )
     xapi_hash = hashlib.sha256(xapi.read_bytes()).hexdigest()
     (build_root / "fw_data.json").write_text(
         json.dumps({
@@ -987,6 +993,17 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
                 "hash": "sdk-hash",
                 "package_path": str(sdk_root),
                 "xapi_sha256": xapi_hash,
+                "package_path": str(sdk_path),
+            },
+            "vcom": {
+                "enabled": True,
+                "gpio": {
+                    "port": "B",
+                    "pin": 4,
+                    "peripheral": "GPIO_NS",
+                    "dout_address": "0x5003C040",
+                    "pin_mask": "0x00000010",
+                },
             },
         }),
         encoding="utf-8",
@@ -1021,6 +1038,16 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     assert request.firmware.tester_img.sha256 == tester_hash
     assert request.firmware.dut_variants["dcdc"].url == str(dut_image)
     assert request.firmware.dut_variants["no_dcdc"].url == str(no_dcdc_dut_image)
+    assert request.firmware.vcom == {
+        "enabled": True,
+        "gpio": {
+            "port": "B",
+            "pin": 4,
+            "peripheral": "GPIO_NS",
+            "dout_address": "0x5003C040",
+            "pin_mask": "0x00000010",
+        },
+    }
 
     args.sisdk_version = "2025.12.3"
     with pytest.raises(RuntimeError, match="does not match the firmware build provenance"):

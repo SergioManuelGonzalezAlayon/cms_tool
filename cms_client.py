@@ -1661,6 +1661,7 @@ def _request_from_send_fw_args(
         )
     firmware_cfg = dict(fw_data.get("firmware", {}))
     firmware_cfg["build_root"] = str(build_root)
+    vcom_metadata = _vcom_metadata_from_fw_data(fw_data, build_root)
     sdk_cfg = fw_data.get("sdk", {})
     sdk_source = str(sdk_cfg.get("source", ""))
     sdk_version = str(sdk_cfg.get("version", firmware_cfg.get("sisdk", "")))
@@ -1792,6 +1793,7 @@ def _request_from_send_fw_args(
             sisdk_version=sdk_version,
             sisdk_commit=sdk_commit,
             sisdk_hash=sdk_hash,
+            vcom=vcom_metadata,
         ),
         requested_by=args.requested_by,
     )
@@ -1886,6 +1888,18 @@ def _require_matching_build_provenance(label: str, requested: str, built: str) -
             f"Requested {label} '{requested}' does not match the firmware build provenance '{built}'. "
             "Rebuild with the requested SDK selection before sending firmware."
         )
+
+
+def _vcom_metadata_from_fw_data(fw_data: dict[str, Any], build_root: Path) -> dict[str, Any]:
+    vcom_metadata = fw_data.get("vcom", {})
+    if vcom_metadata is None:
+        return {}
+    if not isinstance(vcom_metadata, dict):
+        raise RuntimeError(
+            f"Build provenance has invalid VCOM metadata in {build_root / 'fw_data.json'}: "
+            "field 'vcom' must be an object."
+        )
+    return dict(vcom_metadata)
 
 
 def _sisdk_name_from_properties(sdk_package_path: Path) -> str:

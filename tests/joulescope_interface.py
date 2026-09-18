@@ -9,10 +9,13 @@ from presentation.outlier_plots import OutlierPlotsGenerator
 from pathlib import Path
 from time import sleep
 from utils.config_loader import effective_dev_config
+from utils.wpk import setDebugMode, setVCOM
 
 log = logging.getLogger(__name__)
 DUT_WAKE_GPIO = 0
 USB_RESET_TIMEOUT_S = 15.0
+_CMS_RUNTIME_CONFIG_PATH = None
+_CMS_FW_METADATA_PATH = None
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
@@ -112,7 +115,12 @@ class WakePinJoulescope(Joulescope):
 
     def capture(self, seconds: float, on_progress=None):
         if not self.use_wake_pin:
-            result = super().capture(seconds, on_progress=on_progress)
+            result = _capture_with_wpk_quieting(
+                lambda: super(WakePinJoulescope, self).capture(
+                    seconds,
+                    on_progress=on_progress,
+                )
+            )
             self.capture_sequence += 1
             return result
 
@@ -123,11 +131,13 @@ class WakePinJoulescope(Joulescope):
         self.sleepDUT()
         try:
             sleep(self.dut_sleep_settle_ms / 1000.0)
-            self.capture_data = self.read(
-                self.driver,
-                self.signals_full,
-                duration=float(seconds),
-                on_progress=on_progress,
+            self.capture_data = _capture_with_wpk_quieting(
+                lambda: self.read(
+                    self.driver,
+                    self.signals_full,
+                    duration=float(seconds),
+                    on_progress=on_progress,
+                )
             )
         finally:
             self.wakeDUT()
@@ -157,6 +167,34 @@ class WakePinJoulescope(Joulescope):
         self.driver.publish(f"{device_path}/s/gpo/+/!clr", 1 << self.dut_wake_gpio)
         sleep(self.dut_awake_settle_s)
         self.driver.publish(f"{device_path}/s/gpo/+/!clr", 1 << self.dut_wake_gpio)
+
+
+def _configure_wpk_config_paths(runtime_path=None, metadata_path=None) -> None:
+    global _CMS_RUNTIME_CONFIG_PATH, _CMS_FW_METADATA_PATH
+    _CMS_RUNTIME_CONFIG_PATH = runtime_path
+    _CMS_FW_METADATA_PATH = metadata_path
+
+
+def _effective_wpk_config() -> dict:
+    return effective_dev_config(
+        runtime_path=_CMS_RUNTIME_CONFIG_PATH,
+        metadata_path=_CMS_FW_METADATA_PATH,
+    )
+
+
+def _capture_with_wpk_quieting(capture):
+    config = _effective_wpk_config()
+    setVCOM(config, False)
+    try:
+        setDebugMode(config, "OFF")
+        try:
+            result = capture()
+            log.info("Joulescope capture complete")
+            return result
+        finally:
+            setDebugMode(config, "MCU")
+    finally:
+        setVCOM(config, True)
 
 
 def _artifact_stem(test_name=None, config_name=None):
@@ -383,9 +421,13 @@ def _reset_joulescope_usb(usb_id: str) -> None:
         sleep(0.5)
 
 @pytest.fixture(scope="session")
-def JoulescopeDev(JoulescopeUsbReset):
+def JoulescopeDev(JoulescopeUsbReset, request: pytest.FixtureRequest):
     log.info("SETUP START: Joulescope driver creation")
     cfg = JoulescopeConfig(open_mode="defaults")
+    _configure_wpk_config_paths(
+        runtime_path=request.config.getoption("--cms-runtime-config"),
+        metadata_path=request.config.getoption("--cms-fw-metadata"),
+    )
     js = WakePinJoulescope(**asdict(cfg))
 
     js.create_driver()

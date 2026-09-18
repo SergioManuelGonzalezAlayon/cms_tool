@@ -15,6 +15,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.config_loader import BUILD_CONFIG_ENV, _load_json
+from utils.svd import (
+    GpioPortRegisters,
+    ensure_svd_source,
+    parse_gpio_port_registers_from_svd_file,
+    svd_device_from_target_device,
+    svd_export_version_from_sisdk_version,
+)
+from utils.wpk import parse_board_vcom_gpio, vcom_gpio_header_path
 
 
 APPS_DIR = REPO_ROOT / "apps"
@@ -146,6 +154,9 @@ def effective_build_config(config: dict, overrides: argparse.Namespace | None = 
         "sisdk_package_path": str(
             override("sdk_package_path", target.get("sisdk_package_path", target.get("sdk_package_path", "")))
         ),
+        "adapter_board": str(target.get("adapter_board", target.get("wpk_board", "brd4002a"))),
+        "svd_path": str(target.get("svd_path", "")),
+        "svd_cache_dir": str(target.get("svd_cache_dir", "")),
         "build_root": str(override("build_root", build.get("root", config.get("build_root", DEFAULT_BUILD_ROOT)))),
         "bootloader_slcp": str(
             override("bootloader_slcp", build.get("bootloader_slcp", config.get("bootloader_slcp", DEFAULT_BOOTLOADER_SLCP)))
@@ -195,6 +206,11 @@ def validate_firmware_config(effective_config: dict) -> dict[str, str]:
         "brev": str(brev),
         "device": str(device),
         "sisdk": str(sisdk),
+        "adapter_board": str(firmware.get("adapter_board", "brd4002a") or "brd4002a"),
+        "svd_version": svd_export_version_from_sisdk_version(str(sisdk)),
+        "svd_device": str(firmware.get("svd_device", "") or svd_device_from_target_device(str(device))),
+        "svd_path": str(firmware.get("svd_path", "")),
+        "svd_cache_dir": str(firmware.get("svd_cache_dir", "")),
     }
 
 
@@ -451,6 +467,147 @@ def copy_bgapi_xapi(build_root: Path, sdk_path: Path) -> Path:
     return target
 
 
+def resolve_vcom_build_metadata(
+    *,
+    firmware_cfg: dict[str, str],
+    sdk_path: Path,
+    build_root: Path,
+) -> dict:
+    """Resolve VCOM control metadata from build-time board and SVD inputs."""
+
+    adapter_board = firmware_cfg.get("adapter_board", "brd4002a") or "brd4002a"
+    header_path = vcom_gpio_header_path(
+        sdk_path,
+        firmware_cfg["board"],
+        adapter_board,
+    )
+    try:
+        vcom_gpio = parse_board_vcom_gpio(
+            sdk_path,
+            firmware_cfg["board"],
+            adapter_board,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Unable to resolve VCOM GPIO from the selected SiSDK board header: "
+            f"{header_path}. "
+            "Check target.board, target.adapter_board, and target.sisdk_package_path."
+        ) from exc
+
+    cache_dir = Path(firmware_cfg.get("svd_cache_dir", "") or build_root / "svd_cache")
+    configured_svd_path = firmware_cfg.get("svd_path", "")
+    svd_version = firmware_cfg.get("svd_version", "") or svd_export_version_from_sisdk_version(
+        firmware_cfg["sisdk"]
+    )
+    svd_device = firmware_cfg.get("svd_device", "") or svd_device_from_target_device(
+        firmware_cfg["device"]
+    )
+    try:
+        svd_source = ensure_svd_source(
+            svd_version=svd_version,
+            svd_device=svd_device,
+            cache_dir=cache_dir,
+            configured_svd_path=configured_svd_path,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            "Unable to use configured SVD path. "
+            "Check cms_client_config.json target.svd_path."
+        ) from exc
+
+    if svd_source.path is None:
+        raise RuntimeError("resolved SVD source did not provide a local file path")
+
+    try:
+        gpio_registers = parse_gpio_port_registers_from_svd_file(
+            svd_source.path,
+            vcom_gpio.port,
+            vcom_gpio.pin,
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Unable to resolve VCOM GPIO register addresses from SVD: "
+            f"{svd_source.path}."
+        ) from exc
+
+    return _vcom_metadata_to_dict(
+        board=firmware_cfg["board"],
+        adapter_board=adapter_board,
+        device=firmware_cfg["device"],
+        svd_version=svd_source.svd_version,
+        svd_device=svd_source.svd_device,
+        header_path=header_path,
+        svd_path=svd_source.path,
+        svd_source=svd_source.source,
+        artifactory_url=svd_source.artifactory_url,
+        cache_path=svd_source.cache_path,
+        gpio_port=vcom_gpio.port,
+        gpio_pin=vcom_gpio.pin,
+        gpio_registers=gpio_registers,
+    )
+
+
+def _vcom_metadata_to_dict(
+    *,
+    board: str,
+    adapter_board: str,
+    device: str,
+    svd_version: str,
+    svd_device: str,
+    header_path: Path,
+    svd_path: Path,
+    svd_source: str,
+    artifactory_url: str,
+    cache_path: Path,
+    gpio_port: str,
+    gpio_pin: int,
+    gpio_registers: GpioPortRegisters,
+) -> dict:
+    gpio = {
+        "port": gpio_port,
+        "pin": gpio_pin,
+        "peripheral": gpio_registers.peripheral,
+        "peripheral_base_address": _hex_u32(gpio_registers.peripheral_base_address),
+        "port_base_address": _hex_u32(gpio_registers.port_base_address),
+        "dout_address": _hex_u32_or_none(gpio_registers.dout_address),
+        "pin_mask": _hex_u32(gpio_registers.pin_mask),
+        "mode_register_address": _hex_u32_or_none(gpio_registers.mode_register_address),
+        "mode_mask": _hex_u32(gpio_registers.mode_mask),
+        "mode_push_pull_value": _hex_u32(gpio_registers.mode_push_pull_value),
+    }
+    if gpio_registers.dout_set_address is not None:
+        gpio["dout_set_address"] = _hex_u32(gpio_registers.dout_set_address)
+    if gpio_registers.dout_clear_address is not None:
+        gpio["dout_clear_address"] = _hex_u32(gpio_registers.dout_clear_address)
+
+    return {
+        "enabled": True,
+        "source": {
+            "board_config_header": str(header_path.resolve()),
+            "board_config_header_sha256": _sha256(header_path),
+            "svd": str(svd_path.resolve()),
+            "svd_sha256": _sha256(svd_path),
+            "svd_source": svd_source,
+            "svd_artifactory_url": artifactory_url,
+            "svd_cache_path": str(cache_path),
+        },
+        "board": board,
+        "adapter_board": adapter_board,
+        "device": device,
+        "svd_version": svd_version,
+        "svd_device": svd_device,
+        "gpio": gpio,
+    }
+
+
+def _hex_u32(value: int) -> str:
+    return f"0x{value:08X}"
+
+
+def _hex_u32_or_none(value: int | None) -> str | None:
+    return None if value is None else _hex_u32(value)
+
+
 def _relative_to_build_root(path: Path, build_root: Path) -> str:
     return str(path.resolve().relative_to(build_root.resolve()))
 
@@ -491,6 +648,7 @@ def write_build_metadata(
     sdk_path: Path,
     runtime_xapi_path: Path | None,
     sdk_selection: SDKSelection | None = None,
+    vcom_metadata: dict | None = None,
 ) -> Path:
     artifacts = [
         {
@@ -535,6 +693,8 @@ def write_build_metadata(
         },
         "artifacts": artifacts,
     }
+    if vcom_metadata is not None:
+        metadata["vcom"] = vcom_metadata
     metadata_path = out_dir / BUILD_METADATA_FILENAME
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return metadata_path
@@ -548,6 +708,7 @@ def write_fw_data(
     runtime_xapi_path: Path,
     summaries: list[dict],
     sdk_selection: SDKSelection | None = None,
+    vcom_metadata: dict | None = None,
 ) -> Path:
     artifacts = firmware_artifacts_from_summaries(summaries)
     hash_by_role = {
@@ -587,6 +748,8 @@ def write_fw_data(
             "xapi_sha256": sdk_selection.xapi_hash if sdk_selection else _sha256(runtime_xapi_path),
         },
     }
+    if vcom_metadata is not None:
+        fw_data["vcom"] = vcom_metadata
     fw_data_path = build_root / FW_DATA_FILENAME
     fw_data_path.write_text(json.dumps(fw_data, indent=2) + "\n", encoding="utf-8")
     return fw_data_path
@@ -742,6 +905,7 @@ def process_slcp(
     runtime_xapi_path: Path | None,
     action: str,
     sdk_selection: SDKSelection | None = None,
+    vcom_metadata: dict | None = None,
 ) -> dict:
     out_dir = output_dir_for(slcp, build_root)
     started_at = time.perf_counter()
@@ -772,6 +936,7 @@ def process_slcp(
             sdk_path=sdk_path,
             runtime_xapi_path=runtime_xapi_path,
             sdk_selection=sdk_selection,
+            vcom_metadata=vcom_metadata,
         )
 
     return {
@@ -844,8 +1009,14 @@ def run_firmware_action(
     sdk_path = sdk_selection.path
     trust_sisdk(sdk_path)
     runtime_xapi_path = None
+    vcom_metadata = None
     if parsed.action in {"build", "rebuild"}:
         runtime_xapi_path = copy_bgapi_xapi(build_root, sdk_path)
+        vcom_metadata = resolve_vcom_build_metadata(
+            firmware_cfg=firmware_cfg,
+            sdk_path=sdk_path,
+            build_root=build_root,
+        )
 
     slcps = discover_slcps(parsed.targets)
     if not slcps:
@@ -862,6 +1033,7 @@ def run_firmware_action(
             runtime_xapi_path=runtime_xapi_path,
             action=parsed.action,
             sdk_selection=sdk_selection,
+            vcom_metadata=vcom_metadata,
         )
         summaries.append(summary)
         print(
@@ -886,6 +1058,7 @@ def run_firmware_action(
             runtime_xapi_path=runtime_xapi_path,
             summaries=summaries,
             sdk_selection=sdk_selection,
+            vcom_metadata=vcom_metadata,
         )
 
     print(

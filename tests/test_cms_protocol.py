@@ -299,6 +299,35 @@ def test_measurement_request_round_trip_preserves_variable_filters():
     )
 
 
+def test_measurement_request_round_trip_preserves_vcom_metadata():
+    vcom = {
+        "enabled": True,
+        "board": "brd4182a",
+        "device": "EFR32MG22C224F512IM40-C",
+        "gpio": {
+            "port": "B",
+            "pin": 4,
+            "peripheral": "GPIO_NS",
+            "dout_address": "0x5003C040",
+            "pin_mask": "0x00000010",
+        },
+    }
+    request = MeasurementRequest(
+        request_id="measurement-123",
+        selector=SuiteSelector(mode="ble", feature="beacon"),
+        firmware=FirmwareData(
+            dut_img=FirmwareImage(name="dut.s37", url="dut.s37"),
+            tester_img=FirmwareImage(name="tester.s37", url="tester.s37"),
+            vcom=vcom,
+        ),
+    )
+
+    payload = measurement_request_to_dict(request)
+
+    assert payload["firmware"]["vcom"] == vcom
+    assert measurement_request_from_dict(payload).firmware.vcom == vcom
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [("", "2m"), ("phy", ""), ("phy=value", "2m")],

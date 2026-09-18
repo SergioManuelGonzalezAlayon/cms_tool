@@ -77,6 +77,11 @@ def test_validate_firmware_config_uses_effective_config_values() -> None:
         "brev": "",
         "device": "EFR32BG22C224F512GM40",
         "sisdk": "2025.12.2",
+        "adapter_board": "brd4002a",
+        "svd_version": "2025.12.0",
+        "svd_device": "EFR32BG22A224F512GM40",
+        "svd_path": "",
+        "svd_cache_dir": "",
     }
 
 
@@ -97,6 +102,9 @@ def test_effective_build_config_cli_overrides_client_config() -> None:
                 "device": "EFR32MG22C224F512IM40",
                 "sisdk": "2025.12.3",
                 "sisdk_package_path": r"C:\sdk\config",
+                "adapter_board": "brd4002a",
+                "svd_path": r"C:\svd\device.svd",
+                "svd_cache_dir": r"C:\svd-cache",
             },
             "build": {"root": "config-build", "bootloader_slcp": "apps/boot.slcp"},
             "tools": {"slc": "config-slc"},
@@ -110,6 +118,9 @@ def test_effective_build_config_cli_overrides_client_config() -> None:
         "device": "EFR32MG22C224F512IM40",
         "sisdk": "2026.1.0",
         "sisdk_package_path": r"C:\sdk\cli",
+        "adapter_board": "brd4002a",
+        "svd_path": r"C:\svd\device.svd",
+        "svd_cache_dir": r"C:\svd-cache",
         "build_root": "cli-build",
         "bootloader_slcp": "apps/boot.slcp",
     }
@@ -862,6 +873,101 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
         build_root / "diff" / "version2" / app_manager.FW_DATA_FILENAME
     )
     assert manifest["variants"]["version1"]["sdk"]["version"] == "2025.12.3"
+
+
+def test_write_fw_data_records_resolved_vcom_metadata() -> None:
+    build_root = Path("build/test_write_fw_data_vcom")
+    if build_root.exists():
+        shutil.rmtree(build_root)
+    runtime_dir = build_root / "runtime"
+    runtime_dir.mkdir(parents=True)
+    runtime_xapi = runtime_dir / "sl_bt.xapi"
+    runtime_xapi.write_bytes(b"xapi")
+    sdk_path = build_root / "sdk"
+    header_path = (
+        sdk_path
+        / "boards"
+        / "hardware"
+        / "board"
+        / "config"
+        / "brd4182a_brd4002a"
+        / "btl_uart_driver_cfg.h"
+    )
+    header_path.parent.mkdir(parents=True)
+    header_path.write_text(
+        "#define SL_VCOM_ENABLE_PORT SL_GPIO_PORT_B\n"
+        "#define SL_VCOM_ENABLE_PIN 4\n",
+        encoding="utf-8",
+    )
+    svd_path = build_root / "EFR32MG22C224F512IM40.svd"
+    svd_path.write_text(
+        "<device>"
+        "<peripherals>"
+        "<peripheral>"
+        "<name>GPIO_NS</name>"
+        "<baseAddress>0x5003C000</baseAddress>"
+        "<registers>"
+        "<register><name>PORTB_CTRL</name><addressOffset>0x030</addressOffset></register>"
+        "<register>"
+        "<name>PORTB_MODEL</name>"
+        "<addressOffset>0x034</addressOffset>"
+        "<fields>"
+        "<field>"
+        "<name>MODE4</name>"
+        "<enumeratedValues>"
+        "<enumeratedValue><name>PUSHPULL</name><value>4</value></enumeratedValue>"
+        "</enumeratedValues>"
+        "</field>"
+        "</fields>"
+        "</register>"
+        "<register><name>PORTB_DOUT</name><addressOffset>0x040</addressOffset></register>"
+        "</registers>"
+        "</peripheral>"
+        "</peripherals>"
+        "</device>",
+        encoding="utf-8",
+    )
+    firmware_cfg = {
+        "board": "BRD4182A_B06",
+        "brev": "b06",
+        "device": "EFR32MG22C224F512IM40-C",
+        "sisdk": "2025.12.3",
+        "adapter_board": "brd4002a",
+        "svd_path": str(svd_path),
+    }
+
+    vcom_metadata = app_manager.resolve_vcom_build_metadata(
+        firmware_cfg=firmware_cfg,
+        sdk_path=sdk_path,
+        build_root=build_root,
+    )
+    fw_data_path = app_manager.write_fw_data(
+        build_root=build_root,
+        firmware_cfg=firmware_cfg,
+        sdk_path=sdk_path,
+        runtime_xapi_path=runtime_xapi,
+        summaries=[],
+        vcom_metadata=vcom_metadata,
+    )
+
+    fw_data = json.loads(fw_data_path.read_text(encoding="utf-8"))
+    assert fw_data["vcom"]["board"] == "BRD4182A_B06"
+    assert fw_data["vcom"]["adapter_board"] == "brd4002a"
+    assert fw_data["vcom"]["device"] == "EFR32MG22C224F512IM40-C"
+    assert fw_data["vcom"]["svd_version"] == "2025.12.0"
+    assert fw_data["vcom"]["svd_device"] == "EFR32MG22A224F512IM40"
+    assert fw_data["vcom"]["gpio"]["port"] == "B"
+    assert fw_data["vcom"]["gpio"]["pin"] == 4
+    assert fw_data["vcom"]["gpio"]["peripheral"] == "GPIO_NS"
+    assert fw_data["vcom"]["gpio"]["peripheral_base_address"] == "0x5003C000"
+    assert fw_data["vcom"]["gpio"]["port_base_address"] == "0x5003C030"
+    assert fw_data["vcom"]["gpio"]["dout_address"] == "0x5003C040"
+    assert fw_data["vcom"]["gpio"]["pin_mask"] == "0x00000010"
+    assert fw_data["vcom"]["gpio"]["mode_register_address"] == "0x5003C034"
+    assert fw_data["vcom"]["gpio"]["mode_mask"] == "0x000F0000"
+    assert fw_data["vcom"]["gpio"]["mode_push_pull_value"] == "0x00040000"
+    assert fw_data["vcom"]["source"]["board_config_header_sha256"] == app_manager._sha256(header_path)
+    assert fw_data["vcom"]["source"]["svd_sha256"] == app_manager._sha256(svd_path)
 
 
 def test_load_effective_config_layers_role_specific_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

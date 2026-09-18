@@ -212,6 +212,32 @@ def test_pytest_runtime_metadata_contains_requested_config_hash(tmp_path, monkey
     }
 
 
+def test_pytest_runtime_metadata_contains_staged_vcom_metadata(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    session.manifest.vcom = {
+        "enabled": True,
+        "gpio": {
+            "port": "B",
+            "pin": 4,
+            "peripheral": "GPIO_NS",
+            "dout_address": "0x5003C040",
+            "pin_mask": "0x00000010",
+        },
+    }
+    for name in ("dut.s37", "tester.s37", "sl_bt.xapi"):
+        (tmp_path / name).write_bytes(name.encode("ascii"))
+    monkeypatch.setattr(
+        cms_bench,
+        "_load_requested_test_config",
+        lambda session: {"firmware": {"dut_slcp": "dut.slcp", "tester_slcp": "tester.slcp"}},
+    )
+
+    prepared = cms_bench._prepare_pytest_runtime(session, BenchResources())
+    metadata = json.loads(prepared["metadata_path"].read_text(encoding="utf-8"))
+
+    assert metadata["vcom"] == session.manifest.vcom
+
+
 def test_pytest_runtime_metadata_contains_variable_filters(tmp_path, monkeypatch):
     session = _session(
         tmp_path,
@@ -340,6 +366,51 @@ def test_bench_accepts_matching_requested_config_hash(tmp_path):
     session = _session(tmp_path, config="default", config_hash=config_hash)
 
     assert isinstance(cms_bench._load_requested_test_config(session), dict)
+
+
+def test_bench_accepts_firmware_device_with_package_suffix(tmp_path):
+    session = _session(tmp_path)
+    session.manifest.board = "brd4182a"
+    session.manifest.device = "EFR32MG22C224F512IM40-C"
+    _stage_manifest_files(session)
+
+    bench = CMSBench(
+        resources=BenchResources(
+            board="brd4182a",
+            device="EFR32MG22C224F512IM40",
+        )
+    )
+
+    bench.test_prepare(session)
+
+
+def test_bench_still_rejects_different_firmware_device(tmp_path):
+    session = _session(tmp_path)
+    session.manifest.board = "brd4182a"
+    session.manifest.device = "EFR32MG24B310F1536IM48"
+    _stage_manifest_files(session)
+
+    bench = CMSBench(
+        resources=BenchResources(
+            board="brd4182a",
+            device="EFR32MG22C224F512IM40",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="does not match bench device"):
+        bench.test_prepare(session)
+
+
+def _stage_manifest_files(session: BenchSession) -> None:
+    dut_path = session.runtime_dir / session.manifest.dut_img.name
+    tester_path = session.runtime_dir / session.manifest.tester_img.name
+    xapi_path = session.runtime_dir / session.manifest.xapi_file.name
+    dut_path.write_bytes(b"dut")
+    tester_path.write_bytes(b"tester")
+    xapi_path.write_bytes(b"xapi")
+    session.manifest.dut_img.sha256 = cms_bench._sha256_file(dut_path)
+    session.manifest.tester_img.sha256 = cms_bench._sha256_file(tester_path)
+    session.manifest.xapi_file.sha256 = cms_bench._sha256_file(xapi_path)
 
 
 def test_bench_runs_default_config_without_exact_config_override(tmp_path, monkeypatch):

@@ -1429,6 +1429,8 @@ def _prepare_pytest_runtime(
             "xapi": str(xapi_path),
         },
     }
+    if session.manifest.vcom:
+        metadata["vcom"] = session.manifest.vcom
     metadata_path = session.runtime_dir / "cms_fw_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     prepared = {
