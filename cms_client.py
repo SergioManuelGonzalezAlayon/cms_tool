@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Callable
@@ -1345,8 +1346,9 @@ def build_cli_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
-            "  cms ARTIFACTS <measurement_id> --out-dir artifacts\n\n"
-            "Required arguments:\n"
+            "  cms ARTIFACTS <measurement_id> --out-dir artifacts\n"
+            "  cms ARTIFACTS --out-dir artifacts  # saved ongoing debug measurement\n\n"
+            "Optional argument:\n"
             "  measurement_id   explicit measurement whose artifacts should be downloaded\n\n"
             "Defaults:\n"
             "  --out-dir artifacts\n\n"
@@ -1355,7 +1357,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_color_argument(artifacts)
-    artifacts.add_argument("measurement_id")
+    artifacts.add_argument(
+        "measurement_id",
+        nargs="?",
+        default="",
+        help="measurement id; omit to use the saved ongoing debug measurement",
+    )
     artifacts.add_argument("--out-dir", default="artifacts")
 
     failed = subparsers.add_parser(
@@ -1621,8 +1628,9 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command in {"artifacts", "ARTIFACTS"}:
+        measurement_id = args.measurement_id or _saved_debug_measurement_id(args.config)
         for path in client.download_measurement_artifacts(
-            args.measurement_id,
+            measurement_id,
             Path(args.out_dir),
         ):
             print(path)
@@ -1967,6 +1975,95 @@ def _sync_config_sisdk_version(config_path: str | Path, sdk_package_path: str = 
     return version
 
 
+def _record_debug_measurement(
+    args: argparse.Namespace,
+    measurement_id: str,
+    variable_filters: tuple[VariableFilter, ...],
+) -> None:
+    """Record an ongoing debug measurement for later artifact retrieval."""
+
+    path = Path(args.config)
+    config = _read_json_file(path)
+    record = _measurement_record(args, measurement_id, variable_filters)
+    record["status"] = "ongoing"
+    config["debug_measurement"] = record
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def _record_last_measurement(
+    args: argparse.Namespace,
+    measurement_id: str,
+    variable_filters: tuple[VariableFilter, ...],
+) -> None:
+    """Record the most recently accepted test measurement in client config."""
+
+    path = Path(args.config)
+    config = _read_json_file(path)
+    config["last_measurement"] = _measurement_record(args, measurement_id, variable_filters)
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def _measurement_record(
+    args: argparse.Namespace,
+    measurement_id: str,
+    variable_filters: tuple[VariableFilter, ...],
+) -> dict[str, Any]:
+    """Build one persistent client-side measurement reference."""
+
+    path = Path(args.config)
+    config = _read_json_file(path)
+    endpoint = args.base_url.strip()
+    if not endpoint:
+        daemon = config.get("daemon", {})
+        if isinstance(daemon, dict):
+            base_url = str(daemon.get("base_url", "")).strip()
+            if base_url:
+                endpoint = base_url.rstrip("/")
+            else:
+                scheme = str(daemon.get("scheme", config.get("scheme", "http")))
+                host = str(daemon.get("host", config.get("host", platform.node())))
+                port = int(daemon.get("port", config.get("port", 8000)))
+                endpoint = f"{scheme}://{host}:{port}"
+        else:
+            endpoint = f"http://{platform.node()}:8000"
+
+    return {
+        "measurement_id": measurement_id,
+        "mode": args.mode,
+        "feature": args.feature,
+        "config": args.config_name,
+        "run_name": args.run_name,
+        "variable_filters": [
+            {"name": item.name, "value": item.value}
+            for item in variable_filters
+        ],
+        "endpoint": endpoint,
+        "out_dir": args.out_dir,
+        "submitted_at": datetime.utcnow().isoformat(),
+    }
+
+
+def _saved_debug_measurement_id(config_path: str | Path) -> str:
+    """Return the measurement recorded by the most recent ongoing debug run."""
+
+    config = _read_json_file(Path(config_path))
+    debug_measurement = config.get("debug_measurement")
+    if not isinstance(debug_measurement, dict):
+        raise RuntimeError(
+            "no ongoing debug measurement is saved; pass a measurement_id explicitly"
+        )
+    if debug_measurement.get("status") != "ongoing":
+        raise RuntimeError(
+            "the saved debug measurement is not ongoing; pass a measurement_id explicitly"
+        )
+    measurement_id = str(debug_measurement.get("measurement_id", "")).strip()
+    if not measurement_id:
+        raise RuntimeError(
+            "the saved debug measurement has no measurement_id; pass one explicitly"
+        )
+    return measurement_id
+
+
 def _read_json_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -2252,6 +2349,9 @@ def _run_test_feature(
     if not result.measurement_id:
         _print_measurement_result(result, colors=colors)
         return _measurement_exit_code(result.state)
+    _record_last_measurement(args, result.measurement_id, variable_filters)
+    if args.debug:
+        _record_debug_measurement(args, result.measurement_id, variable_filters)
     state = _watch_remote_measurement(
         client,
         result.measurement_id,

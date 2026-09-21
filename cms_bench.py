@@ -346,6 +346,7 @@ class BenchSession:
     job_plan_path: Path | None = None
     console_relay: MeasurementEventStream | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    persistent_artifacts_dir: Path | None = None
     event_stream: MeasurementEventStream = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -364,6 +365,15 @@ class BenchSession:
         """Return the RAM-backed directory that owns active firmware images."""
 
         return self.active_firmware_dir or self.runtime_dir
+
+
+    @property
+    def debug_artifacts_dir(self) -> Path | None:
+        """Return the persistent live-log location for an opted-in debug run."""
+
+        if not self.request.debug_artifact_streaming:
+            return None
+        return self.persistent_artifacts_dir
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,7 +397,6 @@ class DifferentialCampaignSession:
         if variant not in self.run_order:
             raise ValueError(f"unknown differential firmware variant: {variant}")
         return self.execution_runtime_dir / "results" / variant
-
 
 @dataclass(slots=True)
 class CMSBenchRunRequest:
@@ -1517,6 +1526,8 @@ def _run_managed_process(
     cwd: Path,
     stdout_path: Path,
     stderr_path: Path,
+    persistent_stdout_path: Path | None = None,
+    persistent_stderr_path: Path | None = None,
     event_stream: MeasurementEventStream | None = None,
     relay_event_stream: MeasurementEventStream | None = None,
     relay_variant: str = "",
@@ -1534,6 +1545,10 @@ def _run_managed_process(
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     stdout_path.write_text("", encoding="utf-8")
     stderr_path.write_text("", encoding="utf-8")
+    for persistent_path in (persistent_stdout_path, persistent_stderr_path):
+        if persistent_path is not None:
+            persistent_path.parent.mkdir(parents=True, exist_ok=True)
+            persistent_path.write_text("", encoding="utf-8")
 
     child_environment = os.environ.copy()
     child_environment["PYTHONUNBUFFERED"] = "1"
@@ -1578,6 +1593,7 @@ def _run_managed_process(
             relay_variant,
             log_max_bytes,
             drain_errors,
+            persistent_stdout_path,
         ),
         name="cms-stdout-drain",
         daemon=True,
@@ -1593,6 +1609,7 @@ def _run_managed_process(
             relay_variant,
             log_max_bytes,
             drain_errors,
+            persistent_stderr_path,
         ),
         name="cms-stderr-drain",
         daemon=True,
@@ -1728,6 +1745,7 @@ def _drain_process_stream(
     relay_variant: str,
     log_max_bytes: int,
     errors: list[OSError],
+    persistent_destination: Path | None = None,
 ) -> None:
     try:
         for line in stream:
@@ -1736,6 +1754,12 @@ def _drain_process_stream(
                 line,
                 max_bytes=log_max_bytes,
             )
+            if persistent_destination is not None:
+                _append_bounded_log(
+                    persistent_destination,
+                    line,
+                    max_bytes=log_max_bytes,
+                )
             if event_stream is not None:
                 event_stream.append_console(source, line)
                 if discarded_bytes:
@@ -1763,6 +1787,12 @@ def _run_test_orchestrator(
         raise RuntimeError(f"test config directory does not exist: {config_dir}")
 
     orchestrator_mode = _orchestrator_mode(session)
+    debug_artifacts_dir = session.debug_artifacts_dir
+    pytest_log_path = (
+        debug_artifacts_dir / "pytest.log"
+        if debug_artifacts_dir is not None
+        else session.runtime_dir / "pytest.log"
+    )
     cmd = [
         sys.executable,
         "-u",
@@ -1777,7 +1807,7 @@ def _run_test_orchestrator(
         "--cms-fw-metadata",
         str(metadata_path),
         "--log-file",
-        str(session.runtime_dir / "pytest.log"),
+        str(pytest_log_path),
         "--log-file-level",
         "INFO",
         "--log-file-mode",
@@ -1801,6 +1831,16 @@ def _run_test_orchestrator(
         cwd=Path("."),
         stdout_path=session.runtime_paths.stdout,
         stderr_path=session.runtime_paths.stderr,
+        persistent_stdout_path=(
+            debug_artifacts_dir / "test_stdout.log"
+            if debug_artifacts_dir is not None
+            else None
+        ),
+        persistent_stderr_path=(
+            debug_artifacts_dir / "test_stderr.log"
+            if debug_artifacts_dir is not None
+            else None
+        ),
         event_stream=session.event_stream,
         relay_event_stream=session.console_relay,
         relay_variant=session.variant,

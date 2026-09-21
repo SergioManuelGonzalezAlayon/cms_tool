@@ -90,6 +90,14 @@ PUBLISHABLE_CAMPAIGN_NAMES = frozenset(
     }
 )
 
+LIVE_DEBUG_ARTIFACT_NAMES = frozenset(
+    {
+        "pytest.log",
+        "test_stdout.log",
+        "test_stderr.log",
+    }
+)
+
 
 def _should_upload_results_to_database(mode: MeasurementMode | str) -> bool:
     measurement_mode = mode if isinstance(mode, MeasurementMode) else MeasurementMode(str(mode))
@@ -197,6 +205,7 @@ class CMSDaemon:
         self.last_measurement_id: str | None = None
         self.cancelled_measurements: set[str] = set()
         self.cancellation_events: dict[str, threading.Event] = {}
+        self.debug_artifact_measurements: set[str] = set()
 
     def initialize(self) -> None:
         """Prepare daemon runtime directories, staging files, and local bench."""
@@ -619,6 +628,8 @@ class CMSDaemon:
         """Stage the current measurement request without launching execution."""
 
         self.active_measurement_id = request.request_id
+        if request.debug_artifact_streaming:
+            self.debug_artifact_measurements.add(request.request_id)
         self.cancellation_events.setdefault(request.request_id, threading.Event())
         self.measurements[request.request_id] = MeasurementResult(
             measurement_id=request.request_id,
@@ -1036,6 +1047,11 @@ class CMSDaemon:
             cancel_event=self.cancellation_events.setdefault(
                 request.request_id,
                 threading.Event(),
+            ),
+            persistent_artifacts_dir=(
+                self._published_measurement_path(request.request_id)
+                if request.debug_artifact_streaming
+                else None
             ),
         )
 
@@ -1539,7 +1555,7 @@ class CMSDaemon:
             return {
                 "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
                 "measurement_id": measurement_id,
-                "artifacts": measurement_result_to_dict(result)["artifacts"],
+                "artifacts": self._measurement_artifact_payload(result),
             }
 
         @app.get("/artifacts/last")
@@ -1758,6 +1774,34 @@ class CMSDaemon:
         if result_path.exists():
             return measurement_result_from_dict(json.loads(result_path.read_text(encoding="utf-8")))
         return None
+
+    def _measurement_artifact_payload(self, result: MeasurementResult) -> list[dict[str, Any]]:
+        """Include available persistent debug logs while a debug measurement runs."""
+
+        artifacts = measurement_result_to_dict(result)["artifacts"]
+        if self.active_measurement_id != result.measurement_id:
+            return artifacts
+        if result.measurement_id not in self.debug_artifact_measurements:
+            return artifacts
+
+        published_dir = self._published_measurement_path(result.measurement_id)
+        existing_names = {str(artifact.get("name", "")) for artifact in artifacts}
+        for name in sorted(LIVE_DEBUG_ARTIFACT_NAMES):
+            path = published_dir / name
+            if not path.is_file() or name in existing_names:
+                continue
+            artifacts.append(
+                {
+                    "name": name,
+                    "path": str(path),
+                    "url": (
+                        f"/measurement/{result.measurement_id}/artifacts/"
+                        f"{urllib.parse.quote(name, safe='/')}"
+                    ),
+                    "result_type": ResultType.DIAGNOSTIC.value,
+                }
+            )
+        return artifacts
 
     def _touch_staging_files(self) -> None:
         for path in self.files.as_dict().values():
