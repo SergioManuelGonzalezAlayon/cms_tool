@@ -560,7 +560,11 @@ def run_config_manager(mode: str, targets: list[Path]) -> None:
     subprocess.run(cmd, cwd=REPO_ROOT, check=True, text=True)
 
 
-def run_job(job: Job, pytest_args: list[str], junit_path: Path) -> tuple[int, float]:
+def run_job(
+    job: Job,
+    pytest_args: list[str],
+    junit_path: Path,
+) -> tuple[int, float]:
     cmd = [
         sys.executable,
         "-m",
@@ -579,7 +583,8 @@ def run_job(job: Job, pytest_args: list[str], junit_path: Path) -> tuple[int, fl
     cmd.extend(["--junitxml", str(junit_path)])
     started = time.perf_counter()
     result = subprocess.run(cmd, cwd=REPO_ROOT, check=False, text=True)
-    return result.returncode, time.perf_counter() - started
+    duration_s = time.perf_counter() - started
+    return result.returncode, duration_s
 
 
 def strip_forwarded_cfg_args(pytest_args: list[str]) -> tuple[list[str], list[str]]:

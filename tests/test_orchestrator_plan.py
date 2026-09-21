@@ -833,6 +833,43 @@ def test_run_job_passes_authoritative_unique_junit_path(tmp_path, monkeypatch):
     assert captured["cmd"][-2:] == ["--junitxml", str(junit_path)]
 
 
+def test_run_job_retries_retryable_pytest_return_code(tmp_path, monkeypatch):
+    job = _job("default")
+    junit_path = tmp_path / "junit" / "0001-beacon-default.xml"
+    returncodes = [2, 0]
+    calls = []
+
+    def fake_subprocess_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=returncodes.pop(0))
+
+    monkeypatch.setattr(orchestrator.subprocess, "run", fake_subprocess_run)
+
+    returncode, _ = orchestrator.run_job(job, [], junit_path)
+
+    assert returncode == 0
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+
+
+def test_run_job_stops_after_retryable_return_code_budget(tmp_path, monkeypatch):
+    job = _job("default")
+    junit_path = tmp_path / "junit" / "0001-beacon-default.xml"
+    calls = []
+
+    def fake_subprocess_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=2)
+
+    monkeypatch.setattr(orchestrator.subprocess, "run", fake_subprocess_run)
+
+    returncode, _ = orchestrator.run_job(job, [], junit_path)
+
+    assert returncode == 2
+    assert len(calls) == 3
+    assert calls[0] == calls[1] == calls[2]
+
+
 def test_orchestrated_job_does_not_write_configured_global_junit(tmp_path, monkeypatch):
     (tmp_path / "pyproject.toml").write_text(
         "[tool.pytest.ini_options]\n"
