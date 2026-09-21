@@ -1528,6 +1528,8 @@ def _run_managed_process(
     stderr_path: Path,
     persistent_stdout_path: Path | None = None,
     persistent_stderr_path: Path | None = None,
+    pytest_log_source_path: Path | None = None,
+    persistent_pytest_log_path: Path | None = None,
     event_stream: MeasurementEventStream | None = None,
     relay_event_stream: MeasurementEventStream | None = None,
     relay_variant: str = "",
@@ -1535,17 +1537,23 @@ def _run_managed_process(
     timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S,
     cancel_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a child while draining both output pipes into active runtime logs."""
+    """Run a child while keeping RAM logs authoritative and mirroring debug logs."""
 
     if log_max_bytes < 1:
         raise ValueError("log_max_bytes must be positive")
     if timeout_s is not None and timeout_s <= 0:
         raise ValueError("timeout_s must be positive when configured")
+    if persistent_pytest_log_path is not None and pytest_log_source_path is None:
+        raise ValueError("persistent pytest logging requires a RAM source path")
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
     stdout_path.write_text("", encoding="utf-8")
     stderr_path.write_text("", encoding="utf-8")
-    for persistent_path in (persistent_stdout_path, persistent_stderr_path):
+    for persistent_path in (
+        persistent_stdout_path,
+        persistent_stderr_path,
+        persistent_pytest_log_path,
+    ):
         if persistent_path is not None:
             persistent_path.parent.mkdir(parents=True, exist_ok=True)
             persistent_path.write_text("", encoding="utf-8")
@@ -1582,6 +1590,21 @@ def _run_managed_process(
         )
 
     drain_errors: list[OSError] = []
+    pytest_log_mirror_stop = threading.Event()
+    pytest_log_mirror_thread: threading.Thread | None = None
+    if persistent_pytest_log_path is not None:
+        pytest_log_mirror_thread = threading.Thread(
+            target=_mirror_runtime_log,
+            args=(
+                pytest_log_source_path,
+                persistent_pytest_log_path,
+                pytest_log_mirror_stop,
+                drain_errors,
+            ),
+            name="cms-pytest-log-mirror",
+            daemon=True,
+        )
+        pytest_log_mirror_thread.start()
     stdout_thread = threading.Thread(
         target=_drain_process_stream,
         args=(
@@ -1666,6 +1689,9 @@ def _run_managed_process(
         returncode = process.returncode if process.returncode is not None else -1
     stdout_thread.join()
     stderr_thread.join()
+    if pytest_log_mirror_thread is not None:
+        pytest_log_mirror_stop.set()
+        pytest_log_mirror_thread.join()
     if event_stream is not None and cancelled:
         event_stream.append_lifecycle(
             "process_cancelled",
@@ -1772,6 +1798,39 @@ def _drain_process_stream(
         stream.close()
 
 
+def _mirror_runtime_log(
+    source: Path,
+    destination: Path,
+    stop_event: threading.Event,
+    errors: list[OSError],
+) -> None:
+    """Copy appended RAM log bytes to persistent debug storage until stopped."""
+
+    offset = 0
+
+    def copy_appended_bytes() -> None:
+        nonlocal offset
+        if not source.is_file():
+            return
+        with source.open("rb") as input_file:
+            input_file.seek(offset)
+            data = input_file.read()
+        if data:
+            with destination.open("ab") as output_file:
+                output_file.write(data)
+                output_file.flush()
+            offset += len(data)
+
+    try:
+        while True:
+            copy_appended_bytes()
+            if stop_event.wait(0.1):
+                copy_appended_bytes()
+                return
+    except OSError as exc:
+        errors.append(exc)
+
+
 def _run_test_orchestrator(
     session: BenchSession,
     results_log: Path,
@@ -1788,11 +1847,7 @@ def _run_test_orchestrator(
 
     orchestrator_mode = _orchestrator_mode(session)
     debug_artifacts_dir = session.debug_artifacts_dir
-    pytest_log_path = (
-        debug_artifacts_dir / "pytest.log"
-        if debug_artifacts_dir is not None
-        else session.runtime_dir / "pytest.log"
-    )
+    pytest_log_path = session.runtime_dir / "pytest.log"
     cmd = [
         sys.executable,
         "-u",
@@ -1838,6 +1893,12 @@ def _run_test_orchestrator(
         ),
         persistent_stderr_path=(
             debug_artifacts_dir / "test_stderr.log"
+            if debug_artifacts_dir is not None
+            else None
+        ),
+        pytest_log_source_path=pytest_log_path,
+        persistent_pytest_log_path=(
+            debug_artifacts_dir / "pytest.log"
             if debug_artifacts_dir is not None
             else None
         ),

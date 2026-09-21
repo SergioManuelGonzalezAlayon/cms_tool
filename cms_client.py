@@ -572,13 +572,21 @@ class CMSClient:
             )
         return page
 
-    def list_measurement_artifacts(self, measurement_id: str) -> list[Artifacts]:
-        """List published artifacts belonging to an explicit measurement."""
+    def list_measurement_artifacts(
+        self,
+        measurement_id: str,
+        *,
+        debug_persisted: bool = False,
+    ) -> list[Artifacts]:
+        """List RAM artifacts or the persisted debug bundle for one measurement."""
 
         encoded_id = urllib.parse.quote(measurement_id, safe="")
         payload = self._request_json(
             "GET",
-            _observation_path(f"/measurement/{encoded_id}/artifacts"),
+            _observation_path(
+                f"/measurement/{encoded_id}/artifacts",
+                storage="debug" if debug_persisted else "runtime",
+            ),
         )
         _validate_observation_envelope(payload, measurement_id)
         try:
@@ -607,10 +615,19 @@ class CMSClient:
 
         return self._download_artifact_payload(artifact_to_dict(artifact), out_dir)
 
-    def download_measurement_artifacts(self, measurement_id: str, out_dir: Path) -> list[Path]:
-        """Download every published artifact for an explicit measurement."""
+    def download_measurement_artifacts(
+        self,
+        measurement_id: str,
+        out_dir: Path,
+        *,
+        debug_persisted: bool = False,
+    ) -> list[Path]:
+        """Download the RAM artifacts or persisted debug bundle for one measurement."""
 
-        artifacts = self.list_measurement_artifacts(measurement_id)
+        artifacts = self.list_measurement_artifacts(
+            measurement_id,
+            debug_persisted=debug_persisted,
+        )
         if not artifacts:
             raise RuntimeError(f"measurement has no published artifacts: {measurement_id}")
         return [
@@ -1347,7 +1364,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         epilog=(
             "Example:\n"
             "  cms ARTIFACTS <measurement_id> --out-dir artifacts\n"
-            "  cms ARTIFACTS --out-dir artifacts  # saved ongoing debug measurement\n\n"
+            "  cms ARTIFACTS --debug --out-dir artifacts  # saved debug bundle\n\n"
             "Optional argument:\n"
             "  measurement_id   explicit measurement whose artifacts should be downloaded\n\n"
             "Defaults:\n"
@@ -1364,6 +1381,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="measurement id; omit to use the saved ongoing debug measurement",
     )
     artifacts.add_argument("--out-dir", default="artifacts")
+    artifacts.add_argument(
+        "--debug",
+        action="store_true",
+        help="download the saved debug measurement's persistent artifact bundle",
+    )
 
     failed = subparsers.add_parser(
         "failed",
@@ -1628,10 +1650,14 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command in {"artifacts", "ARTIFACTS"}:
-        measurement_id = args.measurement_id or _saved_debug_measurement_id(args.config)
+        measurement_id = (
+            args.measurement_id
+            or _saved_debug_measurement_id(args.config)
+        )
         for path in client.download_measurement_artifacts(
             measurement_id,
             Path(args.out_dir),
+            debug_persisted=args.debug,
         ):
             print(path)
         return CMSCLIExitCode.SUCCESS

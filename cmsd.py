@@ -98,6 +98,16 @@ LIVE_DEBUG_ARTIFACT_NAMES = frozenset(
     }
 )
 
+LIVE_RUNTIME_ARTIFACT_NAMES = frozenset(
+    {
+        "orchestrator_plan.json",
+        "orchestrator_results.jsonl",
+        "pytest.log",
+        "test_stdout.log",
+        "test_stderr.log",
+    }
+)
+
 
 def _should_upload_results_to_database(mode: MeasurementMode | str) -> bool:
     measurement_mode = mode if isinstance(mode, MeasurementMode) else MeasurementMode(str(mode))
@@ -1056,54 +1066,21 @@ class CMSDaemon:
         )
 
     def publish_results(self, result: MeasurementResult) -> MeasurementResult:
-        """Persist metadata and expose final artifacts to remote clients."""
+        """Expose RAM results to clients and persist a bundle only for debug runs."""
         tracked_result = self.measurements.get(result.measurement_id)
         if result.identity is None and tracked_result is not None:
             result.identity = tracked_result.identity
-        published_dir = self.config.artifacts_root / "measurements" / result.measurement_id
-        published_dir.mkdir(parents=True, exist_ok=True)
-
-        published_artifacts = []
         for artifact in result.artifacts:
             if artifact.path is None or not artifact.path.exists():
                 continue
-            if not _is_publishable_final_artifact(artifact):
-                continue
             artifact_name = _safe_artifact_name(artifact.name or artifact.path.name)
-            destination = published_dir / artifact_name
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if artifact.path.resolve() != destination.resolve():
-                shutil.copy2(artifact.path, destination)
-            artifact.path = destination
             artifact.name = artifact_name
             artifact.url = (
                 f"/measurement/{result.measurement_id}/artifacts/"
                 f"{urllib.parse.quote(artifact_name, safe='/')}"
             )
-            published_artifacts.append(artifact)
-
-        result.artifacts = published_artifacts
-        result_path = published_dir / "measurement_result.json"
-        result_path.write_text(
-            json.dumps(measurement_result_to_dict(result), indent=2) + "\n",
-            encoding="utf-8",
-        )
-        if not any(artifact.name == result_path.name for artifact in result.artifacts):
-            result_artifact_name = (Path("cmsd") / result.measurement_id / result_path.name).as_posix()
-            result_artifact_path = published_dir / result_artifact_name
-            result_artifact_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(result_path, result_artifact_path)
-            result.artifacts.append(
-                Artifacts(
-                    name=result_artifact_name,
-                    path=result_artifact_path,
-                    url=(
-                        f"/measurement/{result.measurement_id}/artifacts/"
-                        f"{urllib.parse.quote(result_artifact_name, safe='/')}"
-                    ),
-                    result_type=ResultType.CAMPAIGN,
-                )
-            )
+        if result.measurement_id in self.debug_artifact_measurements:
+            self._persist_debug_result_bundle(result)
         self.measurements[result.measurement_id] = result
         self.last_measurement_id = result.measurement_id
         if self.active_measurement_id == result.measurement_id:
@@ -1111,6 +1088,47 @@ class CMSDaemon:
         self.cancellation_events.pop(result.measurement_id, None)
         self.cancelled_measurements.discard(result.measurement_id)
         return result
+
+    def _persist_debug_result_bundle(self, result: MeasurementResult) -> None:
+        """Copy a completed debug result bundle to the bench's persistent storage."""
+
+        published_dir = self._published_measurement_path(result.measurement_id)
+        published_dir.mkdir(parents=True, exist_ok=True)
+        persisted_artifacts: list[Artifacts] = []
+        for artifact in result.artifacts:
+            if artifact.path is None or not artifact.path.is_file():
+                continue
+            artifact_name = _safe_artifact_name(artifact.name or artifact.path.name)
+            destination = published_dir / artifact_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if artifact.path.resolve() != destination.resolve():
+                shutil.copy2(artifact.path, destination)
+            persisted_artifacts.append(
+                Artifacts(
+                    name=artifact_name,
+                    path=destination,
+                    url=(
+                        f"/measurement/{result.measurement_id}/artifacts/"
+                        f"{urllib.parse.quote(artifact_name, safe='/')}"
+                    ),
+                    result_type=artifact.result_type,
+                )
+            )
+        persisted_result = MeasurementResult(
+            measurement_id=result.measurement_id,
+            state=result.state,
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+            artifacts=persisted_artifacts,
+            progress_percent=result.progress_percent,
+            current_step=result.current_step,
+            message=result.message,
+            identity=result.identity,
+        )
+        (published_dir / "measurement_result.json").write_text(
+            json.dumps(measurement_result_to_dict(persisted_result), indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def measurement_abort(self, measurement_id: str) -> MeasurementResult:
         """Signal the active worker; it publishes cancelled only after cleanup."""
@@ -1526,9 +1544,18 @@ class CMSDaemon:
         @app.get("/measurement/{measurement_id}/artifacts")
         def measurement_artifacts(
             measurement_id: str,
+            storage: str = "runtime",
             protocol_version: int = CMS_OBSERVATION_PROTOCOL_VERSION,
         ) -> dict[str, Any]:
             require_observation_protocol(protocol_version)
+            if storage not in {"runtime", "debug"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "invalid_artifact_storage",
+                        "message": "artifact storage must be runtime or debug",
+                    },
+                )
             try:
                 self._runtime_workspace_path(measurement_id)
             except ValueError as exc:
@@ -1536,6 +1563,8 @@ class CMSDaemon:
                     status_code=400,
                     detail={"code": "invalid_measurement_id", "message": str(exc)},
                 ) from exc
+            if storage == "debug":
+                return self._persisted_debug_artifact_response(measurement_id)
             result = self.measurements.get(measurement_id)
             if result is None:
                 result_path = self.config.artifacts_root / "measurements" / measurement_id / "measurement_result.json"
@@ -1571,7 +1600,11 @@ class CMSDaemon:
             }
 
         @app.get("/measurement/{measurement_id}/artifacts/{artifact_path:path}")
-        def measurement_artifact_file(measurement_id: str, artifact_path: str) -> FileResponse:
+        def measurement_artifact_file(
+            measurement_id: str,
+            artifact_path: str,
+            storage: str = "runtime",
+        ) -> FileResponse:
             try:
                 self._runtime_workspace_path(measurement_id)
                 safe_name = _safe_artifact_name(urllib.parse.unquote(artifact_path))
@@ -1580,6 +1613,32 @@ class CMSDaemon:
                     status_code=400,
                     detail={"code": "invalid_artifact_path", "message": str(exc)},
                 ) from exc
+            if storage not in {"runtime", "debug"}:
+                raise HTTPException(status_code=400, detail="invalid artifact storage")
+            if storage == "debug":
+                debug_artifact = self._persisted_debug_artifact_path(
+                    measurement_id,
+                    safe_name,
+                )
+                if debug_artifact is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail={
+                            "code": "unknown_artifact",
+                            "message": f"persisted debug artifact is unavailable: {safe_name}",
+                        },
+                    )
+                return FileResponse(debug_artifact)
+            if (
+                self.active_measurement_id == measurement_id
+                and safe_name in LIVE_RUNTIME_ARTIFACT_NAMES
+            ):
+                runtime_artifact = self._runtime_workspace_path(measurement_id) / safe_name
+                if runtime_artifact.is_file():
+                    return FileResponse(runtime_artifact)
+            result_artifact = self._result_artifact_path(measurement_id, safe_name)
+            if result_artifact is not None:
+                return FileResponse(result_artifact)
             published_dir = self.config.artifacts_root / "measurements" / measurement_id
             if not published_dir.is_dir():
                 raise_observation_error(
@@ -1776,16 +1835,34 @@ class CMSDaemon:
         return None
 
     def _measurement_artifact_payload(self, result: MeasurementResult) -> list[dict[str, Any]]:
-        """Include available persistent debug logs while a debug measurement runs."""
+        """Include RAM runtime logs and optional persistent debug copies while active."""
 
         artifacts = measurement_result_to_dict(result)["artifacts"]
         if self.active_measurement_id != result.measurement_id:
             return artifacts
+
+        existing_names = {str(artifact.get("name", "")) for artifact in artifacts}
+        runtime_dir = self._runtime_workspace_path(result.measurement_id)
+        for name in sorted(LIVE_RUNTIME_ARTIFACT_NAMES):
+            path = runtime_dir / name
+            if not path.is_file() or name in existing_names:
+                continue
+            artifacts.append(
+                {
+                    "name": name,
+                    "path": str(path),
+                    "url": (
+                        f"/measurement/{result.measurement_id}/artifacts/"
+                        f"{urllib.parse.quote(name, safe='/')}"
+                    ),
+                    "result_type": ResultType.DIAGNOSTIC.value,
+                }
+            )
+            existing_names.add(name)
+
         if result.measurement_id not in self.debug_artifact_measurements:
             return artifacts
-
         published_dir = self._published_measurement_path(result.measurement_id)
-        existing_names = {str(artifact.get("name", "")) for artifact in artifacts}
         for name in sorted(LIVE_DEBUG_ARTIFACT_NAMES):
             path = published_dir / name
             if not path.is_file() or name in existing_names:
@@ -1802,6 +1879,58 @@ class CMSDaemon:
                 }
             )
         return artifacts
+
+    def _result_artifact_path(self, measurement_id: str, artifact_name: str) -> Path | None:
+        """Resolve a client-listed in-RAM artifact without accepting arbitrary paths."""
+
+        result = self.measurements.get(measurement_id)
+        if result is None:
+            return None
+        for artifact in result.artifacts:
+            if artifact.name != artifact_name or artifact.path is None:
+                continue
+            if artifact.path.is_file():
+                return artifact.path
+        return None
+
+    def _persisted_debug_artifact_response(self, measurement_id: str) -> dict[str, Any]:
+        """Return the bundle deliberately retained by a completed debug run."""
+
+        result_path = self._published_measurement_path(measurement_id) / "measurement_result.json"
+        if not result_path.is_file():
+            raise KeyError(f"persisted debug artifacts are unavailable: {measurement_id}")
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        artifacts = payload.get("artifacts", [])
+        if not isinstance(artifacts, list):
+            raise ValueError("persisted debug artifact list must be a list")
+        for artifact in artifacts:
+            if isinstance(artifact, dict):
+                name = str(artifact.get("name", ""))
+                artifact["url"] = (
+                    f"/measurement/{measurement_id}/artifacts/"
+                    f"{urllib.parse.quote(name, safe='/')}?storage=debug"
+                )
+        return {
+            "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+            "measurement_id": measurement_id,
+            "artifacts": artifacts,
+        }
+
+    def _persisted_debug_artifact_path(
+        self,
+        measurement_id: str,
+        artifact_name: str,
+    ) -> Path | None:
+        """Resolve only files named in one persisted debug bundle manifest."""
+
+        response = self._persisted_debug_artifact_response(measurement_id)
+        for artifact in response["artifacts"]:
+            if not isinstance(artifact, dict) or artifact.get("name") != artifact_name:
+                continue
+            path = self._published_measurement_path(measurement_id) / artifact_name
+            if path.is_file():
+                return path
+        return None
 
     def _touch_staging_files(self) -> None:
         for path in self.files.as_dict().values():
