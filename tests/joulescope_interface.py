@@ -366,10 +366,10 @@ def JoulescopeUsbReset(request: pytest.FixtureRequest):
         runtime_path=request.config.getoption("--cms-runtime-config"),
         metadata_path=request.config.getoption("--cms-fw-metadata"),
     )
-    usb_id = cfg.get("js",{}).get("usb_id")
+    usb_id = cfg.get("joulescope", {}).get("id")
 
     if not usb_id:
-        log.warning("SETUP SKIP: Joulescope USB reset; no js.usb_id configured")
+        log.warning("SETUP SKIP: Joulescope USB reset; no joulescope.id configured")
         return
 
     _reset_joulescope_usb(usb_id)

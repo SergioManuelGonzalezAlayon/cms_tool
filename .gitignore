@@ -9,5 +9,7 @@ artifacts/
 __pycache__/
 *.egg-info/
 dev_config.json
+cms_bench_runtime.json
+cms_client_config.json
 tests/configs/*/*/full_sweep/**
 tools/**

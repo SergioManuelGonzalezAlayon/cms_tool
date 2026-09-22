@@ -1,5 +1,5 @@
 {
-    "Joulescope": {
+    "joulescope": {
         "serial_port": "scope",
         "wake_gpio": 0
     },

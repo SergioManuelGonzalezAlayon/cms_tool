@@ -104,11 +104,10 @@ Current required fields for initialization are:
 
 The Joulescope mapping is health-checked as optional in the current bench
 implementation, so a missing mapping reports a warning rather than a startup
-failure. The current loader recognizes `joulescope` or `Joulescope` keys with
-`serial_number`, `serial_port`, or `id`, plus `wake_gpio`. The checked-in
-runtime template currently uses a `js.usb_id` shape; that shape is not consumed
-by the current loader, so it produces the same optional-mapping warning until
-the runtime configuration is changed to the supported shape.
+failure. Use `joulescope.id` for the bench's USB reset identifier; the current
+loader also accepts `serial_number` or `serial_port`, plus `wake_gpio`, for its
+device mapping. Older shapes such as `js.usb_id` are not consumed by the
+loader and produce the same optional-mapping warning.
 
 ## Measurement Inputs
 

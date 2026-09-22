@@ -30,10 +30,14 @@
     "board_rev": "replace-with-board-revision",
     "device": "replace-with-target-device",
     "sisdk_package_path": "C:\\path\\to\\default\\sisdk-package",
-    "sisdk": "replace-with-default-sisdk-version"
+    "sisdk": "replace-with-default-sisdk-version",
+    "device_canonical": "replace-with-canonical-device-id",
+    "radio_board_serial": "replace-with-radio-board-serial",
+    "dut_jlink_serial": "replace-with-dut-jlink-serial",
+    "vcom_supported": true
   },
   "diff": {
-    "sisdk_child_path": "C:\\path\\to\\child\\sisdk-package",
-    "sisdk_parent_path": "C:\\path\\to\\parent\\sisdk-package"
+    "sisdk_version2_path": "C:\\path\\to\\child\\sisdk-package",
+    "sisdk_version1_path": "C:\\path\\to\\parent\\sisdk-package"
   }
 }

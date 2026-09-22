@@ -3,8 +3,8 @@
     "bench_id": "replace-with-unique-bench-id",
     "profile": "bench-lite"
   },
-  "js": {
-    "usb_id": "replace-with-joulescope-usb-id"
+  "joulescope": {
+    "id": "replace-with-joulescope-usb-id"
   },
   "dut": {
     "serial_port": "replace-with-dut-serial-port",

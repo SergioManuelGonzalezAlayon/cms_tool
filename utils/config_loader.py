@@ -64,7 +64,7 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
     tools = runtime.get("tools", {})
     ble = runtime.get("ble", {})
     sdk = ble.get("sdk", {}) if isinstance(ble, dict) else {}
-    js = runtime.get("js", {})
+    joulescope = runtime.get("joulescope", runtime.get("Joulescope", {}))
     fw_metadata = metadata.get("firmware", {})
 
     return {
@@ -83,8 +83,12 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
         "ble": {
             "xapi": metadata.get("ble", {}).get("xapi") or ble.get("xapi"),
         },
-        "js": {
-            "usb_id": js.get("usb_id") or metadata.get("js", {}).get("usb_id"),
+        "joulescope": {
+            "id": (
+                joulescope.get("id")
+                or metadata.get("joulescope", {}).get("id")
+                or metadata.get("Joulescope", {}).get("id")
+            ),
         },
         "firmware": {
             "build_root": fw_metadata.get("build_root"),
