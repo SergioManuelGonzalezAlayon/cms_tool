@@ -1,0 +1,32 @@
+{
+  "bench": {
+    "bench_id": "replace-with-unique-bench-id",
+    "profile": "bench-lite"
+  },
+  "js": {
+    "usb_id": "replace-with-joulescope-usb-id"
+  },
+  "dut": {
+    "serial_port": "replace-with-dut-serial-port",
+    "baudrate": 115200,
+    "probe_sn": "replace-with-dut-probe-serial-number"
+  },
+  "tester": {
+    "serial_port": "replace-with-tester-serial-port",
+    "baudrate": 115200,
+    "probe_sn": "replace-with-tester-probe-serial-number"
+  },
+  "tools": {
+    "commander": "C:\\path\\to\\commander.exe"
+  },
+  "ble": {
+    "xapi": "C:\\path\\to\\sl_bt.xapi"
+  },
+  "devices": {
+    "board": "replace-with-board-id",
+    "board_rev": "replace-with-board-revision",
+    "part_number": "replace-with-part-number",
+    "serial_number": "replace-with-radio-board-serial-number",
+    "device": "replace-with-device-id"
+  }
+}

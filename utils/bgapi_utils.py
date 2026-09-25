@@ -27,6 +27,7 @@ PHY_2M = 0x2
 PHY_CODED = 0x4
 PHY_1M_AND_CODED = PHY_1M | PHY_CODED
 PHY_ANY = 0xFF
+RETRYABLE_STARTUP_EXIT_CODE = 6
 
 
 class BGAPIEventTimeoutError(RuntimeError):
@@ -56,6 +57,28 @@ class BGAPIEventTimeoutError(RuntimeError):
             f"{evt._class_name}.{evt._msg_name}"
             for evt in self.seen_events
         )
+
+
+class RetryableDeviceStartupError(RuntimeError):
+    """A BLE device did not complete its required startup handshake."""
+
+    def __init__(self, event_timeout: BGAPIEventTimeoutError, attempts: int):
+        self.event_timeout = event_timeout
+        self.attempts = attempts
+        super().__init__(
+            f"BLE device did not report system.{event_timeout.event_name} after "
+            f"{attempts} attempt(s); retrying this pytest job is allowed."
+        )
+
+
+def is_retryable_startup_event_timeout(error: BaseException) -> bool:
+    """Return whether a missing BLE startup event permits a whole-job retry."""
+
+    return (
+        isinstance(error, BGAPIEventTimeoutError)
+        and error.event_class == "system"
+        and error.event_name in {"boot", "awake"}
+    )
 
 
 @dataclass

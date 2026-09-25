@@ -22,6 +22,7 @@ DEFAULT_BUILD_ROOT = REPO_ROOT / ".fw_build"
 DEFAULT_BOOTLOADER_SLCP = APPS_DIR / "bootloader-uart-bgapi.slcp"
 BUILD_METADATA_FILENAME = "build_metadata.json"
 FW_DATA_FILENAME = "fw_data.json"
+DIFF_FW_DATA_FILENAME = "diff_fw_data.json"
 BGAPI_RUNTIME_DIRNAME = "runtime"
 BGAPI_XAPI_FILENAME = "sl_bt.xapi"
 TOOL_ENV_VARS = {
@@ -33,7 +34,15 @@ TOOL_ENV_VARS = {
 SL_BT_XAPI_PATH = Path("bluetooth_le_host") / "api" / "sl_bt.xapi"
 SLC_SDK_PACKAGE_PATH_FLAG = "--sdk-package-path"
 FIRMWARE_IMAGE_SUFFIXES = (".s37", ".hex", ".bin")
+CMS_FLASHABLE_IMAGE_SUFFIXES = (".s37", ".hex")
 FIRMWARE_ARTIFACT_SUFFIXES = FIRMWARE_IMAGE_SUFFIXES + (".map", ".out")
+FIRMWARE_ROLE_BY_PROJECT = {
+    "bootloader-uart-bgapi": "bootloader",
+    "ncp_ble_dut": "dut_no_dcdc",
+    "ncp_ble_dut_dcdc": "dut_dcdc",
+    "ncp_ble_tester": "tester",
+}
+REQUIRED_DIFF_FIRMWARE_ROLES = frozenset(FIRMWARE_ROLE_BY_PROJECT.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +226,71 @@ def _sisdk_version_from_properties(sdk_path: Path) -> str:
     raise RuntimeError(f"SiSDK package properties are missing version: {properties_path}")
 
 
+def inspect_sdk_selection(
+    package_path: str | Path,
+    *,
+    source: str,
+    include_git_commit: bool = True,
+) -> SDKSelection:
+    """Inspect one installed SiSDK package without relying on configured version text."""
+
+    sdk_path = Path(package_path).expanduser().resolve()
+    if not sdk_path.exists() or not sdk_path.is_dir():
+        raise RuntimeError(f"SiSDK package path does not exist or is not a directory: {sdk_path}")
+    version = _sisdk_version_from_properties(sdk_path)
+    xapi_path = sdk_path / SL_BT_XAPI_PATH
+    if not xapi_path.is_file():
+        raise RuntimeError(f"Resolved SiSDK '{version}' cannot find `sl_bt.xapi`: {xapi_path}")
+    commit = _sdk_git_commit(sdk_path) if include_git_commit else ""
+    return SDKSelection(
+        path=sdk_path,
+        version=version,
+        source=source,
+        commit=commit,
+        sdk_hash=commit,
+        xapi_path=xapi_path,
+        xapi_hash=_sha256(xapi_path),
+    )
+
+
+def sdk_selection_provenance(selection: SDKSelection) -> dict[str, str]:
+    """Return the SDK facts retained for one normal or differential build variant."""
+
+    return {
+        "source": selection.source,
+        "version": selection.version,
+        "package_path": str(selection.path),
+        "commit": selection.commit,
+        "hash": selection.sdk_hash,
+        "xapi_path": str(selection.xapi_path or ""),
+        "xapi_sha256": selection.xapi_hash,
+    }
+
+
+def resolve_diff_sdk_selections(config: dict) -> dict[str, SDKSelection]:
+    """Resolve independently configured version1 and version2 SDK packages for preflight."""
+
+    diff = config.get("diff")
+    if not isinstance(diff, dict):
+        raise RuntimeError(
+            "cms_client_config.json must contain a diff object with "
+            "sisdk_version1_path and sisdk_version2_path"
+        )
+
+    selections: dict[str, SDKSelection] = {}
+    for variant in ("version1", "version2"):
+        path = str(diff.get(f"sisdk_{variant}_path", "")).strip()
+        if not path:
+            raise RuntimeError(
+                f"cms_client_config.json diff.sisdk_{variant}_path is required for cms BUILD --diff"
+            )
+        selections[variant] = inspect_sdk_selection(
+            path,
+            source=f"client_config_diff_{variant}_path",
+        )
+    return selections
+
+
 def _sdk_git_commit(sdk_path: Path) -> str:
     try:
         result = subprocess.run(
@@ -238,27 +312,23 @@ def resolve_sdk_selection(
 ) -> SDKSelection:
     if cli_package_path:
         source = "cli_package_path"
-        sdk_path = _validate_sdk_path(Path(cli_package_path), version)
+        selection = inspect_sdk_selection(cli_package_path, source=source)
     elif config_package_path:
         source = "client_config_package_path"
-        sdk_path = _validate_sdk_path(Path(config_package_path), version)
+        selection = inspect_sdk_selection(config_package_path, source=source)
     else:
         raise RuntimeError(
             "No SiSDK package path is configured. Set target.sisdk_package_path in "
             "cms_client_config.json to the unpacked SDK directory, or pass "
             "--sdk-package-path <path> to this build."
         )
-    xapi_path = sdk_path / SL_BT_XAPI_PATH
-    commit = _sdk_git_commit(sdk_path)
-    return SDKSelection(
-        path=sdk_path,
-        version=version,
-        source=source,
-        commit=commit,
-        sdk_hash=commit,
-        xapi_path=xapi_path,
-        xapi_hash=_sha256(xapi_path),
-    )
+    if selection.version != version:
+        raise RuntimeError(
+            "Configured SiSDK version does not match the SDK package path: "
+            f"cms_client_config.json target.sisdk={version}, "
+            f"{selection.path / '.properties'} version={selection.version}"
+        )
+    return selection
 
 
 def trust_sisdk(sdk_path: Path) -> None:
@@ -368,8 +438,8 @@ def find_artifacts(out_dir: Path, suffixes: tuple[str, ...]) -> list[Path]:
     root = out_dir / "cmake_gcc"
     artifacts: list[Path] = []
     for suffix in suffixes:
-        artifacts.extend(root.rglob(f"*{suffix}"))
-    return sorted({path.resolve() for path in artifacts})
+        artifacts.extend(sorted(path.resolve() for path in root.rglob(f"*{suffix}")))
+    return list(dict.fromkeys(artifacts))
 
 
 def copy_bgapi_xapi(build_root: Path, sdk_path: Path) -> Path:
@@ -479,24 +549,21 @@ def write_fw_data(
     summaries: list[dict],
     sdk_selection: SDKSelection | None = None,
 ) -> Path:
+    artifacts = firmware_artifacts_from_summaries(summaries)
     hash_by_role = {
         "dut_app_hash": "",
+        "dut_no_dcdc_app_hash": "",
         "tester_app_hash": "",
         "bootloader_app_hash": "",
     }
-    for summary in summaries:
-        image_path = summary.get("image")
-        if not image_path:
-            continue
-        image = Path(image_path)
-        project_name = Path(summary["slcp"]).stem.lower()
-        image_hash = _sha256(image)
-        if "bootloader" in project_name:
-            hash_by_role["bootloader_app_hash"] = image_hash
-        elif "tester" in project_name:
-            hash_by_role["tester_app_hash"] = image_hash
-        elif "dut" in project_name:
-            hash_by_role["dut_app_hash"] = image_hash
+    hash_key_by_role = {
+        "dut_dcdc": "dut_app_hash",
+        "dut_no_dcdc": "dut_no_dcdc_app_hash",
+        "tester": "tester_app_hash",
+        "bootloader": "bootloader_app_hash",
+    }
+    for artifact in artifacts:
+        hash_by_role[hash_key_by_role[artifact["role"]]] = artifact["sha256"]
 
     fw_data = {
         "firmware": {
@@ -505,6 +572,7 @@ def write_fw_data(
             "device": firmware_cfg["device"],
             "sisdk": firmware_cfg["sisdk"],
             **hash_by_role,
+            "artifacts": artifacts,
         },
         "build": {
             "root": str(build_root.resolve()),
@@ -522,6 +590,140 @@ def write_fw_data(
     fw_data_path = build_root / FW_DATA_FILENAME
     fw_data_path.write_text(json.dumps(fw_data, indent=2) + "\n", encoding="utf-8")
     return fw_data_path
+
+
+def firmware_artifacts_from_summaries(summaries: list[dict]) -> list[dict[str, str]]:
+    """Describe known firmware roles from their declared SLCP project identity."""
+
+    artifacts: list[dict[str, str]] = []
+    for summary in summaries:
+        image_path = str(summary.get("image", ""))
+        project_name = Path(str(summary.get("slcp", ""))).stem.lower()
+        role = FIRMWARE_ROLE_BY_PROJECT.get(project_name)
+        if not role or not image_path:
+            continue
+        image = Path(image_path)
+        artifacts.append(
+            {
+                "role": role,
+                "project_name": project_name,
+                "image": str(image),
+                "sha256": _sha256(image),
+            }
+        )
+    return artifacts
+
+
+def validate_required_firmware_roles(
+    summaries: list[dict],
+    required_roles: frozenset[str],
+) -> None:
+    """Reject a differential variant that lacks exactly one required named role."""
+
+    artifacts = firmware_artifacts_from_summaries(summaries)
+    validate_firmware_artifact_roles(artifacts, required_roles)
+    unsupported = [
+        f"{artifact['role']}={artifact['image']}"
+        for artifact in artifacts
+        if Path(artifact["image"]).suffix.lower() not in CMS_FLASHABLE_IMAGE_SUFFIXES
+    ]
+    if unsupported:
+        raise RuntimeError(
+            "Differential firmware roles must use a CMS-flashable .s37 or .hex image: "
+            + ", ".join(sorted(unsupported))
+        )
+
+
+def validate_firmware_artifact_roles(
+    artifacts: list[dict[str, str]],
+    required_roles: frozenset[str],
+) -> None:
+    """Reject missing or duplicate role labels in an already materialized artifact list."""
+
+    roles = [artifact["role"] for artifact in artifacts]
+    missing = sorted(required_roles.difference(roles))
+    duplicate = sorted({role for role in roles if roles.count(role) > 1})
+    if missing or duplicate:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing required roles: {', '.join(missing)}")
+        if duplicate:
+            details.append(f"duplicate roles: {', '.join(duplicate)}")
+        raise RuntimeError("Differential firmware variant is incomplete: " + "; ".join(details))
+
+
+def write_diff_fw_data(
+    *,
+    build_root: Path,
+    parsed: argparse.Namespace,
+    client_config: dict,
+    selections: dict[str, SDKSelection],
+) -> Path:
+    """Persist the two complete isolated build manifests as one diff build record."""
+
+    target_cfg = client_config.get("target") if isinstance(client_config.get("target"), dict) else {}
+    target = {
+        "board": str(target_cfg.get("board", "")),
+        "board_revision": str(target_cfg.get("board_rev", target_cfg.get("brev", ""))),
+        "device": str(target_cfg.get("device", "")),
+    }
+    if not all(target.values()):
+        raise RuntimeError("cms_client_config.json target board, board_rev, and device are required for cms BUILD --diff")
+
+    variants: dict[str, dict] = {}
+    for variant in ("version1", "version2"):
+        variant_root = build_root / "diff" / variant
+        manifest_path = variant_root / FW_DATA_FILENAME
+        if not manifest_path.is_file():
+            raise RuntimeError(f"Differential {variant} build manifest is missing: {manifest_path}")
+        manifest = _load_json(manifest_path)
+        firmware = manifest.get("firmware") if isinstance(manifest.get("firmware"), dict) else {}
+        artifacts = firmware.get("artifacts") if isinstance(firmware.get("artifacts"), list) else None
+        observed_target = {
+            "board": str(firmware.get("board", "")),
+            "board_revision": str(firmware.get("brev", "")),
+            "device": str(firmware.get("device", "")),
+        }
+        if observed_target != target:
+            raise RuntimeError(
+                f"Differential {variant} firmware target does not match the configured target: "
+                f"{observed_target} != {target}"
+            )
+        if (
+            not firmware
+            or artifacts is None
+            or not isinstance(manifest.get("build"), dict)
+            or not isinstance(manifest.get("sdk"), dict)
+        ):
+            raise RuntimeError(f"Differential {variant} build manifest is incomplete: {manifest_path}")
+        validate_firmware_artifact_roles(
+            artifacts,
+            REQUIRED_DIFF_FIRMWARE_ROLES,
+        )
+        variants[variant] = {
+            "build_root": str(variant_root.resolve()),
+            "manifest_path": str(manifest_path.resolve()),
+            "manifest_sha256": _sha256(manifest_path),
+            "manifest": manifest,
+            "sdk": sdk_selection_provenance(selections[variant]),
+        }
+
+    command = [sys.executable, str(Path(__file__).resolve()), parsed.action, *parsed.targets, "--diff"]
+    if parsed.config:
+        command.extend(["--config", parsed.config])
+    command.extend(["--build-root", str(build_root.resolve())])
+    diff_manifest = {
+        "schema_version": 1,
+        "target": target,
+        "build": {"root": str(build_root.resolve()), "command": command},
+        "variants": variants,
+    }
+    output_path = build_root / DIFF_FW_DATA_FILENAME
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(diff_manifest, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(output_path)
+    return output_path
 
 
 def clean_build_root(build_root: Path) -> int:
@@ -600,6 +802,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--config", default="", help="cms_client_config.json path")
     parser.add_argument("--sdk-package-path", default="", help="explicit unpacked SiSDK package path")
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help="build configured version1 and version2 SiSDK packages in isolated roots",
+    )
     parser.add_argument("--sisdk-version", default="", help="override selected SiSDK version")
     parser.add_argument("--build-root", default="", help="override firmware build root")
     parser.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
@@ -610,33 +817,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.add_argument(f"--{tool_name}", default="", help=f"override {tool_name} executable")
     return parser.parse_args(argv)
 
-def main(argv: list[str] | None = None) -> int:
-    parsed = parse_args(list(argv if argv is not None else sys.argv[1:]))
-    config_path = Path(parsed.config) if parsed.config else None
-    effective_config = effective_build_config(read_client_config(config_path), parsed)
-    global _TOOL_OVERRIDES
-    _TOOL_OVERRIDES = effective_config["tools"]
-    build_root = Path(effective_config["firmware"]["build_root"])
-    if not build_root.is_absolute():
-        build_root = (REPO_ROOT / build_root).resolve()
-    total_start = time.perf_counter()
-    if parsed.action == "clean":
-        removed = clean_build_root(build_root)
-        print(
-            "App manager: "
-            f"action=clean "
-            f"build_root={build_root} "
-            f"removed={removed} "
-            f"elapsed_s={time.perf_counter() - total_start:.2f}"
-        )
-        return 0
 
+def run_firmware_action(
+    parsed: argparse.Namespace,
+    effective_config: dict,
+    build_root: Path,
+    *,
+    sdk_selection: SDKSelection | None = None,
+    required_firmware_roles: frozenset[str] = frozenset(),
+) -> int:
+    """Run one normal firmware action in the supplied, fully isolated build root."""
+
+    total_start = time.perf_counter()
     firmware_cfg = validate_firmware_config(effective_config)
-    sdk_selection = resolve_sdk_selection(
-        version=firmware_cfg["sisdk"],
-        cli_package_path=parsed.sdk_package_path,
-        config_package_path=effective_config["firmware"].get("sisdk_package_path"),
-    )
+    if sdk_selection is None:
+        sdk_selection = resolve_sdk_selection(
+            version=firmware_cfg["sisdk"],
+            cli_package_path=parsed.sdk_package_path,
+            config_package_path=effective_config["firmware"].get("sisdk_package_path"),
+        )
+    if sdk_selection.version != firmware_cfg["sisdk"]:
+        raise RuntimeError(
+            "Selected SiSDK version does not match the firmware action configuration: "
+            f"{sdk_selection.version} != {firmware_cfg['sisdk']}"
+        )
     sdk_path = sdk_selection.path
     trust_sisdk(sdk_path)
     runtime_xapi_path = None
@@ -670,6 +874,9 @@ def main(argv: list[str] | None = None) -> int:
             f"elapsed_s={summary['elapsed_s']:.2f}"
         )
 
+    if required_firmware_roles:
+        validate_required_firmware_roles(summaries, required_firmware_roles)
+
     fw_data_path = None
     if parsed.action in {"build", "rebuild"} and runtime_xapi_path is not None:
         fw_data_path = write_fw_data(
@@ -692,6 +899,93 @@ def main(argv: list[str] | None = None) -> int:
         f"elapsed_s={time.perf_counter() - total_start:.2f}"
     )
     return 0
+
+
+def build_diff_variants(
+    parsed: argparse.Namespace,
+    client_config: dict,
+    build_root: Path,
+) -> int:
+    """Build each configured SDK variant below its own root without a shared manifest."""
+
+    if parsed.sdk_package_path:
+        raise RuntimeError(
+            "cms BUILD --diff uses diff.sisdk_version1_path and diff.sisdk_version2_path; "
+            "do not pass --sdk-package-path"
+        )
+    if parsed.action == "clean":
+        raise RuntimeError("cms BUILD --diff does not support clean; remove one named variant root explicitly")
+    if parsed.action not in {"build", "rebuild"}:
+        raise RuntimeError("cms BUILD --diff supports only build or rebuild actions")
+    selections = resolve_diff_sdk_selections(client_config)
+    print("Differential SDK provenance:")
+    print(
+        json.dumps(
+            {
+                variant: sdk_selection_provenance(selection)
+                for variant, selection in selections.items()
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    for variant in ("version1", "version2"):
+        selection = selections[variant]
+        variant_values = vars(parsed).copy()
+        variant_values.update(
+            diff=False,
+            sdk_package_path=str(selection.path),
+            sisdk_version=selection.version,
+            build_root=str(build_root / "diff" / variant),
+        )
+        variant_args = argparse.Namespace(**variant_values)
+        variant_config = effective_build_config(client_config, variant_args)
+        variant_root = Path(variant_config["firmware"]["build_root"])
+        if not variant_root.is_absolute():
+            variant_root = (REPO_ROOT / variant_root).resolve()
+        print(f"Differential build variant={variant}")
+        if run_firmware_action(
+            variant_args,
+            variant_config,
+            variant_root,
+            sdk_selection=selection,
+            required_firmware_roles=REQUIRED_DIFF_FIRMWARE_ROLES,
+        ) != 0:
+            return 1
+    diff_fw_data_path = write_diff_fw_data(
+        build_root=build_root,
+        parsed=parsed,
+        client_config=client_config,
+        selections=selections,
+    )
+    print(f"Differential build manifest={diff_fw_data_path}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parsed = parse_args(list(argv if argv is not None else sys.argv[1:]))
+    config_path = Path(parsed.config) if parsed.config else None
+    client_config = read_client_config(config_path)
+    effective_config = effective_build_config(client_config, parsed)
+    global _TOOL_OVERRIDES
+    _TOOL_OVERRIDES = effective_config["tools"]
+    build_root = Path(effective_config["firmware"]["build_root"])
+    if not build_root.is_absolute():
+        build_root = (REPO_ROOT / build_root).resolve()
+    total_start = time.perf_counter()
+    if parsed.diff:
+        return build_diff_variants(parsed, client_config, build_root)
+    if parsed.action == "clean":
+        removed = clean_build_root(build_root)
+        print(
+            "App manager: "
+            f"action=clean "
+            f"build_root={build_root} "
+            f"removed={removed} "
+            f"elapsed_s={time.perf_counter() - total_start:.2f}"
+        )
+        return 0
+    return run_firmware_action(parsed, effective_config, build_root)
 
 
 if __name__ == "__main__":

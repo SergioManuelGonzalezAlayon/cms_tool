@@ -110,7 +110,58 @@ def test_pytest_runtime_metadata_contains_measurement_identity(tmp_path, monkeyp
     )
     result_types = {artifact.path: artifact.result_type for artifact in result.artifacts}
     assert result_types[junit_report] is ResultType.PYTEST_JUNIT
-    assert result_types[current_result] is ResultType.CURRENT_MEASUREMENT
+    retained_result = session.runtime_dir / "measurement_artifacts" / "beacon_result.json"
+    assert result_types[retained_result] is ResultType.CURRENT_MEASUREMENT
+    assert retained_result.read_text(encoding="utf-8") == '{"result_type":"current_measurement"}\n'
+
+
+def test_differential_session_validates_firmware_from_its_active_root(tmp_path, monkeypatch):
+    session = _session(tmp_path / "results" / "version1")
+    active_root = tmp_path / "active"
+    active_root.mkdir()
+    session.active_firmware_dir = active_root
+    validated_paths = []
+    monkeypatch.setattr(
+        cms_bench,
+        "_validate_firmware_file",
+        lambda path, _hash: validated_paths.append(path),
+    )
+    bench = CMSBench()
+    bench.resources = BenchResources()
+
+    bench.test_prepare(session)
+
+    assert validated_paths == [
+        active_root / "dut.s37",
+        active_root / "tester.s37",
+        active_root / "sl_bt.xapi",
+    ]
+    assert not list(session.runtime_dir.glob("*.s37"))
+
+
+def test_setup_failure_retains_variant_status_summary_and_diagnostics(tmp_path, monkeypatch):
+    session = _session(tmp_path / "results" / "version1")
+    session.variant = "version1"
+    bench = CMSBench()
+    bench.initialized = True
+    monkeypatch.setattr(bench, "test_smoke", lambda session: (_ for _ in ()).throw(RuntimeError("missing active DUT image")))
+
+    result = bench.measurement_run(session)
+
+    setup_status = json.loads((session.runtime_dir / "setup_status.json").read_text(encoding="utf-8"))
+    run_summary = json.loads((session.runtime_dir / "cms_test_run.json").read_text(encoding="utf-8"))
+    assert result.state is MeasurementState.FAILED
+    assert result.message == "missing active DUT image"
+    assert setup_status["variant"] == "version1"
+    assert setup_status["phase"] == "validation"
+    assert setup_status["pytest_launched"] is False
+    assert setup_status["error"] == "missing active DUT image"
+    assert run_summary["phase"] == "validation"
+    assert run_summary["pytest_launched"] is False
+    assert {artifact.path.name for artifact in result.artifacts} >= {
+        "setup_status.json",
+        "cms_test_run.json",
+    }
 
 
 def test_pytest_runtime_materializes_named_dut_variants(tmp_path, monkeypatch):
@@ -220,6 +271,23 @@ def test_pytest_runtime_records_selected_config_evidence_in_measurement_workspac
     assert config_path.read_text(encoding="utf-8") == config_text
     assert snapshot_path not in cms_bench._run_diagnostic_artifacts(session)
     assert evidence_path not in cms_bench._run_diagnostic_artifacts(session)
+
+
+def test_custom_config_evidence_records_the_observed_hash(tmp_path, monkeypatch):
+    config_root = tmp_path / "tests" / "configs" / "ble" / "beacon"
+    config_root.mkdir(parents=True)
+    config_path = config_root / "custom.json"
+    config_path.write_text('{"advertiser":{"interval":100}}\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    session = _session(tmp_path / "runtime", config="custom")
+
+    evidence_paths = cms_bench._write_selected_config_evidence(session)
+    evidence = json.loads(evidence_paths["metadata_path"].read_text(encoding="utf-8"))
+
+    assert evidence["selected_config"] == "custom.json"
+    assert evidence["requested_config_hash"] == ""
+    assert evidence["observed_config_hash"] == cms_bench._sha256_text_file_lf_normalized(config_path)
+    assert evidence_paths["snapshot_path"].read_text(encoding="utf-8") == config_path.read_text(encoding="utf-8")
 
 
 def test_config_hash_is_stable_across_line_endings(tmp_path):
@@ -355,6 +423,57 @@ def test_bench_passes_variable_filters_to_orchestrator(tmp_path, monkeypatch):
     )
 
     assert _option_values(captured["command"], "--variable") == ["phy=2m", "dcdc=On"]
+
+
+def test_bench_passes_frozen_plan_and_variant_to_generic_orchestrator(tmp_path, monkeypatch):
+    session = _session(tmp_path, feature="all")
+    session.variant = "version1"
+    session.job_plan_path = tmp_path / "paired_default_plan.json"
+    captured = {}
+
+    def fake_run_managed_process(command, **kwargs):
+        captured["command"] = command
+        return cms_bench.subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cms_bench, "_run_managed_process", fake_run_managed_process)
+
+    cms_bench._run_test_orchestrator(
+        session,
+        tmp_path / "orchestrator_results.jsonl",
+        tmp_path / "cms_fw_metadata.json",
+    )
+
+    assert _option_value(captured["command"], "--job-plan") == str(session.job_plan_path)
+    assert _option_value(captured["command"], "--variant") == "version1"
+
+
+def test_generic_runner_passes_campaign_active_root_to_runtime_preparation(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    bench = CMSBench()
+    bench.initialized = True
+    captured = {}
+    monkeypatch.setattr(bench, "test_smoke", lambda session: None)
+    monkeypatch.setattr(
+        cms_bench,
+        "_prepare_pytest_runtime",
+        lambda session, resources, *, active_root=None: captured.setdefault("prepared", {
+            "results_log": tmp_path / "results.jsonl",
+            "metadata_path": tmp_path / "metadata.json",
+            "artifact_since": 0,
+            "active_root": active_root,
+        }),
+    )
+    monkeypatch.setattr(
+        cms_bench,
+        "_run_test_orchestrator",
+        lambda *args: cms_bench.subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(bench, "collect_artifacts", lambda session, result, **kwargs: result)
+
+    active_root = tmp_path / "active"
+    bench.measurement_run(session, active_root=active_root)
+
+    assert captured["prepared"]["active_root"] == active_root
 
 
 def test_bench_rejects_variable_filters_with_exact_config(tmp_path):

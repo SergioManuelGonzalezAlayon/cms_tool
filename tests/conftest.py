@@ -67,6 +67,16 @@ def _effective_dev_config(request: pytest.FixtureRequest) -> dict:
         metadata_path=request.config.getoption("--cms-fw-metadata"),
     )
 
+
+def _firmware_project_name(slcp: Path) -> str:
+    """Resolve the build project selected by a config's firmware SLCP path."""
+
+    project_name = slcp.stem.strip()
+    if not project_name:
+        raise RuntimeError(f"Firmware SLCP must name a project: {slcp}")
+    return project_name
+
+
 @pytest.fixture
 def EffectiveDevConfig(request: pytest.FixtureRequest) -> dict:
     return _effective_dev_config(request)
@@ -436,21 +446,23 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
 
     dut_slcp = Path(fw["dut_slcp"])
     tester_slcp = Path(fw["tester_slcp"])
-    dut_image = _find_prebuilt_image(build_root, slcp=dut_slcp, project_name="ncp_ble_dut")
-    tester_image = _find_prebuilt_image(build_root, slcp=tester_slcp, project_name="ncp_ble_tester")
+    dut_project = _firmware_project_name(dut_slcp)
+    tester_project = _firmware_project_name(tester_slcp)
+    dut_image = _find_prebuilt_image(build_root, slcp=dut_slcp, project_name=dut_project)
+    tester_image = _find_prebuilt_image(build_root, slcp=tester_slcp, project_name=tester_project)
 
     dut_required = _image_metadata(
         dut_image,
         slcp=dut_slcp,
         board=fw["board"],
-        project_name="ncp_ble_dut",
+        project_name=dut_project,
         probe_sn=dut_probe_sn,
     )
     tester_required = _image_metadata(
         tester_image,
         slcp=tester_slcp,
         board=fw["board"],
-        project_name="ncp_ble_tester",
+        project_name=tester_project,
         probe_sn=tester_probe_sn,
     )
     bootloader_image_value = str(fw.get("bootloader_image") or "").strip()

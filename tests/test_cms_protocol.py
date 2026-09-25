@@ -3,10 +3,16 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from cms_protocol import (
+    BenchHealthReport,
+    BenchState,
     CMS_OBSERVATION_PROTOCOL_VERSION,
+    CommanderProbeEvidence,
+    DetectedTargetIdentity,
+    DifferentialFirmwareData,
     EventCursor,
     FirmwareData,
     FirmwareImage,
+    FirmwareRoleImage,
     MeasurementEvent,
     MeasurementEventPage,
     MeasurementIdentity,
@@ -21,6 +27,8 @@ from cms_protocol import (
     TestCounts as Counts,
     VariableFilter,
     create_measurement_identity,
+    bench_health_report_from_dict,
+    bench_health_report_to_dict,
     event_cursor_from_int,
     event_cursor_to_int,
     measurement_event_from_dict,
@@ -96,6 +104,44 @@ def test_create_measurement_identity_rejects_naive_timestamp():
         create_measurement_identity("beacon", created_at=datetime(2026, 8, 18, 9, 30))
 
 
+def test_health_report_round_trips_optional_detected_identity_and_probe_evidence():
+    report = BenchHealthReport(
+        state=BenchState.IDLE,
+        detected_identity=DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+            vcom_supported=True,
+        ),
+        commander_probe=CommanderProbeEvidence(
+            command=["commander", "adapter", "probe", "-s", "440365029"],
+            returncode=0,
+            stdout="Board List:\\n...",
+        ),
+    )
+
+    payload = bench_health_report_to_dict(report)
+    recovered = bench_health_report_from_dict(payload)
+
+    assert payload["detected_identity"]["canonical_target_device"] == "EFR32MG22C224F512IM40"
+    assert payload["commander_probe"]["command"][-1] == "440365029"
+    assert recovered.detected_identity == report.detected_identity
+    assert recovered.commander_probe == report.commander_probe
+
+
+def test_health_report_accepts_legacy_payload_without_probe_fields():
+    report = bench_health_report_from_dict({"state": "idle", "identity": {"bench_id": "bench-1"}})
+
+    assert report.detected_identity is None
+    assert report.commander_probe is None
+    payload = bench_health_report_to_dict(report)
+    assert "detected_identity" not in payload
+    assert "commander_probe" not in payload
+
+
 def test_measurement_result_round_trip_preserves_identity():
     identity = create_measurement_identity(
         "beacon-default",
@@ -167,6 +213,59 @@ def test_measurement_request_round_trip_preserves_requested_config_hash():
     assert payload["selector"]["config_hash"] == "sha256:dcdc"
     assert measurement_request_from_dict(payload).selector.config_hash == "sha256:dcdc"
     assert measurement_request_from_dict(payload).firmware.dut_variants == request.firmware.dut_variants
+
+
+def _differential_variant(name: str, *, board: str = "brd4182a") -> FirmwareData:
+    dut = FirmwareImage(name=f"{name}-dut.s37", url=f"{name}-dut.s37", sha256=f"{name}-dut-hash")
+    tester = FirmwareImage(name=f"{name}-tester.s37", url=f"{name}-tester.s37", sha256=f"{name}-tester-hash")
+    xapi = FirmwareImage(name=f"{name}-sl_bt.xapi", url=f"{name}-sl_bt.xapi", sha256=f"{name}-xapi-hash")
+    return FirmwareData(
+        dut_img=dut,
+        tester_img=tester,
+        xapi_file=xapi,
+        board=board,
+        device="EFR32MG22C224F512IM40",
+        sisdk_version=f"{name}-sdk",
+        sisdk_hash=f"{name}-sdk-hash",
+        role_images=(
+            FirmwareRoleImage("dut_dcdc", "ncp_ble_dut_dcdc", dut),
+            FirmwareRoleImage("tester", "ncp_ble_tester", tester),
+        ),
+    )
+
+
+def test_measurement_request_round_trip_preserves_named_differential_firmware() -> None:
+    differential = DifferentialFirmwareData(
+        version1=_differential_variant("version1"),
+        version2=_differential_variant("version2"),
+    )
+    request = MeasurementRequest(
+        request_id="diff-001",
+        selector=SuiteSelector(mode="ble", feature="beacon"),
+        firmware=differential.version2,
+        differential_firmware=differential,
+    )
+
+    payload = measurement_request_to_dict(request)
+    parsed = measurement_request_from_dict(payload)
+
+    assert set(payload["differential_firmware"]) == {"version1", "version2"}
+    assert parsed.differential_firmware is not None
+    assert parsed.differential_firmware.version2.sisdk_version == "version2-sdk"
+    assert parsed.differential_firmware.version1.role_images[0].role == "dut_dcdc"
+
+
+def test_differential_firmware_rejects_missing_hashes_and_mismatched_targets() -> None:
+    version2 = _differential_variant("version2")
+    version2.dut_img.sha256 = ""
+    with pytest.raises(ValueError, match="image without sha256"):
+        DifferentialFirmwareData(version1=_differential_variant("version1"), version2=version2)
+
+    with pytest.raises(ValueError, match="targets do not match"):
+        DifferentialFirmwareData(
+            version1=_differential_variant("version1", board="brd4182a"),
+            version2=_differential_variant("version2", board="brd4182b"),
+        )
 
 
 def test_measurement_request_round_trip_preserves_variable_filters():

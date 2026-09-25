@@ -35,6 +35,8 @@ def test_cli_exit_code_values_are_stable() -> None:
         "CONNECTION_FAILURE": 5,
         "PROTOCOL_MISMATCH": 6,
         "CLIENT_ERROR": 7,
+        "COMPARISON_DATA_FAILURE": 8,
+        "THRESHOLD_REGRESSION": 9,
     }
 
 

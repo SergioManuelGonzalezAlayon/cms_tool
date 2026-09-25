@@ -19,7 +19,8 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+import traceback
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -31,6 +32,9 @@ from cms_protocol import (
     BenchHealthReport,
     BenchIdentity,
     BenchState,
+    CommanderProbeEvidence as HealthCommanderProbeEvidence,
+    canonicalize_target_device,
+    DetectedTargetIdentity,
     DeviceState,
     EventCursor,
     Artifacts,
@@ -50,8 +54,32 @@ DEFAULT_CONSOLE_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_CONSOLE_EVENT_MAX_BYTES = 4 * 1024 * 1024
 # CMS measurements may run for days; cancellation is the normal stop mechanism.
 DEFAULT_EXECUTION_TIMEOUT_S: float | None = None
+_EVENT_STREAM_LOCKS: dict[str, threading.RLock] = {}
+_EVENT_STREAM_CURSORS: dict[str, EventCursor] = {}
+_EVENT_STREAM_LOCKS_GUARD = threading.Lock()
 PROCESS_TERMINATE_GRACE_S = 5.0
 MAX_CONSOLE_EVENT_SEGMENT_BYTES = 64 * 1024
+COMMANDER_PROBE_TIMEOUT_S = 15.0
+
+
+def _event_stream_lock(root: Path) -> threading.RLock:
+    """Return the one in-process lock for all writers to one event workspace."""
+
+    key = str(root.resolve())
+    with _EVENT_STREAM_LOCKS_GUARD:
+        return _EVENT_STREAM_LOCKS.setdefault(key, threading.RLock())
+
+
+def _event_stream_cursor(root: Path, paths: "MeasurementRuntimePaths") -> EventCursor:
+    """Return the shared in-process cursor for one measurement workspace."""
+
+    key = str(root.resolve())
+    with _EVENT_STREAM_LOCKS_GUARD:
+        cursor = _EVENT_STREAM_CURSORS.get(key)
+        if cursor is None:
+            cursor = EventCursor(_last_event_cursor(paths))
+            _EVENT_STREAM_CURSORS[key] = cursor
+        return cursor
 
 
 @dataclass(slots=True)
@@ -74,6 +102,46 @@ class BenchResources:
     xapi_path: str = ""
     group_id: int | None = None
     group_name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CommanderProbeEvidence:
+    """Raw evidence produced by one Commander DUT probe invocation."""
+
+    command: tuple[str, ...]
+    returncode: int | None
+    stdout: str = ""
+    stderr: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CommanderProbeIdentity:
+    """Physical DUT identity extracted from one Commander probe output."""
+
+    radio_board_part_number: str
+    radio_board_revision: str
+    radio_board_serial_number: str
+    target_device: str
+    canonical_target_device: str
+    dut_jlink_serial: str
+    vcom_supported: bool | None
+
+
+@dataclass(frozen=True, slots=True)
+class CommanderProbeResult:
+    """One validated Commander probe, including its retained raw evidence."""
+
+    evidence: CommanderProbeEvidence
+    identity: CommanderProbeIdentity
+
+
+class CommanderProbeError(RuntimeError):
+    """A Commander probe could not establish one trustworthy DUT identity."""
+
+    def __init__(self, message: str, evidence: CommanderProbeEvidence):
+        super().__init__(message)
+        self.evidence = evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,10 +189,10 @@ class MeasurementEventStream:
             MAX_CONSOLE_EVENT_SEGMENT_BYTES,
             max_console_bytes,
         )
-        self._lock = threading.Lock()
+        self._lock = _event_stream_lock(paths.root)
         self._console_segments = _console_segment_paths(paths.console_events)
         self._console_segment_bytes = sum(path.stat().st_size for path in self._console_segments)
-        self._cursor = EventCursor(_last_event_cursor(paths))
+        self._cursor = _event_stream_cursor(paths.root, paths)
         self._oldest_retained_cursor = _first_console_cursor(self._console_segments)
         if self._oldest_retained_cursor == 0 and self._cursor.value:
             self._oldest_retained_cursor = 1
@@ -144,11 +212,11 @@ class MeasurementEventStream:
         with self._lock:
             return self._append_structured_locked(state, **details)
 
-    def append_console(self, source: str, text: str) -> dict[str, Any]:
+    def append_console(self, source: str, text: str, *, variant: str = "") -> dict[str, Any]:
         if source not in {"stdout", "stderr"}:
             raise ValueError("console event source must be stdout or stderr")
         with self._lock:
-            record = self._next_record_locked("console", source=source, text=text)
+            record = self._next_record_locked("console", source=source, text=text, variant=variant)
             payload, record = _bounded_console_payload(record, self.max_console_bytes)
             self._append_console_payload_locked(record["cursor"], payload)
             self._cursor = EventCursor(record["cursor"])
@@ -206,14 +274,21 @@ class MeasurementEventStream:
             os.replace(temporary_path, self.paths.status)
 
     def _next_record_locked(self, event_type: str, **details: Any) -> dict[str, Any]:
-        return {
+        key = str(self.paths.root.resolve())
+        with _EVENT_STREAM_LOCKS_GUARD:
+            cursor = _EVENT_STREAM_CURSORS.get(key)
+            if cursor is None:
+                cursor = EventCursor(_last_event_cursor(self.paths))
+            self._cursor = cursor.next()
+            _EVENT_STREAM_CURSORS[key] = self._cursor
+        record = {
             **details,
             "measurement_id": self.measurement_id,
-            "cursor": self._cursor.next().value,
+            "cursor": self._cursor.value,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": event_type,
         }
-
+        return record
     def _append_structured_locked(self, state: str, **details: Any) -> dict[str, Any]:
         record = self._next_record_locked("lifecycle", state=state, **details)
         self.paths.root.mkdir(parents=True, exist_ok=True)
@@ -262,10 +337,14 @@ class BenchSession:
     runtime_dir: Path
     manifest: FirmwareData
     request: MeasurementRequest
+    active_firmware_dir: Path | None = None
     notes: list[str] = field(default_factory=list)
     max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
     max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
     execution_timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S
+    variant: str = ""
+    job_plan_path: Path | None = None
+    console_relay: MeasurementEventStream | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     event_stream: MeasurementEventStream = field(init=False, repr=False)
 
@@ -279,6 +358,35 @@ class BenchSession:
     @property
     def runtime_paths(self) -> MeasurementRuntimePaths:
         return MeasurementRuntimePaths.from_root(self.runtime_dir)
+
+    @property
+    def firmware_root(self) -> Path:
+        """Return the RAM-backed directory that owns active firmware images."""
+
+        return self.active_firmware_dir or self.runtime_dir
+
+
+@dataclass(frozen=True, slots=True)
+class DifferentialCampaignSession:
+    """Paired-campaign workspace; normal BenchSession remains single-variant."""
+
+    measurement_id: str
+    staged_runtime_dir: Path
+    execution_runtime_dir: Path
+    run_order: tuple[str, ...] = ("version1", "version2")
+
+    def __post_init__(self) -> None:
+        if self.run_order != ("version1", "version2"):
+            raise ValueError("differential campaign run order must be version1 then version2")
+
+    @property
+    def active_root(self) -> Path:
+        return self.execution_runtime_dir / "active"
+
+    def result_root(self, variant: str) -> Path:
+        if variant not in self.run_order:
+            raise ValueError(f"unknown differential firmware variant: {variant}")
+        return self.execution_runtime_dir / "results" / variant
 
 
 @dataclass(slots=True)
@@ -354,7 +462,10 @@ class CMSBench:
         if self.identity is None or self.resources is None:
             self.initialize()
 
-        identity = self.identity or BenchIdentity(bench_id=platform.node(), hostname=platform.node())
+        configured_identity = self.identity or BenchIdentity(
+            bench_id=platform.node(), hostname=platform.node()
+        )
+        identity = configured_identity
         checks: list[BenchCheckResult] = []
 
         if self.startup_error:
@@ -376,10 +487,58 @@ class CMSBench:
             )
 
         resources = self.resources or BenchResources()
+        detected_identity: DetectedTargetIdentity | None = None
+        commander_probe: HealthCommanderProbeEvidence | None = None
+        identity_check: BenchCheckResult
+        if resources.commander_path and resources.dut_probe_sn:
+            try:
+                probe_result = _probe_dut_identity(
+                    resources.commander_path,
+                    resources.dut_probe_sn,
+                )
+                detected_identity = _health_detected_target_identity(probe_result.identity)
+                commander_probe = _health_commander_probe_evidence(probe_result.evidence)
+                identity = replace(
+                    configured_identity,
+                    board=detected_identity.radio_board_part_number,
+                    device=detected_identity.target_device,
+                )
+                identity_check = BenchCheckResult(
+                    name="dut_identity",
+                    status=BenchCheckStatus.PASS,
+                    summary="DUT identity detected by Commander",
+                    detail=(
+                        f"radio_board={detected_identity.radio_board_part_number}; "
+                        f"revision={detected_identity.radio_board_revision}; "
+                        f"device_raw={detected_identity.target_device}; "
+                        f"device_canonical={detected_identity.canonical_target_device}"
+                    ),
+                )
+            except CommanderProbeError as exc:
+                commander_probe = _health_commander_probe_evidence(exc.evidence)
+                identity = replace(configured_identity, board="", device="")
+                identity_check = BenchCheckResult(
+                    name="dut_identity",
+                    status=BenchCheckStatus.FAIL,
+                    summary="Commander could not establish DUT identity",
+                    detail=str(exc),
+                )
+        else:
+            commander_probe = HealthCommanderProbeEvidence(
+                command=[],
+                returncode=None,
+                error="Commander path and DUT probe serial must be configured",
+            )
+            identity = replace(configured_identity, board="", device="")
+            identity_check = BenchCheckResult(
+                name="dut_identity",
+                status=BenchCheckStatus.FAIL,
+                summary="Commander probe is not configured for DUT identity",
+                detail=commander_probe.error,
+            )
+        checks.append(identity_check)
         checks.extend(
             [
-                _presence_check("board", resources.board, "board configured"),
-                _presence_check("device", resources.device, "device configured"),
                 _presence_check("dut_probe", resources.dut_probe_sn, "DUT probe configured"),
                 _presence_check("tester_probe", resources.tester_probe_sn, "tester probe configured"),
                 _presence_check(
@@ -427,6 +586,8 @@ class CMSBench:
             else DeviceState.ERROR,
             summary=_health_summary(state, checks),
             checks=checks,
+            detected_identity=detected_identity,
+            commander_probe=commander_probe,
         )
 
     def inspect(self, measurement_id: str) -> None:
@@ -471,40 +632,340 @@ class CMSBench:
             session.notes.append("firmware git_commit was not supplied")
         if session.request.firmware.sisdk_version == "":
             session.notes.append("firmware sisdk_version was not supplied")
-        if session.manifest.board and session.manifest.board != self.resources.board:
+        if (
+            session.manifest.board
+            and session.manifest.board.lower() != self.resources.board.lower()
+        ):
             raise RuntimeError(
                 f"firmware board {session.manifest.board} does not match bench board {self.resources.board}"
             )
-        if session.manifest.device and session.manifest.device != self.resources.device:
+        if (
+            session.manifest.device
+            and canonicalize_target_device(session.manifest.device)
+            != canonicalize_target_device(self.resources.device)
+        ):
             raise RuntimeError(
                 f"firmware device {session.manifest.device} does not match bench device {self.resources.device}"
             )
         if self.resources.board and session.request.selector.mode == "":
             raise RuntimeError("test selector mode is required")
 
-        dut_path = session.runtime_dir / session.manifest.dut_img.name
-        tester_path = session.runtime_dir / session.manifest.tester_img.name
+        firmware_root = session.firmware_root
+        dut_path = firmware_root / session.manifest.dut_img.name
+        tester_path = firmware_root / session.manifest.tester_img.name
         _validate_firmware_file(dut_path, session.manifest.dut_img.sha256 or session.manifest.dut_img_hash)
         _validate_firmware_file(tester_path, session.manifest.tester_img.sha256 or session.manifest.tester_img_hash)
         for name, image in session.manifest.dut_variants.items():
             _validate_firmware_file(
-                session.runtime_dir / image.name,
+                firmware_root / image.name,
                 image.sha256,
             )
         if session.manifest.bootloader_img is not None:
-            bootloader_path = session.runtime_dir / session.manifest.bootloader_img.name
+            bootloader_path = firmware_root / session.manifest.bootloader_img.name
             _validate_firmware_file(
                 bootloader_path,
                 session.manifest.bootloader_img.sha256 or session.manifest.bootloader_img_hash,
             )
         if session.manifest.xapi_file is None:
             raise RuntimeError("sl_bt.xapi was not supplied by the CMS client")
-        xapi_path = session.runtime_dir / session.manifest.xapi_file.name
+        xapi_path = firmware_root / session.manifest.xapi_file.name
         _validate_firmware_file(
             xapi_path,
             session.manifest.xapi_file.sha256 or session.manifest.xapi_file_hash,
         )
         _validate_variable_filtered_campaign(session)
+
+    def validate_differential_firmware(self, request: MeasurementRequest, runtime_dir: Path) -> None:
+        """Validate both isolated staged firmware variants before differential execution."""
+
+        if self.resources is None:
+            raise RuntimeError("bench resources are not initialized")
+        differential = request.differential_firmware
+        if differential is None:
+            raise RuntimeError("differential firmware was not supplied")
+        for variant_name, firmware in (("version1", differential.version1), ("version2", differential.version2)):
+            if firmware.board and firmware.board.lower() != self.resources.board.lower():
+                raise RuntimeError(
+                    f"{variant_name} firmware board {firmware.board} does not match bench board {self.resources.board}"
+                )
+            if (
+                firmware.device
+                and canonicalize_target_device(firmware.device)
+                != canonicalize_target_device(self.resources.device)
+            ):
+                raise RuntimeError(
+                    f"{variant_name} firmware device {firmware.device} does not match bench device {self.resources.device}"
+                )
+            variant_root = runtime_dir / "firmware" / variant_name
+            for role_image in firmware.role_images:
+                _validate_firmware_file(
+                    variant_root / "roles" / role_image.role / role_image.project_name / role_image.image.name,
+                    role_image.image.sha256,
+                )
+            if firmware.xapi_file is None:
+                raise RuntimeError(f"{variant_name} sl_bt.xapi was not supplied")
+            _validate_firmware_file(
+                variant_root / "xapi" / firmware.xapi_file.name,
+                firmware.xapi_file.sha256 or firmware.xapi_file_hash,
+            )
+            if firmware.bootloader_img is not None:
+                _validate_firmware_file(
+                    variant_root / "bootloader" / firmware.bootloader_img.name,
+                    firmware.bootloader_img.sha256 or firmware.bootloader_img_hash,
+                )
+        if request.selector.config_hash and not _is_mutable_custom_config_name(request.selector.config):
+            session = BenchSession(
+                measurement_id=request.request_id,
+                runtime_dir=runtime_dir,
+                manifest=differential.version2,
+                request=request,
+            )
+            config_path = _requested_test_config_path(session)
+            observed_hash = _sha256_text_file_lf_normalized(config_path)
+            if observed_hash != request.selector.config_hash:
+                raise RuntimeError("selected config hash does not match the requested differential campaign")
+
+    def build_differential_plan(self, request: MeasurementRequest, runtime_dir: Path) -> Path:
+        """Create the submitted deterministic plan to be reused by both SDK variants."""
+
+        if request.differential_firmware is None:
+            raise RuntimeError("differential plan requires differential firmware")
+        from test_orchestrator import CONFIG_ROOT, build_job_plan, build_jobs
+
+        feature = request.selector.feature.strip()
+        if not feature:
+            raise RuntimeError("differential test feature is required")
+        config = request.selector.config.strip() or "default"
+        if feature == "all" and config != "default":
+            raise RuntimeError("differential --feature all only supports the default config")
+        feature_filters = set() if feature == "all" else {feature}
+        exact_config = "" if config == "default" else config
+        jobs = build_jobs(
+            [CONFIG_ROOT / "ble"],
+            mode="all" if exact_config else "default",
+            feature_filters=feature_filters,
+            partition_filters=set(),
+            exact_config=exact_config,
+        )
+        if not jobs:
+            raise RuntimeError("differential selected zero jobs")
+        plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
+        custom_snapshot: dict[str, str] | None = None
+        if _is_mutable_custom_config_name(config):
+            source_config = jobs[0].config_path
+            snapshot_path = plan_path.with_name("custom_config_snapshot.json")
+            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_config, snapshot_path)
+            snapshot_hash = _sha256_file(snapshot_path)
+            jobs = [
+                replace(
+                    job,
+                    config_path=snapshot_path,
+                    cfg_arg=str(snapshot_path),
+                    config_hash=snapshot_hash,
+                )
+                for job in jobs
+            ]
+            custom_snapshot = {
+                "path": str(snapshot_path),
+                "sha256": snapshot_hash,
+            }
+        plan = build_job_plan(jobs)
+        for job_record in plan["jobs"]:
+            dut_project = Path(str(job_record["dut_slcp"])).stem
+            job_record["firmware_role"] = (
+                "dcdc" if dut_project == "ncp_ble_dut_dcdc" else "no_dcdc"
+            )
+        plan["scope"] = (
+            "all_default_features"
+            if feature == "all"
+            else "feature_default"
+            if config == "default"
+            else "feature_exact_config"
+        )
+        plan["selector"] = {
+            "feature": feature,
+            "config": config,
+            "config_hash": request.selector.config_hash,
+        }
+        if custom_snapshot is not None:
+            plan["custom_config_snapshot"] = custom_snapshot
+        plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+        return plan_path
+
+    def prepare_differential_variant_metadata(
+        self,
+        request: MeasurementRequest,
+        runtime_dir: Path,
+        variant: str,
+    ) -> Path:
+        """Create fresh per-pass metadata while retaining the one shared paired plan."""
+
+        if variant not in {"version1", "version2"}:
+            raise RuntimeError(f"unknown differential firmware variant: {variant}")
+        plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
+        if not plan_path.is_file():
+            raise RuntimeError("differential paired plan is missing")
+        metadata_root = runtime_dir / "results" / variant
+        metadata_root.mkdir(parents=True, exist_ok=True)
+        metadata_path = metadata_root / "cms_fw_metadata.json"
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    "variant": variant,
+                    "paired_plan_path": str(plan_path),
+                    "firmware_root": str(runtime_dir / "firmware" / variant),
+                    "request": measurement_request_to_dict(request),
+                },
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        return metadata_path
+
+    def differential_variant_result_root(self, runtime_dir: Path, variant: str) -> Path:
+        """Return the isolated result root for one side of a paired campaign."""
+
+        if variant not in {"version1", "version2"}:
+            raise RuntimeError(f"unknown differential firmware variant: {variant}")
+        result_root = runtime_dir / "results" / variant
+        result_root.mkdir(parents=True, exist_ok=True)
+        return result_root
+
+    def activate_differential_variant(
+        self,
+        request: MeasurementRequest,
+        campaign: DifferentialCampaignSession,
+        variant: str,
+        *,
+        cancel_event: threading.Event,
+    ) -> BenchSession:
+        """Materialize one staged firmware set for the normal generic runner."""
+
+        if variant not in {"version1", "version2"}:
+            raise RuntimeError(f"unknown differential firmware variant: {variant}")
+        differential = request.differential_firmware
+        if differential is None:
+            raise RuntimeError("differential variant activation requires version1 and version2 firmware")
+        firmware = getattr(differential, variant)
+        role_images = {item.project_name: item for item in firmware.role_images}
+        required_projects = {"ncp_ble_dut_dcdc", "ncp_ble_dut", "ncp_ble_tester"}
+        missing_projects = required_projects - set(role_images)
+        if missing_projects:
+            raise RuntimeError(
+                "differential firmware is missing required roles: "
+                + ", ".join(sorted(missing_projects))
+            )
+
+        result_root = campaign.result_root(variant)
+        result_root.mkdir(parents=True, exist_ok=True)
+        active_root = campaign.active_root
+        if active_root.exists():
+            shutil.rmtree(active_root)
+        active_root.mkdir(parents=True, exist_ok=True)
+        staged_variant_root = campaign.staged_runtime_dir / "firmware" / variant
+        for role_image in firmware.role_images:
+            source = (
+                staged_variant_root
+                / "roles"
+                / role_image.role
+                / role_image.project_name
+                / role_image.image.name
+            )
+            if not source.is_file():
+                raise RuntimeError(f"staged differential firmware image is missing: {source}")
+            shutil.copy2(source, active_root / role_image.image.name)
+        if firmware.xapi_file is None:
+            raise RuntimeError(f"{variant} sl_bt.xapi was not supplied")
+        xapi_source = staged_variant_root / "xapi" / firmware.xapi_file.name
+        if not xapi_source.is_file():
+            raise RuntimeError(f"staged differential XAPI is missing: {xapi_source}")
+        shutil.copy2(xapi_source, active_root / firmware.xapi_file.name)
+        if firmware.bootloader_img is not None:
+            bootloader_source = staged_variant_root / "bootloader" / firmware.bootloader_img.name
+            if not bootloader_source.is_file():
+                raise RuntimeError(f"staged differential bootloader is missing: {bootloader_source}")
+            shutil.copy2(bootloader_source, active_root / firmware.bootloader_img.name)
+
+        active_firmware = replace(
+            firmware,
+            dut_img=role_images["ncp_ble_dut"].image,
+            tester_img=role_images["ncp_ble_tester"].image,
+            dut_variants={
+                "dcdc": role_images["ncp_ble_dut_dcdc"].image,
+                "no_dcdc": role_images["ncp_ble_dut"].image,
+            },
+        )
+        active_request = replace(request, firmware=active_firmware)
+        return BenchSession(
+            measurement_id=request.request_id,
+            runtime_dir=result_root,
+            manifest=active_firmware,
+            request=active_request,
+            active_firmware_dir=active_root,
+            variant=variant,
+            job_plan_path=campaign.staged_runtime_dir / "firmware" / "paired_default_plan.json",
+            cancel_event=cancel_event,
+        )
+
+    def record_differential_job(
+        self, runtime_dir: Path, variant: str, record: dict[str, Any]
+    ) -> Path:
+        """Append one variant-labelled terminal job record without sharing output files."""
+
+        result_root = self.differential_variant_result_root(runtime_dir, variant)
+        record_path = result_root / "orchestrator_results.jsonl"
+        payload = {"variant": variant, **record}
+        with record_path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(payload, sort_keys=True) + "\n")
+        return record_path
+
+    def report_differential_firmware_selection(self, session: BenchSession) -> tuple[str, ...]:
+        """Publish the exact active images selected for one differential version."""
+
+        if not session.variant or session.active_firmware_dir is None:
+            raise RuntimeError("differential firmware reporting requires an active variant session")
+        selections: list[str] = []
+        for role_image in session.manifest.role_images:
+            active_image = session.active_firmware_dir / role_image.image.name
+            observed_sha256 = _sha256_file(active_image)
+            line = (
+                "CMS differential firmware selected: "
+                f"version={session.variant} role={role_image.role} "
+                f"project={role_image.project_name} image={active_image} "
+                f"sha256={observed_sha256} expected_sha256={role_image.image.sha256}"
+            )
+            session.event_stream.append_console("stdout", line + "\n")
+            if session.console_relay is not None:
+                session.console_relay.append_console("stdout", line + "\n", variant=session.variant)
+            selections.append(line)
+        return tuple(selections)
+
+    def record_differential_campaign_order(
+        self, runtime_dir: Path, order: tuple[str, ...] = ("version1", "version2")
+    ) -> Path:
+        """Retain the paired-pass order and bench identity for reproducibility."""
+
+        if set(order) != {"version1", "version2"}:
+            raise RuntimeError("differential campaign order must contain version1 and version2 exactly once")
+        path = runtime_dir / "results" / "differential_campaign.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_order": list(order),
+                    "bench": {
+                        "board": self.resources.board if self.resources else "",
+                        "device": self.resources.device if self.resources else "",
+                    },
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                },
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        return path
 
     def persist_staged_firmware_provenance(self, session: BenchSession) -> None:
         """Record the validated client SDK provenance in persistent bench config."""
@@ -537,13 +998,45 @@ class CMSBench:
             raise RuntimeError(f"bench is not runnable from state {self.state.value}")
         self.test_prepare(session)
 
-    def measurement_run(self, session: BenchSession) -> MeasurementResult:
+    def measurement_run(
+        self,
+        session: BenchSession,
+        *,
+        active_root: Path | None = None,
+    ) -> MeasurementResult:
         """Run the requested measurement flow and return structured results."""
         started_at = datetime.utcnow()
         self.state = BenchState.TESTING
+        phase = "validation"
+        pytest_launched = False
+        _write_setup_status(
+            session,
+            phase=phase,
+            state="running",
+            pytest_launched=pytest_launched,
+        )
         try:
             self.test_smoke(session)
-            prepared = _prepare_pytest_runtime(session, self.resources or BenchResources())
+            phase = "runtime_preparation"
+            _write_setup_status(
+                session,
+                phase=phase,
+                state="running",
+                pytest_launched=pytest_launched,
+            )
+            prepared = _prepare_pytest_runtime(
+                session,
+                self.resources or BenchResources(),
+                active_root=active_root,
+            )
+            phase = "pytest"
+            pytest_launched = True
+            _write_setup_status(
+                session,
+                phase=phase,
+                state="running",
+                pytest_launched=pytest_launched,
+            )
             completed = _run_test_orchestrator(session, prepared["results_log"], prepared["metadata_path"])
             result = MeasurementResult(
                 measurement_id=session.measurement_id,
@@ -555,24 +1048,25 @@ class CMSBench:
                 message="test execution completed" if completed.returncode == 0 else "test execution failed",
                 identity=session.request.identity,
             )
-            run_summary_path = session.runtime_dir / "cms_test_run.json"
-            run_summary_path.write_text(
-                json.dumps(
-                    {
-                        "request": measurement_request_to_dict(session.request),
-                        "returncode": completed.returncode,
-                        "stdout": completed.stdout,
-                        "stderr": completed.stderr,
-                        "notes": session.notes,
-                    },
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
+            _write_setup_status(
+                session,
+                phase="collection",
+                state="completed" if completed.returncode == 0 else "failed",
+                pytest_launched=pytest_launched,
             )
+            _write_test_run_summary(session, completed=completed, phase="pytest")
             return self.collect_artifacts(session, result, artifact_since=prepared["artifact_since"])
         except RuntimeError as exc:
-            return MeasurementResult(
+            _write_setup_status(
+                session,
+                phase=phase,
+                state="failed",
+                error=str(exc),
+                traceback_text=traceback.format_exc(),
+                pytest_launched=pytest_launched,
+            )
+            _write_test_run_summary(session, completed=None, phase=phase, error=str(exc))
+            result = MeasurementResult(
                 measurement_id=session.measurement_id,
                 state=MeasurementState.FAILED,
                 started_at=started_at,
@@ -582,6 +1076,11 @@ class CMSBench:
                 message=str(exc),
                 identity=session.request.identity,
             )
+            try:
+                return self.collect_artifacts(session, result)
+            except OSError as artifact_exc:
+                result.message = f"{result.message}; failed to collect diagnostics: {artifact_exc}"
+                return result
         finally:
             self.state = BenchState.IDLE
 
@@ -608,10 +1107,14 @@ class CMSBench:
                 )
             )
         for path in _real_test_artifacts(session, since=artifact_since):
+            relative_path = Path(_artifact_name(Path("artifacts"), path))
+            retained_path = session.runtime_dir / "measurement_artifacts" / relative_path
+            retained_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, retained_path)
             result.artifacts.append(
                 Artifacts(
-                    name=_artifact_name(Path("artifacts"), path),
-                    path=path,
+                    name=relative_path.as_posix(),
+                    path=retained_path,
                     result_type=ResultType.CURRENT_MEASUREMENT,
                 )
             )
@@ -791,8 +1294,16 @@ def resolve_cms_resources_from_hwmux(group_json: dict[str, Any]) -> BenchResourc
     )
 
 
-def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) -> dict[str, Path]:
-    build_root = session.runtime_dir / "fw_build"
+def _prepare_pytest_runtime(
+    session: BenchSession,
+    resources: BenchResources,
+    *,
+    active_root: Path | None = None,
+) -> dict[str, Path]:
+    """Prepare one run; active firmware/build data may live apart from evidence."""
+
+    active_root = active_root or session.runtime_dir
+    build_root = active_root / "fw_build"
     config_data = _campaign_firmware_config(session)
     selected_config = (
         _write_selected_config_evidence(session)
@@ -816,7 +1327,7 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
         for name, project in dut_projects.items():
             image = session.manifest.dut_variants[name]
             dut_copied_images[name] = _copy_image_to_project(
-                session.runtime_dir / image.name,
+                active_root / image.name,
                 project,
             )
     else:
@@ -824,15 +1335,15 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
             str(firmware.get("dut_slcp", session.manifest.dut_img.name))
         ).stem
         dut_copied_images["default"] = _copy_image_to_project(
-            session.runtime_dir / session.manifest.dut_img.name,
+            active_root / session.manifest.dut_img.name,
             dut_project,
         )
     tester_copied_image = _copy_image_to_project(
-        session.runtime_dir / session.manifest.tester_img.name,
+        active_root / session.manifest.tester_img.name,
         tester_project,
     )
-    bootloader_copied_image = _copy_bootloader_image(session, build_root)
-    xapi_path = _staged_xapi_path(session)
+    bootloader_copied_image = _copy_bootloader_image(session, build_root, active_root)
+    xapi_path = _staged_xapi_path(session, active_root)
 
     metadata = {
         "identity": (
@@ -872,8 +1383,9 @@ def _prepare_pytest_runtime(session: BenchSession, resources: BenchResources) ->
             "sisdk_commit": session.manifest.sisdk_commit,
             "sisdk_hash": session.manifest.sisdk_hash,
             "xapi_file_hash": session.manifest.xapi_file_hash,
-            "dut_image": str(session.runtime_dir / session.manifest.dut_img.name),
-            "tester_image": str(session.runtime_dir / session.manifest.tester_img.name),
+            "variant": session.variant,
+            "dut_image": str(active_root / session.manifest.dut_img.name),
+            "tester_image": str(active_root / session.manifest.tester_img.name),
             "dut_image_sha256": session.manifest.dut_img.sha256
             or session.manifest.dut_img_hash
             or _sha256_file(
@@ -968,10 +1480,10 @@ def _campaign_firmware_config(session: BenchSession) -> dict[str, Any]:
     return configs[0][1]
 
 
-def _staged_xapi_path(session: BenchSession) -> Path:
+def _staged_xapi_path(session: BenchSession, active_root: Path | None = None) -> Path:
     if session.manifest.xapi_file is None:
         raise RuntimeError("sl_bt.xapi was not supplied by the CMS client")
-    xapi_path = session.runtime_dir / session.manifest.xapi_file.name
+    xapi_path = (active_root or session.runtime_dir) / session.manifest.xapi_file.name
     if not xapi_path.exists():
         raise RuntimeError(f"staged sl_bt.xapi is missing: {xapi_path}")
     return xapi_path
@@ -986,10 +1498,14 @@ def _copy_image_to_project(source: Path, project_dir: Path) -> Path:
     return destination
 
 
-def _copy_bootloader_image(session: BenchSession, build_root: Path) -> Path | None:
+def _copy_bootloader_image(
+    session: BenchSession,
+    build_root: Path,
+    active_root: Path | None = None,
+) -> Path | None:
     if session.manifest.bootloader_img is None:
         return None
-    source = session.runtime_dir / session.manifest.bootloader_img.name
+    source = (active_root or session.runtime_dir) / session.manifest.bootloader_img.name
     return _copy_image_to_project(source, build_root / "bootloader-uart-bgapi")
 
 
@@ -1000,6 +1516,8 @@ def _run_managed_process(
     stdout_path: Path,
     stderr_path: Path,
     event_stream: MeasurementEventStream | None = None,
+    relay_event_stream: MeasurementEventStream | None = None,
+    relay_variant: str = "",
     log_max_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES,
     timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S,
     cancel_event: threading.Event | None = None,
@@ -1054,6 +1572,8 @@ def _run_managed_process(
             stdout_path,
             "stdout",
             event_stream,
+            relay_event_stream,
+            relay_variant,
             log_max_bytes,
             drain_errors,
         ),
@@ -1067,6 +1587,8 @@ def _run_managed_process(
             stderr_path,
             "stderr",
             event_stream,
+            relay_event_stream,
+            relay_variant,
             log_max_bytes,
             drain_errors,
         ),
@@ -1200,6 +1722,8 @@ def _drain_process_stream(
     destination: Path,
     source: str,
     event_stream: MeasurementEventStream | None,
+    relay_event_stream: MeasurementEventStream | None,
+    relay_variant: str,
     log_max_bytes: int,
     errors: list[OSError],
 ) -> None:
@@ -1214,6 +1738,8 @@ def _drain_process_stream(
                 event_stream.append_console(source, line)
                 if discarded_bytes:
                     event_stream.record_log_truncation(source, discarded_bytes)
+            if relay_event_stream is not None:
+                relay_event_stream.append_console(source, line, variant=relay_variant)
     except OSError as exc:
         errors.append(exc)
     finally:
@@ -1263,6 +1789,10 @@ def _run_test_orchestrator(
         cmd.extend(["--variable", f"{variable_filter.name}={variable_filter.value}"])
     if session.request.upload_results_to_database:
         cmd.append("--upload-results-to-database")
+    if session.job_plan_path is not None:
+        cmd.extend(["--job-plan", str(session.job_plan_path)])
+    if session.variant:
+        cmd.extend(["--variant", session.variant])
 
     return _run_managed_process(
         cmd,
@@ -1270,6 +1800,8 @@ def _run_test_orchestrator(
         stdout_path=session.runtime_paths.stdout,
         stderr_path=session.runtime_paths.stderr,
         event_stream=session.event_stream,
+        relay_event_stream=session.console_relay,
+        relay_variant=session.variant,
         log_max_bytes=session.max_console_log_bytes,
         timeout_s=session.execution_timeout_s,
         cancel_event=session.cancel_event,
@@ -1315,6 +1847,8 @@ def _validate_variable_filtered_campaign(session: BenchSession) -> None:
 
 
 def _orchestrator_mode(session: BenchSession) -> str:
+    if session.request.selector.config != "default":
+        return "all"
     mode = session.request.mode.value
     return "full_sweep" if mode == "full_sweep" else "default"
 
@@ -1322,6 +1856,7 @@ def _orchestrator_mode(session: BenchSession) -> str:
 def _run_diagnostic_artifacts(session: BenchSession) -> list[Path]:
     names = [
         "cms_fw_metadata.json",
+        "setup_status.json",
         "cms_test_run.json",
         "orchestrator_plan.json",
         "orchestrator_results.jsonl",
@@ -1337,6 +1872,70 @@ def _run_diagnostic_artifacts(session: BenchSession) -> list[Path]:
     if junit_dir.exists():
         artifacts.extend(sorted(junit_dir.glob("*.xml")))
     return artifacts
+
+
+def _write_setup_status(
+    session: BenchSession,
+    *,
+    phase: str,
+    state: str,
+    pytest_launched: bool,
+    error: str = "",
+    traceback_text: str = "",
+) -> Path:
+    """Persist RAM-backed per-pass setup progress before pytest can run."""
+
+    path = session.runtime_dir / "setup_status.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "measurement_id": session.measurement_id,
+                "variant": session.variant,
+                "phase": phase,
+                "state": state,
+                "pytest_launched": pytest_launched,
+                "error": error,
+                "traceback": traceback_text,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_test_run_summary(
+    session: BenchSession,
+    *,
+    completed: subprocess.CompletedProcess[str] | None,
+    phase: str,
+    error: str = "",
+) -> Path:
+    """Write a terminal run summary even when setup blocks pytest launch."""
+
+    path = session.runtime_dir / "cms_test_run.json"
+    path.write_text(
+        json.dumps(
+            {
+                "request": measurement_request_to_dict(session.request),
+                "phase": phase,
+                "pytest_launched": completed is not None,
+                "returncode": completed.returncode if completed is not None else None,
+                "stdout": completed.stdout if completed is not None else "",
+                "stderr": completed.stderr if completed is not None else "",
+                "error": error,
+                "notes": session.notes,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _load_requested_test_config(session: BenchSession) -> dict[str, Any]:
@@ -1393,6 +1992,11 @@ def _requested_test_config_dir(session: BenchSession) -> Path:
 
 
 def _requested_test_config_path(session: BenchSession) -> Path:
+    if _is_mutable_custom_config_name(session.request.selector.config) and session.job_plan_path is not None:
+        snapshot_path = session.job_plan_path.with_name("custom_config_snapshot.json")
+        if not snapshot_path.is_file():
+            raise RuntimeError("differential custom config snapshot is missing")
+        return snapshot_path
     config_dir = _requested_test_config_dir(session)
     config_name = session.request.selector.config or "default"
     config_name = config_name.strip().replace("\\", "/")
@@ -1409,6 +2013,10 @@ def _requested_test_config_path(session: BenchSession) -> Path:
     except ValueError as exc:
         raise RuntimeError("test config must stay beneath the selected feature directory") from exc
     return resolved
+
+
+def _is_mutable_custom_config_name(config: str) -> bool:
+    return config.strip().replace("\\", "/").lower() in {"custom", "custom.json"}
 
 
 def _real_test_artifacts(session: BenchSession, *, since: float | None = None) -> list[Path]:
@@ -1565,6 +2173,213 @@ def _presence_check(name: str, value: str, ok_summary: str) -> BenchCheckResult:
         status=BenchCheckStatus.FAIL,
         summary=f"{name} is not configured",
     )
+
+
+def _run_commander_probe(
+    commander_path: str,
+    dut_probe_sn: str,
+    *,
+    timeout_s: float = COMMANDER_PROBE_TIMEOUT_S,
+) -> CommanderProbeEvidence:
+    """Run Commander against the configured DUT probe and retain raw output."""
+
+    if not str(commander_path).strip():
+        raise ValueError("commander path is required for a DUT probe")
+    if not str(dut_probe_sn).strip():
+        raise ValueError("DUT probe serial is required for a Commander probe")
+    if timeout_s <= 0:
+        raise ValueError("Commander probe timeout must be positive")
+
+    command = (str(commander_path), "adapter", "probe", "-s", str(dut_probe_sn))
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_s,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        stdout = getattr(exc, "stdout", "") or ""
+        stderr = getattr(exc, "stderr", "") or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return CommanderProbeEvidence(
+            command=command,
+            returncode=None,
+            stdout=stdout,
+            stderr=stderr,
+            error=str(exc),
+        )
+
+    return CommanderProbeEvidence(
+        command=command,
+        returncode=completed.returncode,
+        stdout=completed.stdout or "",
+        stderr=completed.stderr or "",
+    )
+
+
+def _parse_commander_probe_identity(output: str) -> CommanderProbeIdentity:
+    """Extract the radio-board identity from Commander ``adapter probe`` output."""
+
+    board_entries = _commander_board_list_entries(output)
+    radio_boards = [entry for entry in board_entries if entry.get("target_device")]
+    if not radio_boards:
+        raise ValueError("Commander probe output has no radio-board entry with a target device")
+    if len(radio_boards) != 1:
+        raise ValueError("Commander probe output has multiple radio-board entries with target devices")
+
+    radio_board = radio_boards[0]
+    part_number, revision = _split_commander_board_part_number(radio_board.get("part_number", ""))
+    if not part_number:
+        raise ValueError("Commander radio-board entry has no part number")
+    if not radio_board.get("serial_number"):
+        raise ValueError("Commander radio-board entry has no serial number")
+
+    return CommanderProbeIdentity(
+        radio_board_part_number=part_number,
+        radio_board_revision=revision,
+        radio_board_serial_number=radio_board["serial_number"],
+        target_device=radio_board["target_device"],
+        canonical_target_device=_canonicalize_commander_device(radio_board["target_device"]),
+        dut_jlink_serial=_commander_probe_field(output, "J-Link Serial"),
+        vcom_supported=_commander_bool_field(output, "VCOM Supported"),
+    )
+
+
+def _probe_dut_identity(
+    commander_path: str,
+    dut_probe_sn: str,
+    *,
+    timeout_s: float = COMMANDER_PROBE_TIMEOUT_S,
+) -> CommanderProbeResult:
+    """Run and validate Commander output without falling back to configured identity."""
+
+    evidence = _run_commander_probe(commander_path, dut_probe_sn, timeout_s=timeout_s)
+    if evidence.error:
+        raise CommanderProbeError(f"Commander DUT probe could not run: {evidence.error}", evidence)
+    if evidence.returncode != 0:
+        raise CommanderProbeError(
+            f"Commander DUT probe failed with exit code {evidence.returncode}", evidence
+        )
+
+    try:
+        identity = _parse_commander_probe_identity(evidence.stdout)
+    except ValueError as exc:
+        raise CommanderProbeError(f"Commander DUT probe output is invalid: {exc}", evidence) from exc
+    if not identity.target_device:
+        raise CommanderProbeError(
+            "Commander radio-board entry has no target device",
+            evidence,
+        )
+    if identity.dut_jlink_serial != str(dut_probe_sn):
+        raise CommanderProbeError(
+            "Commander probe J-Link serial does not match the configured DUT probe serial",
+            evidence,
+        )
+    return CommanderProbeResult(evidence=evidence, identity=identity)
+
+
+def _health_detected_target_identity(identity: CommanderProbeIdentity) -> DetectedTargetIdentity:
+    return DetectedTargetIdentity(
+        radio_board_part_number=identity.radio_board_part_number,
+        radio_board_revision=identity.radio_board_revision,
+        radio_board_serial_number=identity.radio_board_serial_number,
+        target_device=identity.target_device,
+        canonical_target_device=identity.canonical_target_device,
+        dut_jlink_serial=identity.dut_jlink_serial,
+        vcom_supported=identity.vcom_supported,
+    )
+
+
+def _health_commander_probe_evidence(evidence: CommanderProbeEvidence) -> HealthCommanderProbeEvidence:
+    return HealthCommanderProbeEvidence(
+        command=list(evidence.command),
+        returncode=evidence.returncode,
+        stdout=evidence.stdout,
+        stderr=evidence.stderr,
+        error=evidence.error,
+    )
+
+
+def _commander_board_list_entries(output: str) -> list[dict[str, str]]:
+    """Return labelled records from the Commander ``Board List`` section only."""
+
+    lines = output.splitlines()
+    try:
+        start = next(
+            index
+            for index, line in enumerate(lines)
+            if re.fullmatch(r"\s*Board List\s*:\s*", line, flags=re.IGNORECASE)
+        )
+    except StopIteration:
+        raise ValueError("Commander probe output has no Board List section") from None
+
+    entries: list[dict[str, str]] = []
+    entry: dict[str, str] = {}
+    labels = {
+        "name": "name",
+        "part number": "part_number",
+        "serial number": "serial_number",
+        "target device": "target_device",
+    }
+    for line in lines[start + 1 :]:
+        if re.fullmatch(r"\s*DONE\s*", line, flags=re.IGNORECASE):
+            break
+        match = re.fullmatch(r"\s*([^:]+?)\s*:\s*(.*?)\s*", line)
+        if match is None:
+            continue
+        label = match.group(1).strip().casefold()
+        if label not in labels:
+            continue
+        key = labels[label]
+        if key == "name" and entry:
+            entries.append(entry)
+            entry = {}
+        entry[key] = match.group(2).strip()
+    if entry:
+        entries.append(entry)
+    return entries
+
+
+def _split_commander_board_part_number(value: str) -> tuple[str, str]:
+    """Split Commander ``BRDxxxx Rev. yyy`` text without normalizing it."""
+
+    match = re.fullmatch(r"\s*(.*?)\s+Rev\.?\s+(.+?)\s*", value, flags=re.IGNORECASE)
+    if match is None:
+        return value.strip(), ""
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def _canonicalize_commander_device(value: str) -> str:
+    """Compatibility wrapper for the shared target-device comparison rule."""
+
+    return canonicalize_target_device(value)
+
+
+def _commander_probe_field(output: str, label: str) -> str:
+    """Read one top-level Commander key/value field without guessing a default."""
+
+    match = re.search(
+        rf"^\s*{re.escape(label)}\s*:\s*(.*?)\s*$",
+        output,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _commander_bool_field(output: str, label: str) -> bool | None:
+    value = _commander_probe_field(output, label).casefold()
+    if value in {"true", "yes", "supported", "available"}:
+        return True
+    if value in {"false", "no", "unsupported", "unavailable"}:
+        return False
+    return None
 
 
 def _optional_presence_check(

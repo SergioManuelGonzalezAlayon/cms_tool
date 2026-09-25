@@ -9,6 +9,7 @@ import pytest
 
 from cms_colors import ColorFormatter
 import test_orchestrator as orchestrator
+from utils.bgapi_utils import RETRYABLE_STARTUP_EXIT_CODE
 
 
 def _job(name: str) -> orchestrator.Job:
@@ -106,6 +107,105 @@ def test_main_writes_complete_plan_before_first_pytest_job(tmp_path, monkeypatch
         assert completed["result_type"] == "pytest_junit"
         assert datetime.fromisoformat(started["started_at"]).utcoffset().total_seconds() == 0
         assert datetime.fromisoformat(completed["finished_at"]).utcoffset().total_seconds() == 0
+
+
+def test_orchestrator_retries_only_retryable_startup_failures(tmp_path, monkeypatch):
+    jobs = [_job("first"), _job("second")]
+    results_log = tmp_path / "orchestrator_results.jsonl"
+    outcomes = iter([RETRYABLE_STARTUP_EXIT_CODE, RETRYABLE_STARTUP_EXIT_CODE, 0, 0])
+    executed = []
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: jobs)
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or next(outcomes), 0.01),
+    )
+
+    exit_code = orchestrator.main(["--results-log", str(results_log)])
+
+    assert exit_code == 0
+    assert executed == [jobs[0].job_id, jobs[0].job_id, jobs[0].job_id, jobs[1].job_id]
+    records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
+    assert [record["record_type"] for record in records] == [
+        "job_started",
+        "job_completed",
+        "job_started",
+        "job_completed",
+    ]
+
+
+def test_orchestrator_continues_after_exhausting_retryable_startup_retries(tmp_path, monkeypatch):
+    jobs = [_job("first"), _job("second")]
+    results_log = tmp_path / "orchestrator_results.jsonl"
+    outcomes = iter([RETRYABLE_STARTUP_EXIT_CODE] * 4 + [0])
+    executed = []
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: jobs)
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or next(outcomes), 0.01),
+    )
+
+    exit_code = orchestrator.main(["--results-log", str(results_log)])
+
+    assert exit_code == 1
+    assert executed == [
+        jobs[0].job_id,
+        jobs[0].job_id,
+        jobs[0].job_id,
+        jobs[0].job_id,
+        jobs[1].job_id,
+    ]
+    records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
+    assert [record["status"] for record in records] == [
+        "running",
+        "failed",
+        "running",
+        "passed",
+    ]
+
+
+def test_orchestrator_does_not_retry_ordinary_pytest_failures(tmp_path, monkeypatch):
+    job = _job("ordinary-failure")
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: [job])
+    calls = []
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path: (calls.append(job.job_id) or 1, 0.01),
+    )
+
+    exit_code = orchestrator.main(["--results-log", str(tmp_path / "results.jsonl")])
+
+    assert exit_code == 1
+    assert calls == [job.job_id]
+
+
+@pytest.mark.parametrize("mode", ["default", "one_factor", "full_sweep", "all"])
+def test_orchestrator_retries_startup_failures_in_every_mode(tmp_path, monkeypatch, mode):
+    job = replace(_job(mode), mode=mode)
+    build_modes = []
+    outcomes = iter([RETRYABLE_STARTUP_EXIT_CODE, 0])
+    executed = []
+
+    def fake_build_jobs(*args, **kwargs):
+        build_modes.append(kwargs["mode"])
+        return [job]
+
+    monkeypatch.setattr(orchestrator, "build_jobs", fake_build_jobs)
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or next(outcomes), 0.01),
+    )
+
+    exit_code = orchestrator.main(
+        ["--mode", mode, "--results-log", str(tmp_path / f"{mode}.jsonl")]
+    )
+
+    assert exit_code == 0
+    assert build_modes == [mode]
+    assert executed == [job.job_id, job.job_id]
 
 
 def test_resume_plan_keeps_jobs_that_execution_skips(tmp_path, monkeypatch):
@@ -323,6 +423,44 @@ def test_build_jobs_rejects_requested_config_hash_mismatch(tmp_path, monkeypatch
             partition_filters=set(),
             cms_metadata_path=str(metadata_path),
         )
+
+
+def test_build_jobs_allows_a_mutable_custom_config_with_a_stale_requested_hash(tmp_path, monkeypatch):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "beacon"
+    feature_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text("{}\n", encoding="utf-8")
+    (feature_dir / "custom.json").write_text("{}\n", encoding="utf-8")
+    metadata_path = tmp_path / "cms_fw_metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "request": {
+                    "selector": {
+                        "mode": "ble",
+                        "feature": "beacon",
+                        "config": "custom",
+                        "config_hash": "stale-custom-hash",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    jobs = orchestrator.build_jobs(
+        [config_root],
+        mode="default",
+        feature_filters=set(),
+        partition_filters=set(),
+        exact_config="custom",
+        cms_metadata_path=str(metadata_path),
+    )
+
+    assert len(jobs) == 1
+    assert jobs[0].config_path.name == "custom.json"
+    assert jobs[0].config_hash == hashlib.sha256(b"{}\n").hexdigest()
 
 
 def test_orchestrator_validates_variable_filters_from_parameters_json(tmp_path, monkeypatch):
@@ -768,3 +906,23 @@ def test_cms_orchestrator_rejects_forwarded_pytest_cfg(tmp_path, monkeypatch, ca
     output = capsys.readouterr().out
     assert exit_code == 2
     assert "CMS orchestrator runs must use --exact-config" in output
+
+
+def test_cms_orchestrator_keeps_variant_identity_out_of_pytest_arguments() -> None:
+    parsed, _ = orchestrator.parse_args_with_pytest(
+        [
+            "--cms-runtime-config",
+            "cms_bench_runtime.json",
+            "--cms-fw-metadata",
+            "cms_fw_metadata.json",
+            "--variant",
+            "version1",
+        ]
+    )
+
+    assert orchestrator.cms_pytest_args(parsed) == [
+        "--cms-runtime-config",
+        "cms_bench_runtime.json",
+        "--cms-fw-metadata",
+        "cms_fw_metadata.json",
+    ]

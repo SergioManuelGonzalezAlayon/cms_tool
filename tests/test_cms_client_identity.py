@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import argparse
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,20 +11,49 @@ import cms_client
 from cms_client import (
     CMSClient,
     CMSClientConfig,
+    CMSBenchEndpointConfig,
+    CMSConnectionError,
+    CMSResolvedEndpoint,
+    compare_detected_target_identity,
+    refresh_and_record_bench_target,
+    require_fresh_firmware_target_match,
+    require_firmware_request_target_match,
     _failed_test_records_from_job_results,
     _print_measurement_result,
     _request_from_send_fw_args,
     _run_local_build,
+    update_custom_test_config,
     build_cli_parser,
+    load_client_config,
+    resolve_client_endpoint,
 )
 from cms_colors import ColorFormatter
 from cms_protocol import (
+    BenchHealthReport,
+    BenchIdentity,
+    BenchState,
+    DetectedTargetIdentity,
+    FirmwareData,
+    FirmwareImage,
     MeasurementIdentity,
     MeasurementMode,
+    MeasurementRequest,
     MeasurementResult,
     MeasurementState,
+    SuiteSelector,
     VariableFilter,
 )
+
+
+def _firmware_stage_request(request_id: str = "stage-001") -> MeasurementRequest:
+    return MeasurementRequest(
+        request_id=request_id,
+        selector=SuiteSelector(mode="ble", feature="beacon"),
+        firmware=FirmwareData(
+            dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut-hash"),
+            tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester-hash"),
+        ),
+    )
 
 
 def test_test_command_accepts_run_name():
@@ -47,6 +77,74 @@ def test_test_command_accepts_run_name():
     assert all_features.feature == "all"
 
 
+def test_custom_command_updates_only_an_existing_custom_config(tmp_path, monkeypatch):
+    config_dir = tmp_path / "tests" / "configs" / "ble" / "beacon"
+    config_dir.mkdir(parents=True)
+    default_path = config_dir / "default.json"
+    custom_path = config_dir / "custom.json"
+    default_path.write_text('{"advertiser": {"interval": 200, "phy": "1m"}}\n', encoding="utf-8")
+    custom_path.write_text(default_path.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    updated_path = update_custom_test_config(
+        "beacon",
+        ["advertiser.interval=100", "advertiser.phy=2m"],
+    )
+
+    assert updated_path == custom_path.resolve()
+    assert json.loads(custom_path.read_text(encoding="utf-8")) == {
+        "advertiser": {"interval": 100, "phy": "2m"}
+    }
+    assert json.loads(default_path.read_text(encoding="utf-8")) == {
+        "advertiser": {"interval": 200, "phy": "1m"}
+    }
+
+
+def test_send_firmware_reconciles_a_timed_out_post_with_its_completed_stage(monkeypatch):
+    client = CMSClient.__new__(CMSClient)
+    request = _firmware_stage_request()
+    calls = []
+
+    def fake_request(method, path, payload=None):
+        calls.append((method, path))
+        if method == "POST":
+            raise CMSConnectionError("CMS daemon request timed out")
+        assert (method, path) == ("GET", "/measurement/stage-001")
+        return {
+            "measurement_id": "stage-001",
+            "state": "accepted",
+            "message": "firmware staged and ready for test",
+        }
+
+    monkeypatch.setattr(cms_client, "_local_firmware_payloads", lambda _: {})
+    client._request_json = fake_request
+
+    result = client.send_firmware(request)
+
+    assert result.state is MeasurementState.ACCEPTED
+    assert calls == [("POST", "/firmware"), ("GET", "/measurement/stage-001")]
+
+
+def test_send_firmware_keeps_a_timeout_when_its_stage_is_not_completed(monkeypatch):
+    client = CMSClient.__new__(CMSClient)
+    request = _firmware_stage_request()
+
+    def fake_request(method, path, payload=None):
+        if method == "POST":
+            raise CMSConnectionError("CMS daemon request timed out")
+        return {
+            "measurement_id": "stage-001",
+            "state": "validating_firmware",
+            "message": "validating staged firmware",
+        }
+
+    monkeypatch.setattr(cms_client, "_local_firmware_payloads", lambda _: {})
+    client._request_json = fake_request
+
+    with pytest.raises(CMSConnectionError, match="request timed out"):
+        client.send_firmware(request)
+
+
 def test_tests_command_hides_debug_mode(capsys, monkeypatch):
     class Client:
         def list_tests(self):
@@ -58,6 +156,323 @@ def test_tests_command_hides_debug_mode(capsys, monkeypatch):
 
     assert exit_code == 0
     assert capsys.readouterr().out == "modes: default, full_sweep, diff\n"
+
+
+def test_health_command_prints_endpoint_and_detected_dut_identity(capsys, monkeypatch):
+    report = BenchHealthReport(
+        state=BenchState.IDLE,
+        identity=BenchIdentity(bench_id="cms-bench-001"),
+        summary="bench ready",
+        detected_identity=DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+            vcom_supported=True,
+        ),
+    )
+
+    class Client:
+        base_url = "http://cms-bench-001:8000"
+
+        def get_health(self):
+            return report
+
+    monkeypatch.setattr("cms_client.CMSClient", lambda **_kwargs: Client())
+
+    assert cms_client.main(["--color", "never", "health"]) == 0
+
+    output = capsys.readouterr().out
+    assert "endpoint: http://cms-bench-001:8000" not in output
+    assert "bench_id: cms-bench-001" in output
+    assert "detected_radio_board: BRD4182A Rev. B06 (serial 212300218)" in output
+    assert "detected_target_device: EFR32MG22C224F512IM40-C" in output
+    assert "detected_dut_jlink_serial: 440365029" in output
+    assert "detected_vcom_supported: true" in output
+
+
+def test_client_config_loads_optional_named_bench_endpoints(tmp_path):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "daemon": {"host": "default-bench", "port": 8000, "api_token": "default-token"},
+                "benches": {
+                    "lab-a": {
+                        "scheme": "https",
+                        "host": "lab-a.example.test",
+                        "port": 8443,
+                        "api_token": "lab-a-token",
+                        "timeout_s": 45,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_client_config(config_path)
+
+    assert config.base_url == "http://default-bench:8000"
+    assert config.benches == {
+        "lab-a": CMSBenchEndpointConfig(
+            scheme="https",
+            host="lab-a.example.test",
+            port=8443,
+            api_token="lab-a-token",
+            timeout_s=45.0,
+        )
+    }
+    assert config.benches["lab-a"].base_url == "https://lab-a.example.test:8443"
+
+
+def test_client_endpoint_resolution_supports_named_one_shot_and_default_endpoints():
+    config = CMSClientConfig(
+        base_url="http://default-bench:8000",
+        api_token="default-token",
+        timeout_s=30.0,
+        benches={
+            "lab-a": CMSBenchEndpointConfig(
+                scheme="https",
+                host="lab-a.example.test",
+                port=8443,
+                api_token="lab-a-token",
+                timeout_s=45.0,
+            )
+        },
+    )
+
+    assert resolve_client_endpoint(config, bench_id="lab-a") == CMSResolvedEndpoint(
+        base_url="https://lab-a.example.test:8443",
+        api_token="lab-a-token",
+        timeout_s=45.0,
+        source="bench ID lab-a",
+    )
+    assert resolve_client_endpoint(config, bench_ip="192.0.2.10") == CMSResolvedEndpoint(
+        base_url="http://192.0.2.10:8000",
+        api_token="default-token",
+        timeout_s=30.0,
+        source="--bench-ip",
+    )
+    assert resolve_client_endpoint(config) == CMSResolvedEndpoint(
+        base_url="http://default-bench:8000",
+        api_token="default-token",
+        timeout_s=30.0,
+        source="default daemon configuration",
+    )
+
+
+def test_client_endpoint_resolution_rejects_unknown_or_conflicting_selectors():
+    config = CMSClientConfig(base_url="http://default-bench:8000")
+
+    with pytest.raises(ValueError, match="unknown CMS bench ID"):
+        resolve_client_endpoint(config, bench_id="missing")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        resolve_client_endpoint(config, base_url="http://one", bench_ip="192.0.2.10")
+
+
+def test_target_comparison_accepts_detected_device_package_suffix_and_board_case():
+    comparison = compare_detected_target_identity(
+        DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+        ),
+        requested_board="brd4182a",
+        requested_device="EFR32MG22C224F512IM40",
+    )
+
+    assert comparison.matches
+    assert comparison.mismatches == ()
+    assert comparison.detected_device_raw == "EFR32MG22C224F512IM40-C"
+    assert comparison.detected_device_canonical == "EFR32MG22C224F512IM40"
+
+
+def test_target_comparison_records_actionable_board_and_device_mismatches():
+    comparison = compare_detected_target_identity(
+        DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+        ),
+        requested_board="BRD4183A",
+        requested_device="EFR32MG24B220F1536IM48",
+    )
+
+    assert not comparison.matches
+    assert "board detected=BRD4182A requested=BRD4183A" in comparison.mismatches
+    assert any("detected_raw=EFR32MG22C224F512IM40-C" in item for item in comparison.mismatches)
+
+
+def test_fresh_health_records_detected_bench_target_in_existing_client_config(tmp_path):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(json.dumps({"target": {"sisdk": "2026.1.0"}}), encoding="utf-8")
+    report = BenchHealthReport(
+        state=BenchState.IDLE,
+        detected_identity=DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+            vcom_supported=True,
+        ),
+    )
+
+    class Client:
+        def get_health(self):
+            return report
+
+    assert refresh_and_record_bench_target(Client(), config_path) == report.detected_identity
+    target = json.loads(config_path.read_text(encoding="utf-8"))["target"]
+    assert target == {
+        "sisdk": "2026.1.0",
+        "board": "brd4182a",
+        "board_rev": "B06",
+        "device": "EFR32MG22C224F512IM40-C",
+        "device_canonical": "EFR32MG22C224F512IM40",
+        "radio_board_serial": "212300218",
+        "dut_jlink_serial": "440365029",
+        "vcom_supported": True,
+    }
+
+
+def test_send_firmware_target_check_rejects_mismatch_after_fresh_health(tmp_path):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(json.dumps({"target": {}}), encoding="utf-8")
+    report = BenchHealthReport(
+        state=BenchState.IDLE,
+        detected_identity=DetectedTargetIdentity(
+            radio_board_part_number="BRD4182A",
+            radio_board_revision="B06",
+            radio_board_serial_number="212300218",
+            target_device="EFR32MG22C224F512IM40-C",
+            canonical_target_device="EFR32MG22C224F512IM40",
+            dut_jlink_serial="440365029",
+        ),
+    )
+
+    class Client:
+        def get_health(self):
+            return report
+
+    firmware = FirmwareData(
+        dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut"),
+        tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester"),
+        board="BRD4183A",
+        device="EFR32MG24B220F1536IM48",
+    )
+
+    with pytest.raises(RuntimeError, match="does not match freshly detected") as raised:
+        require_fresh_firmware_target_match(Client(), config_path, firmware)
+
+    message = str(raised.value)
+    assert "board detected=BRD4182A requested=BRD4183A" in message
+    assert "detected_raw=EFR32MG22C224F512IM40-C" in message
+    assert "detected_canonical=EFR32MG22C224F512IM40" in message
+    assert "requested=EFR32MG24B220F1536IM48" in message
+
+
+def test_differential_firmware_target_check_names_the_mismatched_variant():
+    detected = DetectedTargetIdentity(
+        radio_board_part_number="BRD4182A",
+        radio_board_revision="B06",
+        radio_board_serial_number="212300218",
+        target_device="EFR32MG22C224F512IM40-C",
+        canonical_target_device="EFR32MG22C224F512IM40",
+        dut_jlink_serial="440365029",
+    )
+    matching = FirmwareData(
+        dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut"),
+        tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester"),
+        board="BRD4182A",
+        device="EFR32MG22C224F512IM40",
+    )
+    mismatching = FirmwareData(
+        dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut"),
+        tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester"),
+        board="BRD4183A",
+        device="EFR32MG24B220F1536IM48",
+    )
+    request = SimpleNamespace(
+        differential_firmware=SimpleNamespace(version1=matching, version2=mismatching),
+        firmware=matching,
+    )
+
+    with pytest.raises(RuntimeError, match="differential version2"):
+        require_firmware_request_target_match(detected, request)
+
+
+def test_remote_workflow_commands_accept_named_and_one_shot_bench_selectors():
+    parser = build_cli_parser()
+
+    build = parser.parse_args(["BUILD", "--diff", "--bench-id", "lab-a"])
+    send_fw = parser.parse_args(["SEND_FW", "--bench-ip", "192.0.2.10"])
+    test = parser.parse_args(
+        ["TEST", "--mode", "diff", "--feature", "beacon", "--bench-id", "lab-a"]
+    )
+
+    assert build.bench_id == "lab-a"
+    assert send_fw.bench_ip == "192.0.2.10"
+    assert test.bench_id == "lab-a"
+
+
+def test_diff_build_uses_and_displays_the_resolved_named_endpoint(tmp_path, monkeypatch, capsys):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "benches": {
+                    "lab-a": {
+                        "scheme": "https",
+                        "host": "lab-a.example.test",
+                        "port": 8443,
+                        "api_token": "lab-a-token",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, object] = {}
+
+    class Client:
+        base_url = "https://lab-a.example.test:8443"
+
+        def get_health(self):
+            return BenchHealthReport(
+                state=BenchState.IDLE,
+                detected_identity=DetectedTargetIdentity(
+                    radio_board_part_number="BRD4182A",
+                    radio_board_revision="B06",
+                    radio_board_serial_number="212300218",
+                    target_device="EFR32MG22C224F512IM40-C",
+                    canonical_target_device="EFR32MG22C224F512IM40",
+                    dut_jlink_serial="440365029",
+                ),
+            )
+
+    def fake_client(**kwargs):
+        captured.update(kwargs)
+        return Client()
+
+    monkeypatch.setattr(cms_client, "CMSClient", fake_client)
+    monkeypatch.setattr(cms_client, "_run_local_build", lambda *_args: 0)
+
+    assert cms_client.main(["--config", str(config_path), "BUILD", "--diff", "--bench-id", "lab-a"]) == 0
+
+    assert captured["base_url"] == "https://lab-a.example.test:8443"
+    assert captured["api_token"] == "lab-a-token"
+    assert "endpoint: https://lab-a.example.test:8443" in capsys.readouterr().out
 
 
 def test_build_derives_sisdk_version_from_the_selected_package(tmp_path, monkeypatch):
@@ -96,6 +511,47 @@ def test_build_derives_sisdk_version_from_the_selected_package(tmp_path, monkeyp
     assert "--sisdk-version" not in captured["command"]
 
 
+def test_diff_build_passes_preflight_flag_without_rewriting_normal_sdk_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "target": {"sisdk": "unchanged"},
+                "diff": {
+                    "sisdk_version2_path": "version2-sdk",
+                    "sisdk_version1_path": "version1-sdk",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(cms_client.subprocess, "run", fake_run)
+    args = argparse.Namespace(
+        action="build",
+        targets=[],
+        sdk_package_path="",
+        build_root="",
+        bootloader_slcp="",
+        diff=True,
+    )
+
+    assert _run_local_build(args, str(config_path)) == 0
+    assert "--diff" in captured["command"]
+    assert json.loads(config_path.read_text(encoding="utf-8"))["target"]["sisdk"] == "unchanged"
+
+
+def test_build_parser_accepts_diff_preflight():
+    args = build_cli_parser().parse_args(["BUILD", "--diff"])
+
+    assert args.diff is True
+
+
 def test_run_test_sends_requested_run_name_to_daemon():
     captured = {}
     client = CMSClient.__new__(CMSClient)
@@ -118,6 +574,22 @@ def test_run_test_sends_requested_run_name_to_daemon():
     assert result.measurement_id == "generated-id"
 
 
+def test_run_diff_test_uses_the_current_stage_without_sending_a_staging_id():
+    captured = {}
+    client = CMSClient.__new__(CMSClient)
+
+    def fake_request(method, path, payload):
+        captured.update(payload)
+        return {"measurement_id": "generated-id", "state": "accepted"}
+
+    client._request_json = fake_request
+
+    client.run_test(MeasurementMode.DIFF, "all")
+
+    assert captured["mode"] == "diff"
+    assert "staging_id" not in captured
+
+
 def test_run_all_features_does_not_send_a_single_config_hash():
     captured = {}
     client = CMSClient.__new__(CMSClient)
@@ -132,6 +604,22 @@ def test_run_all_features_does_not_send_a_single_config_hash():
 
     assert captured["feature"] == "all"
     assert captured["config"] == "default"
+    assert captured["config_hash"] == ""
+
+
+def test_run_custom_config_does_not_send_a_config_hash():
+    captured = {}
+    client = CMSClient.__new__(CMSClient)
+
+    def fake_request(method, path, payload):
+        captured.update(payload)
+        return {"measurement_id": "generated-id", "state": "accepted"}
+
+    client._request_json = fake_request
+
+    client.run_test(MeasurementMode.DEFAULT, "beacon", config="custom")
+
+    assert captured["config"] == "custom"
     assert captured["config_hash"] == ""
 
 
@@ -463,6 +951,14 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
     build_root = tmp_path / "fw"
     runtime = build_root / "runtime"
     runtime.mkdir(parents=True)
+    sdk_root = tmp_path / "sdk"
+    sdk_xapi = sdk_root / "bluetooth_le_host" / "api" / "sl_bt.xapi"
+    sdk_xapi.parent.mkdir(parents=True)
+    sdk_xapi.write_bytes(b"exact-sdk-xapi")
+    (sdk_root / ".properties").write_text(
+        "id=com.silabs.sdk.stack.sisdk\nversion=2026.1.0\n",
+        encoding="utf-8",
+    )
     dut_image = tmp_path / "dut.s37"
     no_dcdc_dut_image = tmp_path / "dut-no-dcdc.s37"
     tester_image = tmp_path / "tester.s37"
@@ -489,6 +985,7 @@ def test_firmware_request_uses_build_sdk_and_xapi_provenance(tmp_path, monkeypat
                 "version": "2026.1.0",
                 "commit": "sdk-commit",
                 "hash": "sdk-hash",
+                "package_path": str(sdk_root),
                 "xapi_sha256": xapi_hash,
             },
         }),
@@ -555,3 +1052,35 @@ def test_firmware_request_rejects_incomplete_build_sdk_provenance(tmp_path):
             args,
             CMSClientConfig(target={}, build={"root": str(build_root)}),
         )
+
+
+def test_differential_request_rejects_bin_firmware_manifest(tmp_path) -> None:
+    build_root = tmp_path / "fw"
+    build_root.mkdir()
+    variants = {}
+    for name in ("version1", "version2"):
+        variants[name] = {
+            "manifest": {
+                "firmware": {
+                    "board": "brd4182a",
+                    "device": "EFR32MG22C224F512IM40",
+                    "artifacts": [
+                        {"role": role, "project_name": project, "image": f"{project}.bin", "sha256": "hash"}
+                        for role, project in (
+                            ("dut_dcdc", "ncp_ble_dut_dcdc"),
+                            ("dut_no_dcdc", "ncp_ble_dut"),
+                            ("tester", "ncp_ble_tester"),
+                        )
+                    ],
+                },
+                "build": {"xapi": "runtime/sl_bt.xapi"},
+                "sdk": {"xapi_sha256": "xapi-hash"},
+            }
+        }
+    (build_root / "diff_fw_data.json").write_text(
+        json.dumps({"variants": variants}), encoding="utf-8"
+    )
+    args = argparse.Namespace(request_id="request", requested_by="developer")
+
+    with pytest.raises(RuntimeError, match="non-flashable firmware artifact"):
+        cms_client._request_from_diff_build_manifest(args, build_root)

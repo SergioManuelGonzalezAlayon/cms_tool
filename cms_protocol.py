@@ -34,6 +34,20 @@ class BenchCheckStatus(str, Enum):
     FAIL = "fail"
 
 
+def canonicalize_target_device(value: str) -> str:
+    """Return the stable build-comparison form of a target device identifier.
+
+    Commander may append a one-letter package suffix, such as ``-C``, to an
+    EFR32 device identifier. Build manifests omit that suffix, so it is removed
+    only from otherwise valid EFR32 identifiers. All other text is retained
+    after trimming and uppercasing rather than guessed or rewritten.
+    """
+
+    raw = value.strip().upper()
+    match = re.fullmatch(r"(EFR32[A-Z0-9]+)-[A-Z]", raw)
+    return match.group(1) if match else raw
+
+
 class MeasurementState(str, Enum):
     """Lifecycle states visible to the remote client."""
     ACCEPTED = "accepted"
@@ -233,6 +247,21 @@ class FirmwareImage:
     sha256: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class FirmwareRoleImage:
+    """One explicitly named firmware role within a complete firmware variant."""
+
+    role: str
+    project_name: str
+    image: FirmwareImage
+
+    def __post_init__(self) -> None:
+        if not self.role.strip():
+            raise ValueError("firmware role must not be empty")
+        if not self.project_name.strip():
+            raise ValueError("firmware project name must not be empty")
+
+
 @dataclass(slots=True)
 class FirmwareData:
     """Firmware references that the daemon stages before execution."""
@@ -253,6 +282,18 @@ class FirmwareData:
     sisdk_version: str = ""
     sisdk_commit: str = ""
     sisdk_hash: str = ""
+    role_images: tuple[FirmwareRoleImage, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DifferentialFirmwareData:
+    """The complete, independently provenanced version1 and version2 firmware sets."""
+
+    version1: FirmwareData
+    version2: FirmwareData
+
+    def __post_init__(self) -> None:
+        validate_differential_firmware(self)
 
 
 @dataclass(slots=True)
@@ -291,6 +332,7 @@ class MeasurementRequest:
     upload_results_to_database: bool = True
     debug_artifact_streaming: bool = False
     identity: MeasurementIdentity | None = None
+    differential_firmware: DifferentialFirmwareData | None = None
 
 
 @dataclass(slots=True)
@@ -314,6 +356,13 @@ class MeasurementResult:
     current_step: str = ""
     message: str = ""
     identity: MeasurementIdentity | None = None
+    mode: str = ""
+    current_variant: str = ""
+    completed_variants: int = 0
+    total_variants: int = 0
+    current_test: str = ""
+    passed_count: int = 0
+    failed_count: int = 0
 
 
 @dataclass(slots=True)
@@ -326,6 +375,30 @@ class BenchStatus:
 
 
 @dataclass(slots=True)
+class DetectedTargetIdentity:
+    """Physical DUT identity freshly detected by the CMS Bench."""
+
+    radio_board_part_number: str
+    radio_board_revision: str
+    radio_board_serial_number: str
+    target_device: str
+    canonical_target_device: str
+    dut_jlink_serial: str
+    vcom_supported: bool | None = None
+
+
+@dataclass(slots=True)
+class CommanderProbeEvidence:
+    """Raw execution evidence from the Commander probe used for health."""
+
+    command: list[str]
+    returncode: int | None
+    stdout: str = ""
+    stderr: str = ""
+    error: str = ""
+
+
+@dataclass(slots=True)
 class BenchHealthReport:
     """Health snapshot for hardware and local tooling."""
     state: BenchState
@@ -335,6 +408,8 @@ class BenchHealthReport:
     identity: BenchIdentity = field(default_factory=lambda: BenchIdentity(bench_id=""))
     summary: str = ""
     checks: list["BenchCheckResult"] = field(default_factory=list)
+    detected_identity: DetectedTargetIdentity | None = None
+    commander_probe: CommanderProbeEvidence | None = None
     checked_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -578,8 +653,56 @@ def bench_check_to_dict(check: BenchCheckResult) -> dict[str, str]:
     return result
 
 
-def bench_health_report_to_dict(report: BenchHealthReport) -> dict[str, Any]:
+def detected_target_identity_to_dict(identity: DetectedTargetIdentity) -> dict[str, Any]:
     return {
+        "radio_board_part_number": identity.radio_board_part_number,
+        "radio_board_revision": identity.radio_board_revision,
+        "radio_board_serial_number": identity.radio_board_serial_number,
+        "target_device": identity.target_device,
+        "canonical_target_device": identity.canonical_target_device,
+        "dut_jlink_serial": identity.dut_jlink_serial,
+        "vcom_supported": identity.vcom_supported,
+    }
+
+
+def detected_target_identity_from_dict(data: dict[str, Any] | None) -> DetectedTargetIdentity | None:
+    if data is None:
+        return None
+    return DetectedTargetIdentity(
+        radio_board_part_number=str(data.get("radio_board_part_number", "")),
+        radio_board_revision=str(data.get("radio_board_revision", "")),
+        radio_board_serial_number=str(data.get("radio_board_serial_number", "")),
+        target_device=str(data.get("target_device", "")),
+        canonical_target_device=str(data.get("canonical_target_device", "")),
+        dut_jlink_serial=str(data.get("dut_jlink_serial", "")),
+        vcom_supported=data.get("vcom_supported"),
+    )
+
+
+def commander_probe_evidence_to_dict(evidence: CommanderProbeEvidence) -> dict[str, Any]:
+    return {
+        "command": list(evidence.command),
+        "returncode": evidence.returncode,
+        "stdout": evidence.stdout,
+        "stderr": evidence.stderr,
+        "error": evidence.error,
+    }
+
+
+def commander_probe_evidence_from_dict(data: dict[str, Any] | None) -> CommanderProbeEvidence | None:
+    if data is None:
+        return None
+    return CommanderProbeEvidence(
+        command=[str(value) for value in data.get("command", [])],
+        returncode=data.get("returncode"),
+        stdout=str(data.get("stdout", "")),
+        stderr=str(data.get("stderr", "")),
+        error=str(data.get("error", "")),
+    )
+
+
+def bench_health_report_to_dict(report: BenchHealthReport) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "identity": bench_identity_to_dict(report.identity),
         "state": report.state.value,
         "dut_state": report.dut_state.value,
@@ -589,6 +712,11 @@ def bench_health_report_to_dict(report: BenchHealthReport) -> dict[str, Any]:
         "checks": [bench_check_to_dict(check) for check in report.checks],
         "checked_at": report.checked_at.isoformat(),
     }
+    if report.detected_identity is not None:
+        result["detected_identity"] = detected_target_identity_to_dict(report.detected_identity)
+    if report.commander_probe is not None:
+        result["commander_probe"] = commander_probe_evidence_to_dict(report.commander_probe)
+    return result
 
 
 def bench_identity_from_dict(data: dict[str, Any] | None) -> BenchIdentity:
@@ -629,6 +757,8 @@ def bench_health_report_from_dict(data: dict[str, Any]) -> BenchHealthReport:
         js_state=DeviceState(str(data.get("js_state", DeviceState.ERROR.value))),
         summary=str(data.get("summary", "")),
         checks=[bench_check_from_dict(check) for check in data.get("checks", [])],
+        detected_identity=detected_target_identity_from_dict(data.get("detected_identity")),
+        commander_probe=commander_probe_evidence_from_dict(data.get("commander_probe")),
         checked_at=parsed_checked_at,
     )
 
@@ -649,8 +779,27 @@ def firmware_image_from_dict(data: dict[str, Any] | None) -> FirmwareImage | Non
     )
 
 
-def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
+def firmware_role_image_to_dict(role_image: FirmwareRoleImage) -> dict[str, Any]:
     return {
+        "role": role_image.role,
+        "project_name": role_image.project_name,
+        "image": firmware_image_to_dict(role_image.image),
+    }
+
+
+def firmware_role_image_from_dict(data: dict[str, Any]) -> FirmwareRoleImage:
+    image = firmware_image_from_dict(data.get("image"))
+    if image is None:
+        raise ValueError("firmware role image must contain an image")
+    return FirmwareRoleImage(
+        role=str(data.get("role", "")),
+        project_name=str(data.get("project_name", "")),
+        image=image,
+    )
+
+
+def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
+    payload = {
         "dut_img": firmware_image_to_dict(firmware.dut_img),
         "tester_img": firmware_image_to_dict(firmware.tester_img),
         "dut_variants": {
@@ -672,6 +821,12 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
         "sisdk_commit": firmware.sisdk_commit,
         "sisdk_hash": firmware.sisdk_hash,
     }
+    if firmware.role_images:
+        payload["role_images"] = [
+            firmware_role_image_to_dict(role_image)
+            for role_image in firmware.role_images
+        ]
+    return payload
 
 
 def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
@@ -692,6 +847,9 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         for name, value in raw_dut_variants.items()
         if (image := firmware_image_from_dict(value)) is not None
     }
+    raw_role_images = data.get("role_images", [])
+    if not isinstance(raw_role_images, list):
+        raise ValueError("role_images must be a list")
     return FirmwareData(
         dut_img=dut_img,
         tester_img=tester_img,
@@ -710,11 +868,56 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         sisdk_version=str(data.get("sisdk_version", "")),
         sisdk_commit=str(data.get("sisdk_commit", "")),
         sisdk_hash=str(data.get("sisdk_hash", "")),
+        role_images=tuple(firmware_role_image_from_dict(item) for item in raw_role_images),
     )
 
 
-def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
+def differential_firmware_to_dict(firmware: DifferentialFirmwareData) -> dict[str, Any]:
+    validate_differential_firmware(firmware)
     return {
+        "version1": firmware_data_to_dict(firmware.version1),
+        "version2": firmware_data_to_dict(firmware.version2),
+    }
+
+
+def differential_firmware_from_dict(data: dict[str, Any]) -> DifferentialFirmwareData:
+    version1 = data.get("version1")
+    version2 = data.get("version2")
+    if not isinstance(version1, dict) or not isinstance(version2, dict):
+        raise ValueError("differential_firmware must contain version1 and version2 firmware objects")
+    return DifferentialFirmwareData(
+        version1=firmware_data_from_dict(version1),
+        version2=firmware_data_from_dict(version2),
+    )
+
+
+def validate_differential_firmware(firmware: DifferentialFirmwareData) -> None:
+    """Reject incomplete or ambiguous version1/version2 firmware sets before staging."""
+
+    for variant_name, variant in (("version1", firmware.version1), ("version2", firmware.version2)):
+        required_images = [variant.dut_img, variant.tester_img, variant.xapi_file]
+        required_images.extend(variant.dut_variants.values())
+        required_images.extend(role_image.image for role_image in variant.role_images)
+        if variant.bootloader_img is not None:
+            required_images.append(variant.bootloader_img)
+        if any(image is None or not image.sha256 for image in required_images):
+            raise ValueError(f"differential {variant_name} firmware contains an image without sha256")
+        if not variant.role_images:
+            raise ValueError(f"differential {variant_name} firmware must contain explicit role images")
+        role_keys = [(item.role, item.project_name) for item in variant.role_images]
+        if len(role_keys) != len(set(role_keys)):
+            raise ValueError(f"differential {variant_name} firmware contains duplicate role images")
+        project_names = [item.project_name for item in variant.role_images]
+        if len(project_names) != len(set(project_names)):
+            raise ValueError(f"differential {variant_name} firmware contains duplicate role project names")
+    version1_target = (firmware.version1.board, firmware.version1.device)
+    version2_target = (firmware.version2.board, firmware.version2.device)
+    if all(version1_target) and all(version2_target) and version1_target != version2_target:
+        raise ValueError("differential version1 and version2 firmware targets do not match")
+
+
+def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
+    payload = {
         "request_id": request.request_id,
         "identity": measurement_identity_to_dict(request.identity) if request.identity else None,
         "selector": {
@@ -730,6 +933,11 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
         "upload_results_to_database": request.upload_results_to_database,
         "debug_artifact_streaming": request.debug_artifact_streaming,
     }
+    if request.differential_firmware is not None:
+        payload["differential_firmware"] = differential_firmware_to_dict(
+            request.differential_firmware
+        )
+    return payload
 
 
 def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
@@ -750,6 +958,11 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
         upload_results_to_database=bool(data.get("upload_results_to_database", True)),
         debug_artifact_streaming=bool(data.get("debug_artifact_streaming", False)),
         identity=measurement_identity_from_dict(identity_data) if identity_data else None,
+        differential_firmware=(
+            differential_firmware_from_dict(data["differential_firmware"])
+            if data.get("differential_firmware") is not None
+            else None
+        ),
     )
 
 
@@ -784,6 +997,13 @@ def measurement_result_to_dict(result: MeasurementResult) -> dict[str, Any]:
         "progress_percent": result.progress_percent,
         "current_step": result.current_step,
         "message": result.message,
+        "mode": result.mode,
+        "current_variant": result.current_variant,
+        "completed_variants": result.completed_variants,
+        "total_variants": result.total_variants,
+        "current_test": result.current_test,
+        "passed_count": result.passed_count,
+        "failed_count": result.failed_count,
     }
 
 
@@ -798,6 +1018,13 @@ def measurement_result_from_dict(data: dict[str, Any]) -> MeasurementResult:
         progress_percent=int(data.get("progress_percent", 0)),
         current_step=str(data.get("current_step", "")),
         message=str(data.get("message", "")),
+        mode=str(data.get("mode", "")),
+        current_variant=str(data.get("current_variant", "")),
+        completed_variants=int(data.get("completed_variants", 0)),
+        total_variants=int(data.get("total_variants", 0)),
+        current_test=str(data.get("current_test", "")),
+        passed_count=int(data.get("passed_count", 0)),
+        failed_count=int(data.get("failed_count", 0)),
         identity=measurement_identity_from_dict(identity_data) if identity_data else None,
     )
 

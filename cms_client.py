@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from datetime import datetime
 import hashlib
 import json
 import platform
@@ -27,6 +28,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from cms_colors import COLOR_CHOICES, ColorFormatter, color_formatter, state_role
+from cms_diff_comparison import (
+    ComparisonStatus,
+    DifferentialPairingError,
+    create_diff_comparison_report,
+    pair_downloaded_differential_results,
+    prepare_comparison_inputs,
+    render_diff_comparison_table,
+    write_diff_comparison_report,
+)
 from cms_protocol import (
     CMS_OBSERVATION_PROTOCOL_VERSION,
     Artifacts,
@@ -34,8 +44,11 @@ from cms_protocol import (
     BenchIdentity,
     BenchState,
     BenchStatus,
+    DetectedTargetIdentity,
+    DifferentialFirmwareData,
     FirmwareImage,
     FirmwareData,
+    FirmwareRoleImage,
     EventCursor,
     MeasurementEventPage,
     MeasurementMode,
@@ -48,6 +61,7 @@ from cms_protocol import (
     artifact_from_dict,
     artifact_to_dict,
     bench_health_report_from_dict,
+    canonicalize_target_device,
     measurement_request_from_dict,
     measurement_request_to_dict,
     measurement_result_from_dict,
@@ -83,6 +97,8 @@ class CMSCLIExitCode(IntEnum):
     CONNECTION_FAILURE = 5
     PROTOCOL_MISMATCH = 6
     CLIENT_ERROR = 7
+    COMPARISON_DATA_FAILURE = 8
+    THRESHOLD_REGRESSION = 9
 
 
 class CMSClientError(RuntimeError):
@@ -107,6 +123,31 @@ class CMSDaemonError(CMSClientError):
 
 
 @dataclass(slots=True)
+class CMSBenchEndpointConfig:
+    """One named CMS Bench daemon endpoint from client configuration."""
+
+    scheme: str
+    host: str
+    port: int
+    api_token: str
+    timeout_s: float = 30.0
+
+    @property
+    def base_url(self) -> str:
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+
+@dataclass(frozen=True, slots=True)
+class CMSResolvedEndpoint:
+    """One concrete Client endpoint selected for the current invocation."""
+
+    base_url: str
+    api_token: str
+    timeout_s: float
+    source: str
+
+
+@dataclass(slots=True)
 class CMSClientConfig:
     """Configuration needed for one remote CMS daemon client."""
 
@@ -116,6 +157,202 @@ class CMSClientConfig:
     target: dict[str, str] | None = None
     build: dict[str, str] | None = None
     tools: dict[str, str] | None = None
+    diff: dict[str, str] | None = None
+    benches: dict[str, CMSBenchEndpointConfig] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TargetIdentityComparison:
+    """Comparison evidence for one detected Bench target and requested target."""
+
+    detected_board: str
+    requested_board: str
+    detected_device_raw: str
+    detected_device_canonical: str
+    requested_device: str
+    requested_device_canonical: str
+    mismatches: tuple[str, ...]
+
+    @property
+    def matches(self) -> bool:
+        return not self.mismatches
+
+
+def compare_detected_target_identity(
+    detected: DetectedTargetIdentity,
+    *,
+    requested_board: str,
+    requested_device: str,
+) -> TargetIdentityComparison:
+    """Compare detected Bench hardware with build/firmware target metadata."""
+
+    detected_board = detected.radio_board_part_number.strip().upper()
+    expected_board = requested_board.strip().upper()
+    detected_device = detected.canonical_target_device or canonicalize_target_device(
+        detected.target_device
+    )
+    expected_device = canonicalize_target_device(requested_device)
+    mismatches: list[str] = []
+    if not expected_board:
+        mismatches.append("requested board is missing")
+    elif detected_board != expected_board:
+        mismatches.append(f"board detected={detected.radio_board_part_number} requested={requested_board}")
+    if not expected_device:
+        mismatches.append("requested device is missing")
+    elif detected_device != expected_device:
+        mismatches.append(
+            "device "
+            f"detected_raw={detected.target_device} "
+            f"detected_canonical={detected_device} "
+            f"requested={requested_device} "
+            f"requested_canonical={expected_device}"
+        )
+    return TargetIdentityComparison(
+        detected_board=detected.radio_board_part_number,
+        requested_board=requested_board,
+        detected_device_raw=detected.target_device,
+        detected_device_canonical=detected_device,
+        requested_device=requested_device,
+        requested_device_canonical=expected_device,
+        mismatches=tuple(mismatches),
+    )
+
+
+def refresh_and_record_bench_target(
+    client: CMSClient,
+    config_path: str | Path,
+) -> DetectedTargetIdentity:
+    """Fetch fresh Bench identity and record it in the sole Client config file."""
+
+    report = client.get_health()
+    if report.state is BenchState.ERROR:
+        raise RuntimeError(f"CMS Bench health failed before workflow action: {report.summary}")
+    detected = report.detected_identity
+    if detected is None:
+        raise RuntimeError("CMS Bench health did not provide a detected DUT identity")
+
+    path = Path(config_path)
+    if not path.is_file():
+        raise RuntimeError(f"CMS client config does not exist: {path}")
+    config = _read_json_file(path)
+    target = config.get("target")
+    if target is None:
+        target = {}
+        config["target"] = target
+    if not isinstance(target, dict):
+        raise RuntimeError("cms_client_config.json target must be an object")
+    target.update(
+        {
+            "board": detected.radio_board_part_number.lower(),
+            "board_rev": detected.radio_board_revision,
+            "device": detected.target_device,
+            "device_canonical": detected.canonical_target_device,
+            "radio_board_serial": detected.radio_board_serial_number,
+            "dut_jlink_serial": detected.dut_jlink_serial,
+            "vcom_supported": detected.vcom_supported,
+        }
+    )
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return detected
+
+
+def record_last_measurement(
+    config_path: str | Path,
+    result: MeasurementResult,
+    *,
+    mode: MeasurementMode,
+    feature: str,
+    config_name: str,
+    run_name: str,
+    variable_filters: tuple[VariableFilter, ...],
+    endpoint: str,
+) -> None:
+    """Persist the locally recoverable identity of an accepted measurement."""
+
+    if not result.measurement_id:
+        return
+    path = Path(config_path)
+    if not path.is_file():
+        return
+    config = _read_json_file(path)
+    config["last_measurement"] = {
+        "measurement_id": result.measurement_id,
+        "mode": mode.value,
+        "feature": feature,
+        "config": config_name,
+        "run_name": run_name,
+        "variable_filters": [
+            {"name": item.name, "value": item.value}
+            for item in variable_filters
+        ],
+        "endpoint": endpoint,
+        "submitted_at": datetime.utcnow().isoformat(),
+    }
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def require_firmware_target_match(
+    detected: DetectedTargetIdentity,
+    firmware: FirmwareData,
+) -> TargetIdentityComparison:
+    """Reject firmware that does not match one fresh detected Bench target."""
+
+    comparison = compare_detected_target_identity(
+        detected,
+        requested_board=firmware.board,
+        requested_device=firmware.device,
+    )
+    if not comparison.matches:
+        raise RuntimeError(
+            "Firmware target does not match freshly detected CMS Bench target: "
+            + "; ".join(comparison.mismatches)
+        )
+    return comparison
+
+
+def require_fresh_firmware_target_match(
+    client: CMSClient,
+    config_path: str | Path,
+    firmware: FirmwareData,
+) -> TargetIdentityComparison:
+    """Compatibility helper for callers that need to refresh before comparison."""
+
+    return require_firmware_target_match(
+        refresh_and_record_bench_target(client, config_path),
+        firmware,
+    )
+
+
+def require_firmware_request_target_match(
+    detected: DetectedTargetIdentity,
+    request: MeasurementRequest,
+) -> tuple[TargetIdentityComparison, ...]:
+    """Validate normal firmware or each differential variant before staging."""
+
+    variants: tuple[tuple[str, FirmwareData], ...]
+    if request.differential_firmware is None:
+        variants = (("firmware", request.firmware),)
+    else:
+        variants = (
+            ("differential version1", request.differential_firmware.version1),
+            ("differential version2", request.differential_firmware.version2),
+        )
+    comparisons: list[TargetIdentityComparison] = []
+    mismatches: list[str] = []
+    for variant_name, firmware in variants:
+        comparison = compare_detected_target_identity(
+            detected,
+            requested_board=firmware.board,
+            requested_device=firmware.device,
+        )
+        comparisons.append(comparison)
+        mismatches.extend(f"{variant_name}: {item}" for item in comparison.mismatches)
+    if mismatches:
+        raise RuntimeError(
+            "Firmware target does not match freshly detected CMS Bench target: "
+            + "; ".join(mismatches)
+        )
+    return tuple(comparisons)
 
 
 @dataclass(slots=True)
@@ -155,12 +392,13 @@ class CMSClient:
         self,
         base_url: str = "",
         api_token: str = "",
+        timeout_s: float | None = None,
         config_path: str | Path = CMS_CLIENT_CONFIG,
     ):
         config = load_client_config(config_path)
         self.base_url = (base_url or config.base_url).rstrip("/")
         self.api_token = api_token or config.api_token
-        self.timeout_s = config.timeout_s
+        self.timeout_s = config.timeout_s if timeout_s is None else timeout_s
 
     def get_health(self) -> BenchHealthReport:
         """Fetch the daemon health view for operator and CI checks."""
@@ -197,8 +435,41 @@ class CMSClient:
         """Stage firmware and metadata on the remote bench."""
         payload = measurement_request_to_dict(request)
         payload["image_payloads"] = _local_firmware_payloads(request)
-        payload = self._request_json("POST", "/firmware", payload)
+        try:
+            payload = self._request_json("POST", "/firmware", payload)
+        except CMSConnectionError as exc:
+            if str(exc) != "CMS daemon request timed out":
+                raise
+            reconciled = self._reconcile_timed_out_firmware_stage(request)
+            if reconciled is None:
+                raise
+            return reconciled
         return measurement_result_from_dict(payload)
+
+    def _reconcile_timed_out_firmware_stage(
+        self,
+        request: MeasurementRequest,
+    ) -> MeasurementResult | None:
+        """Return a completed stage only when its request ID exactly matches the timed-out POST."""
+
+        try:
+            result = self.get_measurement(request.request_id)
+        except CMSConnectionError:
+            return None
+        if result.measurement_id != request.request_id:
+            return None
+        if result.state in {
+            MeasurementState.ACCEPTED,
+            MeasurementState.FAILED,
+            MeasurementState.REJECTED,
+        }:
+            return result
+        return None
+
+    def get_staged(self) -> dict[str, Any]:
+        """Return the daemon's current normal and differential firmware stages."""
+
+        return self._request_json("GET", "/staged")
 
     def run_test(
         self,
@@ -207,10 +478,16 @@ class CMSClient:
         config: str = "default",
         run_name: str = "",
         variable_filters: tuple[VariableFilter, ...] = (),
+        upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
-        config_hash = "" if feature == "all" else _validate_local_test_config(feature, config)
+
+        config_hash = (
+            ""
+            if feature == "all" or _is_mutable_custom_config_name(config)
+            else _validate_local_test_config(feature, config)
+        )
         payload = self._request_json(
             "POST",
             "/test",
@@ -224,7 +501,7 @@ class CMSClient:
                     for item in variable_filters
                 ],
                 "run_name": run_name,
-                "upload_results_to_database": True,
+                "upload_results_to_database": upload_results_to_database,
                 "debug_artifact_streaming": debug_artifact_streaming,
             },
         )
@@ -566,6 +843,21 @@ def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
     if not base_url:
         base_url = f"{scheme}://{host}:{port}"
 
+    benches: dict[str, CMSBenchEndpointConfig] = {}
+    raw_benches = config.get("benches", {})
+    if not isinstance(raw_benches, dict):
+        raise ValueError("cms_client_config.json benches must be an object keyed by bench ID")
+    for bench_id, raw_endpoint in raw_benches.items():
+        if not isinstance(raw_endpoint, dict):
+            raise ValueError(f"cms_client_config.json benches.{bench_id} must be an object")
+        benches[str(bench_id)] = CMSBenchEndpointConfig(
+            scheme=str(raw_endpoint.get("scheme", "http")),
+            host=str(raw_endpoint.get("host", "")),
+            port=int(raw_endpoint.get("port", 8000)),
+            api_token=str(raw_endpoint.get("api_token", "")),
+            timeout_s=float(raw_endpoint.get("timeout_s", daemon.get("timeout_s", 30.0))),
+        )
+
     return CMSClientConfig(
         base_url=base_url,
         api_token=str(daemon.get("api_token", config.get("api_token", "silabs-cms"))),
@@ -573,7 +865,71 @@ def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
         target={str(key): str(value) for key, value in config.get("target", {}).items()},
         build={str(key): str(value) for key, value in config.get("build", {}).items()},
         tools={str(key): str(value) for key, value in config.get("tools", {}).items()},
+        diff={str(key): str(value) for key, value in config.get("diff", {}).items()},
+        benches=benches,
     )
+
+
+def resolve_client_endpoint(
+    config: CMSClientConfig,
+    *,
+    base_url: str = "",
+    api_token: str = "",
+    bench_id: str = "",
+    bench_ip: str = "",
+) -> CMSResolvedEndpoint:
+    """Resolve one endpoint without persisting a command-specific selection."""
+
+    endpoint_selectors = [
+        name
+        for name, value in (("--base-url", base_url), ("--bench-id", bench_id), ("--bench-ip", bench_ip))
+        if value
+    ]
+    if len(endpoint_selectors) > 1:
+        raise ValueError("endpoint selectors cannot be combined: " + ", ".join(endpoint_selectors))
+
+    if base_url:
+        return CMSResolvedEndpoint(
+            base_url=base_url.rstrip("/"),
+            api_token=api_token or config.api_token,
+            timeout_s=config.timeout_s,
+            source="--base-url",
+        )
+    if bench_id:
+        endpoint = (config.benches or {}).get(bench_id)
+        if endpoint is None:
+            raise ValueError(f"unknown CMS bench ID: {bench_id}")
+        return CMSResolvedEndpoint(
+            base_url=endpoint.base_url,
+            api_token=api_token or endpoint.api_token,
+            timeout_s=endpoint.timeout_s,
+            source=f"bench ID {bench_id}",
+        )
+    if bench_ip:
+        if "://" in bench_ip or "/" in bench_ip:
+            raise ValueError("--bench-ip must be a host name or IP address, not a URL")
+        parsed_default = urllib.parse.urlsplit(config.base_url)
+        if not parsed_default.scheme or not parsed_default.hostname or parsed_default.port is None:
+            raise ValueError("default daemon endpoint is invalid; cannot resolve --bench-ip")
+        return CMSResolvedEndpoint(
+            base_url=f"{parsed_default.scheme}://{bench_ip}:{parsed_default.port}",
+            api_token=api_token or config.api_token,
+            timeout_s=config.timeout_s,
+            source="--bench-ip",
+        )
+    return CMSResolvedEndpoint(
+        base_url=config.base_url,
+        api_token=api_token or config.api_token,
+        timeout_s=config.timeout_s,
+        source="default daemon configuration",
+    )
+
+
+def _print_explicit_endpoint_selection(args: argparse.Namespace, client: CMSClient) -> None:
+    """Show a one-shot endpoint choice without changing normal command output."""
+
+    if args.base_url or args.bench_id or args.bench_ip:
+        print(f"endpoint: {client.base_url}")
 
 
 def _non_negative_int(value: str) -> int:
@@ -590,6 +946,13 @@ def _non_negative_float(value: str) -> float:
     return parsed
 
 
+def _add_bench_endpoint_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add non-persistent bench selection options to one remote-workflow command."""
+
+    parser.add_argument("--bench-id", default="", help="configured bench ID from the benches mapping")
+    parser.add_argument("--bench-ip", default="", help="one-shot bench host name or IP address")
+
+
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cms",
@@ -601,12 +964,17 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  2. cms status\n"
             "  3. cms tests\n"
             "  4. cms BUILD\n"
-            "  5. cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n"
+            "  5. cms SEND_FW\n"
             "  6. cms TEST --mode default --feature beacon --config-name default --preview\n"
             "  7. cms TEST --mode default --feature beacon --config-name default --out-dir artifacts\n"
             "  8. cms WATCH <measurement_id> --cursor <last_cursor>\n"
             "  9. cms CANCEL\n"
             " 10. cms ARTIFACTS <measurement_id> --out-dir artifacts\n\n"
+            "Differential workflow:\n"
+            "  cms HEALTH\n"
+            "  cms BUILD --diff\n"
+            "  cms SEND_FW --diff\n"
+            "  cms TEST --mode diff --feature beacon --verbose\n\n"
             "  cms RECIPES prints copy/paste command recipes for the common workflows.\n\n"
             "  cms EXIT_CODES documents stable script outcomes.\n\n"
             "  cms TROUBLESHOOT prints operator diagnostics for common failures.\n\n"
@@ -624,8 +992,27 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-    health = subparsers.add_parser("health", help="show daemon and bench health")
+    health = subparsers.add_parser(
+        "health",
+        aliases=["HEALTH"],
+        help="show daemon and bench health",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Endpoint selection:\n"
+            "  With no endpoint option, use the default daemon configuration.\n"
+            "  --bench-id selects one configured benches entry.\n"
+            "  --bench-ip makes a one-shot host/IP override using default daemon settings.\n"
+            "  --base-url makes a one-shot complete URL override.\n"
+            "  Use only one endpoint selector; conflicting selectors are rejected.\n"
+            "  --api-token may override the selected endpoint token.\n\n"
+            "Examples:\n"
+            "  cms HEALTH --bench-id cms-bench-001\n"
+            "  cms HEALTH --bench-ip 192.0.2.10\n"
+            "  cms --base-url http://cms-bench-001:8000 HEALTH"
+        ),
+    )
     _add_color_argument(health)
+    _add_bench_endpoint_arguments(health)
     status = subparsers.add_parser("status", help="show bench status")
     _add_color_argument(status)
     tests = subparsers.add_parser("tests", aliases=["TESTS"], help="list test modes and features")
@@ -698,6 +1085,14 @@ def build_cli_parser() -> argparse.ArgumentParser:
     build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
     build.add_argument("--build-root", default="", help="override firmware build root")
     build.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
+    build.add_argument(
+        "--diff",
+        action="store_true",
+        help=(
+            "build configured version1 and version2 SiSDK packages in isolated diff roots"
+        ),
+    )
+    _add_bench_endpoint_arguments(build)
 
     send_fw = subparsers.add_parser(
         "send_fw",
@@ -705,16 +1100,24 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="send firmware and metadata to the bench",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Example:\n"
-            "  cms SEND_FW --request-id cms-dev-001 --requested-by <user>\n\n"
+            "Examples:\n"
+            "  cms SEND_FW\n"
+            "  cms SEND_FW --diff\n\n"
             "Defaults:\n"
             "  Firmware images and sl_bt.xapi are discovered from the configured build root.\n\n"
             "Next:\n"
-            "  Run cms TEST --mode default --feature beacon --config-name default --preview before starting a test."
+            "  Run cms TEST --mode default --feature beacon --config-name default --preview before starting a test.\n"
+            "  After cms SEND_FW --diff, run cms TEST --mode diff --feature beacon --verbose."
         ),
     )
     _add_color_argument(send_fw)
+    _add_bench_endpoint_arguments(send_fw)
     send_fw.add_argument("--request-json", help="load the full firmware request from JSON")
+    send_fw.add_argument(
+        "--diff",
+        action="store_true",
+        help="stage the version1/version2 firmware pair from diff_fw_data.json",
+    )
     send_fw.add_argument("--request-id", default="", help="firmware staging id")
     send_fw.add_argument("--dut-image", default="", help="DUT firmware path or URL")
     send_fw.add_argument("--tester-image", default="", help="tester firmware path or URL")
@@ -730,6 +1133,20 @@ def build_cli_parser() -> argparse.ArgumentParser:
     send_fw.add_argument("--build-root", default="", help="override firmware build root used for provenance")
     send_fw.add_argument("--requested-by", default="", help="request owner")
 
+    staged = subparsers.add_parser(
+        "staged",
+        aliases=["STAGED"],
+        help="show the current normal and differential firmware stages",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Read-only view:\n"
+            "  cms STAGED\n\n"
+            "Shows the one current normal stage and the one current differential stage, if present."
+        ),
+    )
+    _add_color_argument(staged)
+    _add_bench_endpoint_arguments(staged)
+
     test = subparsers.add_parser(
         "test",
         aliases=["TEST"],
@@ -742,6 +1159,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms TEST --mode default --feature beacon --config-name dcdc --preview\n"
             "  cms TEST --mode full_sweep --feature beacon --variable phy=2m --preview\n"
             "  cms TEST -m full_sweep -f beacon --variable phy=2m --variable dcdc=On --out-dir artifacts\n\n"
+            "  cms TEST --mode diff --feature beacon --verbose\n\n"
             "Required options:\n"
             "  --mode, -m      default, full_sweep, or diff\n"
             "  --feature, -f  BLE feature name such as beacon, or all\n\n"
@@ -761,6 +1179,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_color_argument(test)
+    _add_bench_endpoint_arguments(test)
     test.add_argument(
         "--mode",
         "-m",
@@ -794,6 +1213,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
         default="",
         help="human-readable test run name",
     )
+    test.add_argument(
+        "--upload-results-to-database",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="upload completed results to the configured database (default: enabled)",
+    )
     test.add_argument("--out-dir", default="artifacts", help="local artifact root")
     test.add_argument(
         "--debug",
@@ -815,6 +1240,28 @@ def build_cli_parser() -> argparse.ArgumentParser:
         type=_non_negative_float,
         default=1.0,
         help="seconds between observation polls",
+    )
+    custom = subparsers.add_parser(
+        "custom",
+        aliases=["CUSTOM"],
+        help="update a feature's mutable custom.json configuration",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  cms CUSTOM --feature beacon --set advertiser.interval=100\n"
+            "  cms CUSTOM --feature beacon --set advertiser.phy=2m --set hw.supply_v=3.3\n\n"
+            "Values are parsed as JSON when possible; unquoted text is stored as a string.\n"
+            "Only tests/configs/ble/<feature>/custom.json is modified."
+        ),
+    )
+    _add_color_argument(custom)
+    custom.add_argument("--feature", "-f", required=True, help="BLE feature whose custom.json is updated")
+    custom.add_argument(
+        "--set",
+        action="append",
+        required=True,
+        metavar="PATH=VALUE",
+        help="replace an existing custom.json value using a dotted object path; repeat as needed",
     )
     measurement = subparsers.add_parser(
         "measurement",
@@ -838,10 +1285,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  cms WATCH\n"
+            "  cms WATCH --reconnect\n"
             "  cms WATCH <measurement_id> --cursor 0\n"
             "  cms WATCH <measurement_id> --cursor <last_cursor> --verbose\n\n"
             "Defaults:\n"
             "  measurement_id omitted means attach to the active measurement.\n"
+            "  --reconnect resumes the last submitted measurement recorded locally.\n"
             "  --cursor 0 starts from the beginning of retained events.\n"
             "  --poll-interval 1.0\n\n"
             "Next:\n"
@@ -850,6 +1299,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     _add_color_argument(watch)
     watch.add_argument("measurement_id", nargs="?", default="")
+    watch.add_argument(
+        "--reconnect",
+        action="store_true",
+        help="resume the last submitted measurement recorded in cms_client_config.json",
+    )
     watch.add_argument(
         "--cursor",
         type=_non_negative_int,
@@ -995,11 +1449,51 @@ def _main(argv: list[str] | None = None) -> int:
     args = build_cli_parser().parse_args(argv)
     colors = color_formatter(args.color)
     client_config = load_client_config(args.config)
-    client = CMSClient(base_url=args.base_url, api_token=args.api_token, config_path=args.config)
+    uses_resolved_endpoint = (
+        args.command == "health"
+        or args.command in {"send_fw", "SEND_FW", "test", "TEST"}
+        or args.command in {"build", "BUILD"}
+    )
+    if uses_resolved_endpoint:
+        endpoint = resolve_client_endpoint(
+            client_config,
+            base_url=args.base_url,
+            api_token=args.api_token,
+            bench_id=args.bench_id,
+            bench_ip=args.bench_ip,
+        )
+        client = CMSClient(
+            base_url=endpoint.base_url,
+            api_token=endpoint.api_token,
+            timeout_s=endpoint.timeout_s,
+            config_path=args.config,
+        )
+    else:
+        client = CMSClient(base_url=args.base_url, api_token=args.api_token, config_path=args.config)
 
     if args.command == "health":
         report = client.get_health()
         print(f"{colors.state(report.state)}: {report.summary}")
+        _print_explicit_endpoint_selection(args, client)
+        print(f"bench_id: {report.identity.bench_id}")
+        if report.detected_identity is None:
+            print("detected_dut_identity: unavailable")
+        else:
+            detected = report.detected_identity
+            revision = f" Rev. {detected.radio_board_revision}" if detected.radio_board_revision else ""
+            vcom = "unknown" if detected.vcom_supported is None else str(detected.vcom_supported).lower()
+            print(
+                "detected_radio_board: "
+                f"{detected.radio_board_part_number}{revision} "
+                f"(serial {detected.radio_board_serial_number})"
+            )
+            print(
+                "detected_target_device: "
+                f"{detected.target_device} "
+                f"(canonical {detected.canonical_target_device})"
+            )
+            print(f"detected_dut_jlink_serial: {detected.dut_jlink_serial}")
+            print(f"detected_vcom_supported: {vcom}")
         for check in report.checks:
             detail = f" ({check.detail})" if check.detail else ""
             print(f"{colors.state(check.status.value)} {check.name}: {check.summary}{detail}")
@@ -1040,6 +1534,12 @@ def _main(argv: list[str] | None = None) -> int:
         return CMSCLIExitCode.SUCCESS
 
     if args.command in {"build", "BUILD"}:
+        _print_explicit_endpoint_selection(args, client)
+        detected = refresh_and_record_bench_target(client, args.config)
+        print(
+            "recorded_bench_target: "
+            f"{detected.radio_board_part_number} {detected.target_device}"
+        )
         return (
             CMSCLIExitCode.SUCCESS
             if _run_local_build(args, args.config) == 0
@@ -1047,7 +1547,11 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command in {"send_fw", "SEND_FW"}:
+        _print_explicit_endpoint_selection(args, client)
+        detected = refresh_and_record_bench_target(client, args.config)
+        client_config = load_client_config(args.config)
         request = _request_from_send_fw_args(args, client_config)
+        require_firmware_request_target_match(detected, request)
         result = client.send_firmware(request)
         _print_measurement_result(result, colors=colors)
         if result.state is MeasurementState.REJECTED:
@@ -1058,12 +1562,22 @@ def _main(argv: list[str] | None = None) -> int:
             else CMSCLIExitCode.SUCCESS
         )
 
+    if args.command in {"staged", "STAGED"}:
+        _print_explicit_endpoint_selection(args, client)
+        _print_staged_firmware(client.get_staged())
+        return CMSCLIExitCode.SUCCESS
+
     if args.command == "measurement":
         _print_measurement_result(client.get_measurement(args.measurement_id), colors=colors)
         return CMSCLIExitCode.SUCCESS
 
     if args.command in {"watch", "WATCH"}:
-        measurement_id = _resolve_watch_measurement_id(client, args.measurement_id)
+        measurement_id = _resolve_watch_measurement_id(
+            client,
+            args.measurement_id,
+            reconnect=args.reconnect,
+            config_path=args.config,
+        )
         state = _watch_remote_measurement(
             client,
             measurement_id,
@@ -1077,6 +1591,7 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command in {"test", "TEST"}:
+        _print_explicit_endpoint_selection(args, client)
         variable_filters = parse_variable_filters(args.variable)
         if args.feature == "all" and args.config_name != "default":
             raise RuntimeError("--feature all only supports the default config")
@@ -1088,6 +1603,11 @@ def _main(argv: list[str] | None = None) -> int:
             _print_test_preview(args, variable_filters)
             return CMSCLIExitCode.SUCCESS
         return _run_test_feature(client, args, variable_filters, colors)
+
+    if args.command in {"custom", "CUSTOM"}:
+        path = update_custom_test_config(args.feature, args.set)
+        print(path)
+        return CMSCLIExitCode.SUCCESS
 
     if args.command in {"cancel", "CANCEL"}:
         result = client.cancel_active_test()
@@ -1131,6 +1651,8 @@ def _request_from_send_fw_args(
     target_cfg = client_config.target if client_config and client_config.target else {}
     build_cfg = client_config.build if client_config and client_config.build else {}
     build_root = Path(args.build_root or str(build_cfg.get("root", ".fw_build")))
+    if getattr(args, "diff", False):
+        return _request_from_diff_build_manifest(args, build_root)
     fw_data = _read_json_file(build_root / "fw_data.json")
     if not fw_data:
         raise RuntimeError(
@@ -1275,6 +1797,89 @@ def _request_from_send_fw_args(
     )
 
 
+def _request_from_diff_build_manifest(args: argparse.Namespace, build_root: Path) -> MeasurementRequest:
+    """Create one paired staging request from the app manager's diff build manifest."""
+
+    diff_manifest = _read_json_file(build_root / "diff_fw_data.json")
+    variants = diff_manifest.get("variants")
+    if not isinstance(variants, dict):
+        raise RuntimeError(
+            f"Differential build provenance is missing: {build_root / 'diff_fw_data.json'}. "
+            "Run `cms build --diff` before staging differential firmware."
+        )
+
+    def variant_firmware(name: str) -> FirmwareData:
+        variant = variants.get(name)
+        if not isinstance(variant, dict) or not isinstance(variant.get("manifest"), dict):
+            raise RuntimeError(f"Differential build manifest is missing the {name} variant")
+        manifest = variant["manifest"]
+        firmware = manifest.get("firmware")
+        build = manifest.get("build")
+        sdk = manifest.get("sdk")
+        if not isinstance(firmware, dict) or not isinstance(build, dict) or not isinstance(sdk, dict):
+            raise RuntimeError(f"Differential {name} build manifest is incomplete")
+        artifacts = firmware.get("artifacts")
+        if not isinstance(artifacts, list):
+            raise RuntimeError(f"Differential {name} build manifest has no firmware artifacts")
+        all_role_images = tuple(
+            FirmwareRoleImage(
+                role=str(item.get("role", "")),
+                project_name=str(item.get("project_name", "")),
+                image=FirmwareImage(
+                    name=Path(str(item.get("image", ""))).name,
+                    url=str(item.get("image", "")),
+                    sha256=str(item.get("sha256", "")),
+                ),
+            )
+            for item in artifacts
+            if isinstance(item, dict)
+        )
+        by_role = {item.role: item.image for item in all_role_images}
+        required_roles = {"dut_dcdc", "dut_no_dcdc", "tester"}
+        missing_roles = sorted(required_roles - set(by_role))
+        if missing_roles:
+            raise RuntimeError(f"Differential {name} build is missing roles: {', '.join(missing_roles)}")
+        unsupported_roles = sorted(
+            f"{item.role}={item.image.name}"
+            for item in all_role_images
+            if item.image.name and Path(item.image.name).suffix.lower() not in {".s37", ".hex"}
+        )
+        if unsupported_roles:
+            raise RuntimeError(
+                f"Differential {name} build contains non-flashable firmware artifact(s): "
+                f"{', '.join(unsupported_roles)}. Run `cms BUILD --diff` to produce .s37 or .hex images."
+            )
+        xapi_path = str(build.get("xapi", ""))
+        xapi_hash = str(sdk.get("xapi_sha256", ""))
+        return FirmwareData(
+            dut_img=by_role["dut_dcdc"],
+            tester_img=by_role["tester"],
+            dut_variants={"dcdc": by_role["dut_dcdc"], "no_dcdc": by_role["dut_no_dcdc"]},
+            bootloader_img=by_role.get("bootloader"),
+            board=str(firmware.get("board", "")),
+            device=str(firmware.get("device", "")),
+            xapi_file=FirmwareImage(name=Path(xapi_path).name, url=xapi_path, sha256=xapi_hash),
+            xapi_file_hash=xapi_hash,
+            sisdk_source=str(sdk.get("source", "")),
+            sisdk_version=str(sdk.get("version", "")),
+            sisdk_commit=str(sdk.get("commit", "")),
+            sisdk_hash=str(sdk.get("hash", "")),
+            role_images=tuple(item for item in all_role_images if item.role != "bootloader"),
+        )
+
+    version1 = variant_firmware("version1")
+    version2 = variant_firmware("version2")
+    request_id = args.request_id or f"cms-diff-{int(time.time())}"
+    return MeasurementRequest(
+        request_id=request_id,
+        selector=SuiteSelector(mode="ble", feature="", config="default"),
+        firmware=version2,
+        mode=MeasurementMode.DIFF,
+        requested_by=args.requested_by,
+        differential_firmware=DifferentialFirmwareData(version1=version1, version2=version2),
+    )
+
+
 def _require_matching_build_provenance(label: str, requested: str, built: str) -> None:
     if requested and requested != built:
         raise RuntimeError(
@@ -1295,8 +1900,12 @@ def _sisdk_name_from_properties(sdk_package_path: Path) -> str:
 
 
 def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
-    _sync_config_sisdk_version(config_path, args.sdk_package_path)
+    is_diff = bool(getattr(args, "diff", False))
+    if not is_diff:
+        _sync_config_sisdk_version(config_path, args.sdk_package_path)
     cmd = [sys.executable, str(Path("apps") / "app_manager.py"), args.action, *args.targets]
+    if is_diff:
+        cmd.append("--diff")
     for option, value in (
         ("--config", config_path),
         ("--sdk-package-path", args.sdk_package_path),
@@ -1423,6 +2032,46 @@ def _validate_local_test_config(feature: str, config: str) -> str:
     return _sha256_text_file_lf_normalized(config_path)
 
 
+def _is_mutable_custom_config_name(config: str) -> bool:
+    return config.strip().replace("\\", "/").lower() in {"custom", "custom.json"}
+
+
+def update_custom_test_config(feature: str, assignments: list[str]) -> Path:
+    """Apply explicit dotted-path updates to one feature's mutable custom config."""
+
+    config_path = _local_test_config_path(feature, "custom")
+    if not config_path.exists():
+        raise RuntimeError(f"custom test config does not exist: {config_path}")
+    try:
+        config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"custom test config is not valid JSON: {config_path}") from exc
+    if not isinstance(config_data, dict):
+        raise RuntimeError(f"custom test config must be a JSON object: {config_path}")
+
+    for assignment in assignments:
+        path, separator, raw_value = assignment.partition("=")
+        parts = path.split(".")
+        if not separator or not raw_value or not path or any(not part for part in parts):
+            raise RuntimeError("custom updates must use PATH=VALUE with a dotted object path")
+        current: dict[str, Any] = config_data
+        for part in parts[:-1]:
+            child = current.get(part)
+            if not isinstance(child, dict):
+                raise RuntimeError(f"custom config path does not exist: {path}")
+            current = child
+        if parts[-1] not in current:
+            raise RuntimeError(f"custom config path does not exist: {path}")
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            value = raw_value
+        current[parts[-1]] = value
+
+    config_path.write_text(json.dumps(config_data, indent=4) + "\n", encoding="utf-8")
+    return config_path
+
+
 def _local_test_config_path(feature: str, config: str) -> Path:
     feature_name = feature.strip()
     if not feature_name:
@@ -1448,6 +2097,30 @@ def _local_test_config_path(feature: str, config: str) -> Path:
 
 def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
     payloads: dict[str, str] = {}
+    if request.differential_firmware is not None:
+        for variant_name, firmware in (
+            ("version1", request.differential_firmware.version1),
+            ("version2", request.differential_firmware.version2),
+        ):
+            for role_image in firmware.role_images:
+                path = Path(role_image.image.url)
+                if path.exists() and path.is_file():
+                    payloads[
+                        f"differential_firmware.{variant_name}.role_images.{role_image.project_name}"
+                    ] = base64.b64encode(path.read_bytes()).decode("ascii")
+            if firmware.xapi_file is not None:
+                path = Path(firmware.xapi_file.url)
+                if path.exists() and path.is_file():
+                    payloads[f"differential_firmware.{variant_name}.xapi_file"] = (
+                        base64.b64encode(path.read_bytes()).decode("ascii")
+                    )
+            if firmware.bootloader_img is not None:
+                path = Path(firmware.bootloader_img.url)
+                if path.exists() and path.is_file():
+                    payloads[f"differential_firmware.{variant_name}.bootloader_img"] = (
+                        base64.b64encode(path.read_bytes()).decode("ascii")
+                    )
+        return payloads
     for key, image in (("dut_img", request.firmware.dut_img), ("tester_img", request.firmware.tester_img)):
         path = Path(image.url)
         if path.exists() and path.is_file():
@@ -1484,6 +2157,45 @@ def _print_measurement_result(
         print(f"artifact {artifact.name}: {location}")
 
 
+def _print_staged_firmware(payload: dict[str, Any]) -> None:
+    """Render the read-only current-stage view without exposing stage IDs."""
+
+    for stage_name in ("normal", "differential"):
+        stage = payload.get(stage_name)
+        if not isinstance(stage, dict):
+            print(f"{stage_name}: none")
+            continue
+        print(f"{stage_name}: {stage.get('intended_use', '')}")
+        print(f"  created_at: {stage.get('created_at', '')}")
+        target = stage.get("target", {})
+        if isinstance(target, dict):
+            print(f"  target: {target.get('board', '')} {target.get('device', '')}".rstrip())
+        if stage_name == "differential":
+            for variant_name in ("version1", "version2"):
+                variant = stage.get(variant_name, {})
+                if isinstance(variant, dict):
+                    _print_staged_firmware_variant(variant_name, variant)
+        else:
+            _print_staged_firmware_variant("firmware", stage)
+
+
+def _print_staged_firmware_variant(label: str, stage: dict[str, Any]) -> None:
+    sisdk = stage.get("sisdk", {})
+    if isinstance(sisdk, dict):
+        print(
+            f"  {label} SiSDK: {sisdk.get('version', '')} "
+            f"{sisdk.get('commit', '')}".rstrip()
+        )
+    firmware = stage.get("firmware", [])
+    if isinstance(firmware, list):
+        names = ", ".join(
+            f"{item.get('role', '')}={item.get('name', '')}"
+            for item in firmware
+            if isinstance(item, dict)
+        )
+        print(f"  {label} firmware: {names}")
+
+
 def _local_parameters_path(feature: str) -> Path:
     feature_name = feature.strip()
     if not feature_name:
@@ -1510,7 +2222,18 @@ def _run_test_feature(
         config=args.config_name,
         run_name=args.run_name,
         variable_filters=variable_filters,
+        upload_results_to_database=args.upload_results_to_database,
         debug_artifact_streaming=args.debug,
+    )
+    record_last_measurement(
+        args.config,
+        result,
+        mode=MeasurementMode(args.mode),
+        feature=args.feature,
+        config_name=args.config_name,
+        run_name=args.run_name,
+        variable_filters=variable_filters,
+        endpoint=getattr(client, "base_url", ""),
     )
     if not result.measurement_id:
         _print_measurement_result(result, colors=colors)
@@ -1523,13 +2246,63 @@ def _run_test_feature(
         colors=colors,
     )
     result = client.get_measurement(result.measurement_id)
+    downloaded_paths: list[Path] = []
     if result.artifacts:
-        for path in client.download_measurement_artifacts(
+        downloaded_paths = client.download_measurement_artifacts(
             result.measurement_id,
             Path(args.out_dir),
-        ):
+        )
+        for path in downloaded_paths:
             print(f"saved {path}")
-    return _measurement_exit_code(state.summary.state if state.summary is not None else None)
+    execution_state = state.summary.state if state.summary is not None else result.state
+    execution_exit = _measurement_exit_code(execution_state)
+    if execution_exit is not CMSCLIExitCode.SUCCESS:
+        return execution_exit
+    if args.mode == MeasurementMode.DIFF.value:
+        return _create_and_render_diff_comparison(Path(args.out_dir), downloaded_paths)
+    return execution_exit
+
+
+def _create_and_render_diff_comparison(
+    out_dir: Path, downloaded_paths: list[Path]
+) -> CMSCLIExitCode:
+    """Create client-side differential output only after physical execution passed."""
+
+    plan_paths = [path for path in downloaded_paths if path.name == "paired_default_plan.json"]
+    if len(plan_paths) != 1:
+        print("differential comparison data did not include one paired_default_plan.json", file=sys.stderr)
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
+    evidence_root = plan_paths[0].parent
+    plan_path = evidence_root / "paired_default_plan.json"
+    version1_root = evidence_root / "version1"
+    version2_root = evidence_root / "version2"
+    required = (plan_path, version1_root, version2_root)
+    if not all(path.exists() for path in required):
+        missing = ", ".join(str(path) for path in required if not path.exists())
+        print(f"differential comparison data is incomplete: missing {missing}", file=sys.stderr)
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
+    try:
+        pairing = pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+        inputs = prepare_comparison_inputs(pairing)
+        report = create_diff_comparison_report(pairing, inputs)
+        report_path = write_diff_comparison_report(report, evidence_root / "diff_comparison.json")
+        print(f"saved {report_path}")
+        saved_report = json.loads(report_path.read_text(encoding="utf-8"))
+        print(render_diff_comparison_table(saved_report))
+    except (DifferentialPairingError, ValueError, OSError) as exc:
+        print(f"differential comparison data is invalid: {exc}", file=sys.stderr)
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
+
+    if report["diagnostics"]:
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
+    statuses = {
+        metric.get("status")
+        for pair in report["pairs"]
+        for metric in pair["metrics"]
+    }
+    if ComparisonStatus.FAIL.value in statuses:
+        return CMSCLIExitCode.THRESHOLD_REGRESSION
+    return CMSCLIExitCode.SUCCESS
 
 
 def _preview_job_count(
@@ -1699,6 +2472,8 @@ def _print_exit_codes() -> None:
         CMSCLIExitCode.CONNECTION_FAILURE: "connection failure",
         CMSCLIExitCode.PROTOCOL_MISMATCH: "protocol mismatch",
         CMSCLIExitCode.CLIENT_ERROR: "daemon, client, configuration, or operational error",
+        CMSCLIExitCode.COMPARISON_DATA_FAILURE: "differential comparison data failure",
+        CMSCLIExitCode.THRESHOLD_REGRESSION: "differential comparison threshold regression",
     }
     for code in CMSCLIExitCode:
         print(f"{int(code)} {code.name}: {descriptions[code]}")
@@ -1784,8 +2559,38 @@ def _print_troubleshooting(topic: str = "all") -> None:
             print(f"  - {line}")
 
 
-def _resolve_watch_measurement_id(client: CMSClient, requested_measurement_id: str) -> str:
+def _resolve_watch_measurement_id(
+    client: CMSClient,
+    requested_measurement_id: str,
+    *,
+    reconnect: bool = False,
+    config_path: str | Path = CMS_CLIENT_CONFIG,
+) -> str:
+    """Resolve an explicit, active, or locally recovered measurement identity."""
+
     measurement_id = requested_measurement_id.strip()
+    if reconnect:
+        if measurement_id:
+            raise RuntimeError("cms WATCH --reconnect cannot be combined with a measurement ID")
+        config_file = Path(config_path)
+        if not config_file.is_file():
+            raise RuntimeError(
+                "cannot reconnect because the CMS client recovery record does not exist; "
+                "submit a test first or use cms WATCH <measurement_id>"
+            )
+        record = _read_json_file(config_file).get("last_measurement")
+        if not isinstance(record, dict) or not isinstance(record.get("measurement_id"), str):
+            raise RuntimeError(
+                "cannot reconnect because no submitted measurement is recorded; "
+                "submit a test first or use cms WATCH <measurement_id>"
+            )
+        measurement_id = record["measurement_id"].strip()
+        if not measurement_id:
+            raise RuntimeError(
+                "cannot reconnect because the recorded measurement ID is empty; "
+                "use cms WATCH <measurement_id>"
+            )
+        return measurement_id
     if measurement_id:
         return measurement_id
     measurement_id = client.get_active_measurement_id()
@@ -1844,9 +2649,11 @@ def _print_verbose_event_page(
         timestamp = event.timestamp.isoformat()
         if event.event_type == "console":
             source = str(event.details.get("source", "console"))
+            variant = str(event.details.get("variant", ""))
+            label = f"{variant} {source}" if variant else source
             text = str(event.details.get("text", ""))
             for line in text.splitlines() or [""]:
-                print(f"{colors.color(timestamp, 'dim')} [{source}] {line}")
+                print(f"{colors.color(timestamp, 'dim')} [{label}] {line}")
             continue
         state = str(event.details.get("state", event.event_type))
         print(f"{colors.color(timestamp, 'dim')} [event] {colors.color(state, state_role(state))}")

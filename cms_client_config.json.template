@@ -1,0 +1,39 @@
+{
+  "daemon": {
+    "scheme": "http",
+    "host": "cms-bench-hostname-or-ip",
+    "port": 8000,
+    "api_token": "replace-with-your-cms-api-token",
+    "timeout_s": 30.0
+  },
+  "benches": {
+    "cms-bench-001": {
+      "scheme": "http",
+      "host": "cms-bench-001-or-ip",
+      "port": 8000,
+      "api_token": "replace-with-that-bench-api-token",
+      "timeout_s": 30.0
+    }
+  },
+  "tools": {
+    "slt": "C:\\path\\to\\slt.exe",
+    "slc": "C:\\path\\to\\slc.exe",
+    "cmake": "C:\\path\\to\\cmake.exe",
+    "commander": "C:\\path\\to\\commander.exe"
+  },
+  "build": {
+    "root": ".fw_build",
+    "bootloader_slcp": "apps/bootloader-uart-bgapi.slcp"
+  },
+  "target": {
+    "board": "replace-with-supported-board-id",
+    "board_rev": "replace-with-board-revision",
+    "device": "replace-with-target-device",
+    "sisdk_package_path": "C:\\path\\to\\default\\sisdk-package",
+    "sisdk": "replace-with-default-sisdk-version"
+  },
+  "diff": {
+    "sisdk_child_path": "C:\\path\\to\\child\\sisdk-package",
+    "sisdk_parent_path": "C:\\path\\to\\parent\\sisdk-package"
+  }
+}
