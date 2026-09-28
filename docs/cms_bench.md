@@ -14,14 +14,15 @@ structured result with artifacts.
 
 ## Architecture Position
 
-`docs/cms_tool.md` and `docs/newCMSArch.html` define the split between
-orchestration and physical execution:
+The current implementation keeps the split between orchestration and physical
+execution across `cms_client.py`, `cmsd.py`, `cms_bench.py`, and
+`cms_protocol.py`:
 
 | Area | Owner |
 | --- | --- |
 | Build orchestration | CMS Client |
 | Test selection and workflow | CMS Client |
-| Bench reservation and scheduling | HWMux direction / integration layer |,
+| Bench reservation and scheduling | Not implemented; endpoint selection is configured by CMS Client |
 | HTTP/session handling | CMS Bench daemon |
 | Hardware readiness and local execution | CMS Bench |
 | Signal capture and result evidence | CMS Bench |
@@ -45,17 +46,17 @@ to the physical setup:
    availability, XAPI availability, and current bench state.
 3. Validate staged firmware and metadata for one measurement request.
 4. Confirm that the firmware board and device match the physical bench.
-5. Verify staged image files and SHA-256 hashes for DUT, tester and required
-6. `sl_bt.xapi`.
-7. Prepare a pytest/test-orchestrator runtime layout from the staged firmware.
-8. Write `cms_fw_metadata.json`, which is consumed by the test orchestration
+5. Verify staged image files and SHA-256 hashes for DUT, tester, and required
+   `sl_bt.xapi`.
+6. Prepare a pytest/test-orchestrator runtime layout from the staged firmware.
+7. Write `cms_fw_metadata.json`, which is consumed by the test orchestration
    flow.
-9. Execute `test_orchestrator.py` against the selected test configuration.
-10. Capture stdout, stderr, pytest logs, orchestrator result logs, and
+8. Execute `test_orchestrator.py` against the selected test configuration.
+9. Capture stdout, stderr, pytest logs, orchestrator result logs, and
    diagnostic metadata.
-1.  Collect result artifacts from the generated artifact directories and attach
+10. Collect result artifacts from the generated artifact directories and attach
     them to the structured measurement result.
-2.  Return the bench to `idle` when the run completes or fails.
+11. Return the bench to `idle` when the run completes or fails.
 
 The bench state model is deliberately small: `offline`, `idle`, `busy`,
 `testing`, and `error`. A healthy initialized bench becomes `idle`; an active
@@ -88,7 +89,7 @@ has stopped.
 | `tester` | Tester serial port and debug probe serial number |
 | `tools` | Local tool paths, especially Simplicity Commander |
 | `ble` | Optional local fallback path for `sl_bt.xapi` |
-| `joulescope` / `Joulescope` | Joulescope serial, port, or ID mapping |
+| `joulescope` / `Joulescope` | Joulescope serial, port, ID, and optional wake GPIO mapping |
 
 Current required fields for initialization are:
 
@@ -104,10 +105,10 @@ Current required fields for initialization are:
 The Joulescope mapping is health-checked as optional in the current bench
 implementation, so a missing mapping reports a warning rather than a startup
 failure. The current loader recognizes `joulescope` or `Joulescope` keys with
-`serial_number`, `serial_port`, or `id`. If the runtime file uses a different
-shape, such as `js.usb_id`, the bench will not populate
-`resources.joulescope_serial` until the configuration shape or loader is
-updated.
+`serial_number`, `serial_port`, or `id`, plus `wake_gpio`. The checked-in
+runtime template currently uses a `js.usb_id` shape; that shape is not consumed
+by the current loader, so it produces the same optional-mapping warning until
+the runtime configuration is changed to the supported shape.
 
 ## Measurement Inputs
 
@@ -121,6 +122,11 @@ daemon and passed into `CMSBench` as a `BenchSession`. The session contains:
 | `manifest` | Firmware assets staged for execution |
 | `request` | Test selector, measurement mode, metadata, and upload preference |
 | `notes` | Non-fatal validation notes collected during preparation |
+
+For a differential request, `differential_firmware` contains independently
+provenanced `version1` and `version2` firmware sets. The daemon stages both
+sets, while the bench validates each set against the local board, device,
+images, hashes, bootloader, and `sl_bt.xapi` before execution.
 
 Firmware inputs include:
 
@@ -142,11 +148,15 @@ The test selector chooses:
 
 ## Result Upload Policy
 
-CMS Bench result upload is mode-based:
+CMS Bench result upload is mode-based and is normalized by the daemon before
+the bench session is created:
 
 - `default`, `full_sweep`, and `diff` runs upload results to the configured
   database by default.
-- `debug` runs do not upload results to the database.
+- `debug` requests do not upload results to the database. `debug` is a protocol
+  mode, but it is not currently one of the modes accepted by the `cms TEST`
+  command; the CLI's `--debug` option enables live artifact streaming while a
+  supported mode is running.
 
 The daemon enforces this policy before creating the `BenchSession`, and
 `cms_bench.py` forwards `--upload-results-to-database` to `test_orchestrator.py`
@@ -176,7 +186,8 @@ The current `measurement_run()` flow is:
 python test_orchestrator.py <config_dir> --mode <default|full_sweep> --feature <feature> --results-log <runtime_dir>/orchestrator_results.jsonl --cms-runtime-config cms_bench_runtime.json --cms-fw-metadata <runtime_dir>/cms_fw_metadata.json
 ```
 
-12. Add `--cfg <selector.config>` when the selected config is not `default`.
+12. Add `--exact-config <selector.config>` when the selected config is not
+    `default`.
 13. Add `--upload-results-to-database` for non-debug CMS Bench runs.
 14. Write `test_stdout.log`, `test_stderr.log`, and `cms_test_run.json`.
 15. Convert the orchestrator return code into `passed` or `failed`.
@@ -185,7 +196,30 @@ python test_orchestrator.py <config_dir> --mode <default|full_sweep> --feature <
 18. Return the bench state to `idle`.
 
 For `request.mode == full_sweep`, the bench passes `full_sweep` to the
-orchestrator. Other modes currently map to the orchestrator `default` mode.
+orchestrator. Exact named configs use the orchestrator's `all` discovery mode
+with `--exact-config`; `default` and `diff` passes use the orchestrator's
+`default` mode. Variable filters are forwarded as repeated `--variable`
+arguments.
+
+## Differential Execution
+
+`diff` is a bench-supported paired campaign, not a comparison-only label. The
+client builds and stages two independently provenanced firmware sets with
+`cms BUILD --diff` and `cms SEND_FW --diff`. The daemon then:
+
+1. Creates one deterministic `paired_default_plan.json` shared by both passes.
+2. Validates both firmware variants before starting pytest.
+3. Runs `version1`, then `version2`, through the normal bench runner.
+4. Uses isolated runtime, logs, result records, and active firmware roots for
+   each variant.
+5. Records the selected image and SHA-256 for every firmware role.
+6. Retains the paired plan, differential firmware evidence, pass records,
+   campaign order, and per-variant artifacts in the published measurement.
+
+The bench reports both variant outcomes and does not itself decide comparison
+thresholds. After a successful physical campaign, the CMS Client creates
+`diff_comparison.json` from the downloaded paired evidence and assigns the
+comparison result its own CLI outcome.
 
 ## Artifacts
 
@@ -196,16 +230,24 @@ Diagnostic artifacts are collected from the measurement runtime directory when
 present:
 
 - `cms_fw_metadata.json`
+- `setup_status.json`
 - `cms_test_run.json`
+- `orchestrator_plan.json`
 - `orchestrator_results.jsonl`
 - `pytest.log`
 - `test_stdout.log`
 - `test_stderr.log`
+- JUnit XML files under `junit/`, when produced
 
 Measurement artifacts are collected from:
 
 - `artifacts/<selector.mode>/<feature>/<default|full_sweep>/`
 - `artifacts/orchestrator/`
+
+Differential measurements additionally publish paired evidence under the
+measurement's differential evidence root, including the shared plan,
+`version1`/`version2` pass outputs, selected firmware evidence, pass records,
+and `differential_campaign.json`.
 
 Only files modified after the run preparation timestamp are attached when that
 timestamp is available. This keeps the returned artifact list focused on the
@@ -222,6 +264,7 @@ current measurement.
 - optional Joulescope mapping
 - Commander path resolution
 - optional XAPI path resolution
+- detected DUT radio-board and target-device identity from the Commander probe
 - current bench state
 
 Any failed required check makes the overall health state `error`. Warnings, such
@@ -260,8 +303,6 @@ architecture continues to take shape. New remote execution should use the
 `BenchSession` and `MeasurementRequest` flow.
 
 ## Design Rule
-
-The core architecture rule from `newCMSArch.html` applies directly to this file:
 
 > CMS Bench owns live measurement authority locally. CMS Client owns
 > orchestration and workflow.

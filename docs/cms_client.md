@@ -21,7 +21,7 @@ orchestration and physical execution:
 | Build orchestration | CMS Client |
 | Test selection and workflow | CMS Client |
 | Developer and CI entry point | CMS Client |
-| Bench reservation and scheduling | HWMux direction / integration layer |
+| Bench reservation and scheduling | Not implemented; endpoint selection is configured by CMS Client |
 | HTTP/session handling | CMS Bench daemon |
 | Hardware readiness and local execution | CMS Bench |
 | Signal capture and result evidence | CMS Bench |
@@ -133,8 +133,11 @@ and does not use the bench. Continue only when the displayed config is exactly
 the one you intend to run.
 
 For CMS Bench runs, result upload is selected by mode. `default`,
-`full_sweep`, and `diff` tests upload results to the configured database by
-default. `debug` tests do not upload results to the database.
+`full_sweep`, and `diff` tests upload results to the configured database;
+`debug` requests do not. `debug` is advertised by the daemon protocol but is
+not currently accepted by the `cms TEST --mode` CLI choices. The client-side
+`--debug` option has a different purpose: it streams completed artifacts while
+the measurement is still running.
 
 7. Run the default config and watch it until completion.
 
@@ -373,6 +376,27 @@ use `--config-name` for one exact config, or use one or more `--variable`
 options for a generated campaign. The bench revalidates names, values, config
 hashes, and the final selected job count before hardware execution.
 
+### Run A Differential Campaign
+
+Use this when two independently built firmware variants must execute the same
+paired campaign:
+
+```text
+cms BUILD --diff
+cms SEND_FW --diff --requested-by <user>
+cms STAGED
+cms TEST --mode diff --feature beacon --config-name default --out-dir artifacts --verbose
+```
+
+`cms BUILD --diff` builds `version1` and `version2` in isolated roots and
+writes `diff_fw_data.json`. `cms SEND_FW --diff` stages both provenanced
+firmware sets. The daemon creates one paired plan, runs `version1` followed by
+`version2`, and publishes isolated evidence for both passes. After the physical
+campaign succeeds, the client writes `diff_comparison.json` into the downloaded
+differential evidence directory. A comparison-data failure or threshold
+regression has its own exit code; a passed bench campaign does not by itself
+guarantee that the comparison thresholds passed.
+
 ### Mutable Custom Configuration
 
 `custom` is a configuration name, not a measurement mode. The valid `--mode`
@@ -564,6 +588,8 @@ developer workstation, CI machine, or other automation host:
 12. Download published artifacts by explicit measurement ID.
 13. Request cancellation through `/cancel` or
     `/measurement/<measurement_id>/cancel`.
+14. For differential runs, pair downloaded `version1` and `version2` evidence
+    and write `diff_comparison.json` with comparison status and diagnostics.
 
 The current client is focused on one daemon endpoint at a time. It does not yet
 perform HWMux discovery, multi-bench scheduling, or database comparison policy.
@@ -598,6 +624,17 @@ The build section supports:
 | --- | --- |
 | `build.root` | Local root for generated projects, firmware images, runtime XAPI, and build metadata |
 | `build.bootloader_slcp` | Bootloader `.slcp` project used by the firmware build |
+
+The diff section is required by `cms BUILD --diff`:
+
+| Field | Purpose |
+| --- | --- |
+| `diff.sisdk_version1_path` | Unpacked SiSDK package used to build the `version1` firmware set |
+| `diff.sisdk_version2_path` | Unpacked SiSDK package used to build the `version2` firmware set |
+
+The build writes the resulting paired provenance to
+`<build.root>/diff_fw_data.json`. The older `sisdk_child_path` and
+`sisdk_parent_path` names are not read by the current diff build flow.
 
 The tools section supports optional paths for `tools.slt`, `tools.slc`,
 `tools.cmake`, and `tools.commander`. A tool value may be left unset when the
@@ -704,15 +741,20 @@ The current CLI commands are:
 | `cms health` | Print daemon-plus-bench health checks |
 | `cms status` | Print bench state and active measurement ID |
 | `cms tests` | List test modes, BLE features, and config names advertised by the daemon |
+| `cms STAGED` | Show the current normal and differential firmware stages |
 | `cms EXIT_CODES` | Print stable CLI exit-code meanings |
 | `cms TROUBLESHOOT` | Print troubleshooting guidance |
 | `cms BUILD` | Build local firmware through `apps/app_manager.py` |
+| `cms BUILD --diff` | Build isolated `version1` and `version2` firmware roots |
 | `cms SEND_FW` | Stage firmware and metadata on the daemon |
+| `cms SEND_FW --diff` | Stage the provenanced differential firmware pair |
 | `cms TEST` | Start a remote test, exact config, or variable-filtered campaign using the most recently staged firmware |
+| `cms CUSTOM` | Update a feature's mutable `custom.json` configuration |
 | `cms measurement <id>` | Print status for one measurement |
 | `cms CANCEL` | Cancel the active or last measurement |
 | `cms ARTIFACTS` | Download artifacts from an explicit measurement |
 | `cms FAILED` | Show failed test identities and rerun commands |
+| `cms RECIPES` | Print copy/paste recipes for common workflows |
 
 A typical current workflow is:
 
@@ -747,15 +789,20 @@ cms TEST --mode default --feature beacon --config-name default --out-dir artifac
 | --- | --- | --- |
 | `GET` | `/health` | `get_health()` |
 | `GET` | `/bench` | `get_status()` |
+| `GET` | `/staged` | `get_staged()` |
 | `GET` | `/tests` | `list_tests()` |
 | `POST` | `/measurement` | `submit_measurement()` |
 | `POST` | `/firmware` | `send_firmware()` |
 | `POST` | `/test` | `run_test()` |
 | `GET` | `/measurement/<measurement_id>` | `get_measurement()` |
+| `GET` | `/measurement/active` | `get_active_measurement_id()` |
+| `GET` | `/measurement/<measurement_id>/summary` | `get_measurement_summary()` |
+| `GET` | `/measurement/<measurement_id>/events` | `get_measurement_events()` |
+| `GET` | `/measurement/<measurement_id>/artifacts` | `list_measurement_artifacts()` |
 | `POST` | `/measurement/<measurement_id>/cancel` | `cancel_measurement()` |
 | `POST` | `/cancel` | `cancel_active_test()` |
-| `GET` | `/measurement/<measurement_id>/artifacts` | `download_artifact()` lookup |
 | `GET` | `/artifacts/last` | `download_last_artifacts()` |
+| `GET` | `/measurement/<measurement_id>/artifacts/<artifact_path>` | artifact payload download |
 
 HTTP errors are converted to `RuntimeError` with the daemon response body.
 Connection errors are reported as an unreachable daemon.
@@ -763,19 +810,19 @@ Connection errors are reported as an unreachable daemon.
 ## Test Execution Behavior
 
 `cms TEST` does not send firmware by itself. It asks the daemon to run a test
-using the most recently staged firmware request. The request body contains:
+using the most recently staged normal firmware request, or the current staged
+differential pair when `--mode diff` is selected. The request body contains:
 
-- measurement mode: `debug`, `default`, `full_sweep`, or `diff`
+- measurement mode: `default`, `full_sweep`, or `diff` from the current CLI
 - feature name
 - config name
 - zero or more variable filters as `name=value`
 - optional request ID
-- `upload_results_to_database`
+- `upload_results_to_database` (normalized by the daemon from the selected mode)
 
-The client sets `upload_results_to_database` to `true` for `default`,
-`full_sweep`, and `diff`, and to `false` for `debug`. The daemon applies the
-same policy again before bench execution, so older clients that omit or send an
-old flag value still follow the bench-side rule.
+The client sends the upload preference field, but the daemon applies the
+mode-based policy again before bench execution. This means older clients that
+omit or send an old flag value still follow the bench-side rule.
 
 After the daemon accepts the test, the client polls until the result state is
 terminal:
@@ -798,6 +845,10 @@ For `beacon`, the current declared examples include `phy=2m` and `dcdc=On`.
 Unknown variables, unsupported values, malformed filters, incompatible exact
 config combinations, and zero selected jobs are rejected before pytest or
 hardware setup starts.
+
+For `diff`, the daemon uses one paired plan and runs the same selected jobs
+against both staged firmware variants. The client compares the downloaded
+variant evidence only after both physical passes have completed.
 
 Human output can be colored with `--color auto|always|never`. The default is
 `auto`, which emits ANSI colors only on a TTY. Use `--color always` for local
@@ -849,6 +900,8 @@ distinguish a completed test failure from communication or protocol failures.
 | 5 | `CONNECTION_FAILURE` | The daemon is unreachable or a request timed out |
 | 6 | `PROTOCOL_MISMATCH` | The daemon protocol/version or response shape is incompatible |
 | 7 | `CLIENT_ERROR` | Another daemon, client, configuration, or operational error occurred, including an interrupted run after daemon restart |
+| 8 | `COMPARISON_DATA_FAILURE` | Differential evidence is missing, invalid, or contains comparison diagnostics |
+| 9 | `THRESHOLD_REGRESSION` | Differential comparison completed and exceeded a configured regression threshold |
 
 Errors are written to stderr. In particular, exit code 1 is reserved for a
 real completed test failure; daemon HTTP errors do not masquerade as failed
@@ -877,16 +930,16 @@ architecture pieces are still in progress:
 
 - The client talks to one configured daemon endpoint at a time.
 - HWMux reservation and bench discovery are not implemented in `cms_client.py`.
-- `diff` is accepted as a measurement mode but is not a full comparison workflow
-  in the client yet.
+- `diff` runs both firmware variants on the bench and generates the client-side
+  comparison report after artifacts are downloaded; it does not provide
+  multi-bench scheduling or historical baseline selection.
 - `cms_client_config.json` contains a `tools` section, but the current build
   wrapper does not pass that section directly to `apps/app_manager.py`.
 - `send_firmware()` sends local files as base64 JSON payloads, which is simple
   for bringup but not the final large-artifact transfer strategy.
 - `cms TEST` depends on a previous successful `cms SEND_FW`.
-- Database upload is mode-based for CMS Bench tests. Non-debug tests request
-  database upload by default; debug tests do not. The client does not upload
-  results itself.
+- Database upload is mode-based for CMS Bench tests. The daemon normalizes the
+  policy, and the client does not upload results itself.
 
 ## Design Rule
 
