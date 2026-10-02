@@ -583,6 +583,86 @@ class CMSDaemon:
             reverse=True,
         )[: self.config.completed_measurement_retention]
 
+    def saved_measurements(self) -> list[dict[str, Any]]:
+        """Return measurement directories that contain recoverable artifacts.
+
+        A measurement directory is intentionally considered recoverable even
+        when its final ``measurement_result.json`` manifest is missing.  This
+        is the important recovery path for a daemon or host failure that
+        occurred after logs were written but before final publication.
+        """
+
+        measurements_root = self.config.artifacts_root / "measurements"
+        if not measurements_root.is_dir():
+            return []
+
+        saved: list[dict[str, Any]] = []
+        for measurement_dir in sorted(path for path in measurements_root.iterdir() if path.is_dir()):
+            try:
+                self._runtime_workspace_path(measurement_dir.name)
+            except ValueError:
+                continue
+            files = self._artifact_files(measurement_dir)
+            if not files:
+                continue
+            latest_mtime = max(path.stat().st_mtime for path in files)
+            state = ""
+            result_path = measurement_dir / "measurement_result.json"
+            if result_path.is_file():
+                try:
+                    payload = json.loads(result_path.read_text(encoding="utf-8"))
+                    state = str(payload.get("state", ""))
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    state = ""
+            saved.append(
+                {
+                    "measurement_id": measurement_dir.name,
+                    "state": state,
+                    "has_manifest": result_path.is_file(),
+                    "artifact_count": len(files),
+                    "last_modified_at": datetime.fromtimestamp(
+                        latest_mtime,
+                        tz=timezone.utc,
+                    ).isoformat(),
+                }
+            )
+        return sorted(saved, key=lambda item: item["last_modified_at"], reverse=True)
+
+    def bench_artifacts(self, scope: str) -> dict[str, Any]:
+        """List files under one safe, bench-local artifact scope."""
+
+        root = self._bench_artifact_root(scope)
+        files = self._artifact_files(root)
+        encoded_scope = urllib.parse.quote(scope, safe="")
+        return {
+            "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+            "scope": scope,
+            "artifacts": [
+                self._artifact_file_payload(
+                    root,
+                    path,
+                    f"/bench/artifacts/{encoded_scope}/"
+                    f"{urllib.parse.quote(path.relative_to(root).as_posix(), safe='/')}",
+                )
+                for path in files
+            ],
+        }
+
+    def bench_artifact_path(self, scope: str, artifact_path: str) -> Path:
+        """Resolve one file from a safe bench-local artifact scope."""
+
+        root = self._bench_artifact_root(scope)
+        safe_name = _safe_artifact_name(urllib.parse.unquote(artifact_path))
+        candidate = root / safe_name
+        try:
+            resolved_root = root.resolve()
+            resolved_candidate = candidate.resolve()
+        except OSError as exc:
+            raise OSError(f"unable to resolve artifact scope: {scope}") from exc
+        if not resolved_candidate.is_relative_to(resolved_root) or not resolved_candidate.is_file():
+            raise KeyError(f"artifact is unavailable: {scope}/{safe_name}")
+        return resolved_candidate
+
     def reconstruct_interrupted_runtime_workspaces(self) -> None:
         """Mark unfinished runtime workspaces after daemon restart.
 
@@ -1505,6 +1585,46 @@ class CMSDaemon:
                 ],
             }
 
+        @app.get("/artifacts/measurements")
+        def saved_artifact_measurements(
+            protocol_version: int = CMS_OBSERVATION_PROTOCOL_VERSION,
+        ) -> dict[str, Any]:
+            require_observation_protocol(protocol_version)
+            return {
+                "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+                "measurements": self.saved_measurements(),
+            }
+
+        @app.get("/bench/artifacts/{scope}")
+        def bench_artifact_listing(
+            scope: str,
+            protocol_version: int = CMS_OBSERVATION_PROTOCOL_VERSION,
+        ) -> dict[str, Any]:
+            require_observation_protocol(protocol_version)
+            try:
+                return self.bench_artifacts(scope)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "invalid_artifact_scope", "message": str(exc)},
+                ) from exc
+
+        @app.get("/bench/artifacts/{scope}/{artifact_path:path}")
+        def bench_artifact_file(scope: str, artifact_path: str) -> FileResponse:
+            try:
+                path = self.bench_artifact_path(scope, artifact_path)
+            except (RuntimeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "invalid_artifact_path", "message": str(exc)},
+                ) from exc
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"code": "unknown_artifact", "message": str(exc.args[0])},
+                ) from exc
+            return FileResponse(path)
+
         @app.get("/measurement/{measurement_id}/summary")
         def measurement_summary(
             measurement_id: str,
@@ -1564,7 +1684,10 @@ class CMSDaemon:
                     detail={"code": "invalid_measurement_id", "message": str(exc)},
                 ) from exc
             if storage == "debug":
-                return self._persisted_debug_artifact_response(measurement_id)
+                try:
+                    return self._persisted_debug_artifact_response(measurement_id)
+                except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise_observation_error(exc)
             result = self.measurements.get(measurement_id)
             if result is None:
                 result_path = self.config.artifacts_root / "measurements" / measurement_id / "measurement_result.json"
@@ -1616,10 +1739,13 @@ class CMSDaemon:
             if storage not in {"runtime", "debug"}:
                 raise HTTPException(status_code=400, detail="invalid artifact storage")
             if storage == "debug":
-                debug_artifact = self._persisted_debug_artifact_path(
-                    measurement_id,
-                    safe_name,
-                )
+                try:
+                    debug_artifact = self._persisted_debug_artifact_path(
+                        measurement_id,
+                        safe_name,
+                    )
+                except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise_observation_error(exc)
                 if debug_artifact is None:
                     raise HTTPException(
                         status_code=404,
@@ -1894,22 +2020,43 @@ class CMSDaemon:
         return None
 
     def _persisted_debug_artifact_response(self, measurement_id: str) -> dict[str, Any]:
-        """Return the bundle deliberately retained by a completed debug run."""
+        """Return all files retained for a debug measurement.
 
-        result_path = self._published_measurement_path(measurement_id) / "measurement_result.json"
-        if not result_path.is_file():
+        The directory itself is authoritative for recovery.  The manifest is
+        preferred for metadata when present, but is not required to expose
+        files that survived a daemon failure.
+        """
+
+        published_dir = self._published_measurement_path(measurement_id)
+        if not published_dir.is_dir():
             raise KeyError(f"persisted debug artifacts are unavailable: {measurement_id}")
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
-        artifacts = payload.get("artifacts", [])
-        if not isinstance(artifacts, list):
-            raise ValueError("persisted debug artifact list must be a list")
-        for artifact in artifacts:
-            if isinstance(artifact, dict):
-                name = str(artifact.get("name", ""))
-                artifact["url"] = (
-                    f"/measurement/{measurement_id}/artifacts/"
-                    f"{urllib.parse.quote(name, safe='/')}?storage=debug"
+        manifest_by_name: dict[str, dict[str, Any]] = {}
+        result_path = published_dir / "measurement_result.json"
+        if result_path.is_file():
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            manifest_artifacts = payload.get("artifacts", [])
+            if not isinstance(manifest_artifacts, list):
+                raise ValueError("persisted debug artifact list must be a list")
+            for artifact in manifest_artifacts:
+                if isinstance(artifact, dict) and artifact.get("name"):
+                    manifest_by_name[str(artifact["name"])] = dict(artifact)
+
+        artifacts: list[dict[str, Any]] = []
+        for path in self._artifact_files(published_dir):
+            name = path.relative_to(published_dir).as_posix()
+            artifact = manifest_by_name.get(name, {})
+            artifact.update(
+                self._artifact_file_payload(
+                    published_dir,
+                    path,
+                    f"/measurement/{urllib.parse.quote(measurement_id, safe='')}/artifacts/"
+                    f"{urllib.parse.quote(name, safe='/')}?storage=debug",
                 )
+            )
+            artifact.setdefault("result_type", ResultType.DIAGNOSTIC.value)
+            artifacts.append(artifact)
+        if not artifacts:
+            raise KeyError(f"persisted debug artifacts are unavailable: {measurement_id}")
         return {
             "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
             "measurement_id": measurement_id,
@@ -1931,6 +2078,52 @@ class CMSDaemon:
             if path.is_file():
                 return path
         return None
+
+    def _bench_artifact_root(self, scope: str) -> Path:
+        """Map a single scope name to a bench-local artifact directory."""
+
+        try:
+            normalized = _safe_artifact_name(scope)
+        except RuntimeError as exc:
+            raise ValueError(f"invalid artifact scope: {scope}") from exc
+        if normalized != scope or "/" in scope or "\\" in scope:
+            raise ValueError(f"artifact scope must be one path component: {scope}")
+        if scope == "cmsd":
+            return self.config.artifacts_root
+        return Path("artifacts") / scope
+
+    @staticmethod
+    def _artifact_files(root: Path) -> list[Path]:
+        """Return regular files below root without following outside symlinks."""
+
+        if not root.is_dir():
+            return []
+        try:
+            resolved_root = root.resolve()
+        except OSError:
+            return []
+        files: list[Path] = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                if not path.resolve().is_relative_to(resolved_root):
+                    continue
+            except OSError:
+                continue
+            files.append(path)
+        return files
+
+    @staticmethod
+    def _artifact_file_payload(root: Path, path: Path, url: str) -> dict[str, Any]:
+        stat = path.stat()
+        return {
+            "name": path.relative_to(root).as_posix(),
+            "path": str(path),
+            "url": url,
+            "size": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        }
 
     def _touch_staging_files(self) -> None:
         for path in self.files.as_dict().values():

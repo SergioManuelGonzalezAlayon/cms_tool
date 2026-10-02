@@ -198,9 +198,9 @@ def test_client_lists_and_downloads_artifacts_by_explicit_measurement_id(tmp_pat
     assert saved == [tmp_path / "downloads" / "results" / "result.json"]
     assert saved[0].read_text(encoding="utf-8") == '{"passed":true}\n'
     assert requests == [
-        f"/measurement/{MEASUREMENT_ID}/artifacts?protocol_version="
+        f"/measurement/{MEASUREMENT_ID}/artifacts?storage=runtime&protocol_version="
         f"{CMS_OBSERVATION_PROTOCOL_VERSION}",
-        f"/measurement/{MEASUREMENT_ID}/artifacts?protocol_version="
+        f"/measurement/{MEASUREMENT_ID}/artifacts?storage=runtime&protocol_version="
         f"{CMS_OBSERVATION_PROTOCOL_VERSION}",
     ]
     assert "/artifacts/last" not in requests
@@ -217,3 +217,75 @@ def test_client_explicit_artifact_download_rejects_empty_list(tmp_path: Path) ->
 
     with pytest.raises(RuntimeError, match="no published artifacts"):
         client.download_measurement_artifacts(MEASUREMENT_ID, tmp_path)
+
+
+def test_client_lists_saved_measurements_and_downloads_bench_scopes(tmp_path: Path) -> None:
+    scope_source = tmp_path / "source" / "ble-results.csv"
+    scope_source.parent.mkdir()
+    scope_source.write_text("result\n", encoding="utf-8")
+    debug_source = tmp_path / "source" / "test_stdout.log"
+    debug_source.write_text("test output\n", encoding="utf-8")
+    requests = []
+
+    def request(method, path):
+        requests.append(path)
+        if path.startswith("/artifacts/measurements?"):
+            return {
+                "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+                "measurements": [
+                    {
+                        "measurement_id": MEASUREMENT_ID,
+                        "state": "",
+                        "has_manifest": False,
+                        "artifact_count": 1,
+                        "last_modified_at": "2026-09-22T18:06:42+00:00",
+                    }
+                ],
+            }
+        if path.startswith("/bench/artifacts/ble?"):
+            return {
+                "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+                "scope": "ble",
+                "artifacts": [
+                    {
+                        "name": "ble-results.csv",
+                        "path": str(scope_source),
+                        "url": "/bench/artifacts/ble/ble-results.csv",
+                    }
+                ],
+            }
+        if path.startswith(f"/measurement/{MEASUREMENT_ID}/artifacts?"):
+            return {
+                "protocol_version": CMS_OBSERVATION_PROTOCOL_VERSION,
+                "measurement_id": MEASUREMENT_ID,
+                "artifacts": [
+                    {
+                        "name": "test_stdout.log",
+                        "path": str(debug_source),
+                        "url": f"/measurement/{MEASUREMENT_ID}/artifacts/test_stdout.log?storage=debug",
+                    }
+                ],
+            }
+        raise AssertionError(f"unexpected request: {path}")
+
+    client = _client(request)
+
+    assert client.list_saved_measurements()[0]["measurement_id"] == MEASUREMENT_ID
+    scope_downloads = client.download_bench_artifacts("ble", tmp_path / "downloads")
+    debug_downloads = client.download_debug_measurement_tree(
+        MEASUREMENT_ID,
+        tmp_path / "downloads",
+    )
+
+    assert scope_downloads == [tmp_path / "downloads" / "ble" / "ble-results.csv"]
+    assert debug_downloads == [
+        tmp_path / "downloads" / "cmsd" / "measurements" / MEASUREMENT_ID / "test_stdout.log"
+    ]
+    assert scope_downloads[0].read_text(encoding="utf-8") == "result\n"
+    assert debug_downloads[0].read_text(encoding="utf-8") == "test output\n"
+    assert requests == [
+        f"/artifacts/measurements?protocol_version={CMS_OBSERVATION_PROTOCOL_VERSION}",
+        f"/bench/artifacts/ble?protocol_version={CMS_OBSERVATION_PROTOCOL_VERSION}",
+        f"/measurement/{MEASUREMENT_ID}/artifacts?storage=debug&protocol_version="
+        f"{CMS_OBSERVATION_PROTOCOL_VERSION}",
+    ]

@@ -210,6 +210,84 @@ def test_explicit_artifact_file_distinguishes_unknown_measurement_and_artifact(t
     assert Path(response.path) == artifact
 
 
+def test_debug_artifacts_recover_manifestless_measurement_logs(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    published_dir = daemon.config.artifacts_root / "measurements" / MEASUREMENT_ID
+    published_dir.mkdir(parents=True)
+    for name, content in (
+        ("pytest.log", "pytest failed before publication\n"),
+        ("test_stderr.log", "daemon traceback\n"),
+        ("test_stdout.log", "test output\n"),
+    ):
+        (published_dir / name).write_text(content, encoding="utf-8")
+
+    app = daemon.create_app()
+    listing_endpoint = _endpoint(app, "/artifacts/measurements")
+    debug_endpoint = _endpoint(app, "/measurement/{measurement_id}/artifacts")
+    file_endpoint = _endpoint(
+        app,
+        "/measurement/{measurement_id}/artifacts/{artifact_path:path}",
+    )
+
+    saved = listing_endpoint(protocol_version=CMS_OBSERVATION_PROTOCOL_VERSION)
+    assert saved["measurements"][0]["measurement_id"] == MEASUREMENT_ID
+    assert saved["measurements"][0]["has_manifest"] is False
+    assert saved["measurements"][0]["artifact_count"] == 3
+
+    debug_payload = debug_endpoint(
+        MEASUREMENT_ID,
+        storage="debug",
+        protocol_version=CMS_OBSERVATION_PROTOCOL_VERSION,
+    )
+    assert {artifact["name"] for artifact in debug_payload["artifacts"]} == {
+        "pytest.log",
+        "test_stderr.log",
+        "test_stdout.log",
+    }
+
+    response = file_endpoint(MEASUREMENT_ID, "test_stdout.log", storage="debug")
+    assert isinstance(response, FileResponse)
+    assert Path(response.path) == published_dir / "test_stdout.log"
+
+
+def test_bench_artifact_scopes_list_files_and_reject_traversal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    daemon = CMSDaemon(
+        DaemonConfig(
+            runtime_root=tmp_path / "runtime",
+            artifacts_root=tmp_path / "artifacts" / "cmsd",
+            bench_config=tmp_path / "bench.json",
+        )
+    )
+    cmsd_artifact = daemon.config.artifacts_root / "cmsd.log"
+    cmsd_artifact.parent.mkdir(parents=True)
+    cmsd_artifact.write_text("cmsd\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    orchestrator_artifact = tmp_path / "artifacts" / "orchestrator" / "results.jsonl"
+    orchestrator_artifact.parent.mkdir(parents=True)
+    orchestrator_artifact.write_text("{}\n", encoding="utf-8")
+
+    app = daemon.create_app()
+    listing_endpoint = _endpoint(app, "/bench/artifacts/{scope}")
+    file_endpoint = _endpoint(app, "/bench/artifacts/{scope}/{artifact_path:path}")
+
+    payload = listing_endpoint(
+        "orchestrator",
+        protocol_version=CMS_OBSERVATION_PROTOCOL_VERSION,
+    )
+    assert [artifact["name"] for artifact in payload["artifacts"]] == ["results.jsonl"]
+    response = file_endpoint("cmsd", "cmsd.log")
+    assert isinstance(response, FileResponse)
+    assert Path(response.path) == cmsd_artifact
+
+    with pytest.raises(HTTPException) as traversal:
+        file_endpoint("cmsd", "../outside.log")
+    assert traversal.value.status_code == 400
+    assert traversal.value.detail["code"] == "invalid_artifact_path"
+
+
 def test_measurement_status_prefers_active_runtime_status(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
     daemon.active_measurement_id = MEASUREMENT_ID
@@ -365,6 +443,7 @@ def test_completed_measurement_discovery_is_limited_to_newest_published_results(
 
 def test_daemon_startup_marks_unfinished_runtime_workspace_interrupted(tmp_path: Path) -> None:
     daemon = _daemon(tmp_path)
+    daemon.debug_artifact_measurements.add(MEASUREMENT_ID)
     runtime_dir = daemon.config.runtime_root / "measurements" / MEASUREMENT_ID
     runtime_dir.mkdir(parents=True)
     job = {

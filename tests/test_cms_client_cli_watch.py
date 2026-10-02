@@ -66,6 +66,23 @@ def test_cli_accepts_explicit_or_active_watch_and_explicit_artifacts() -> None:
     assert submitted.poll_interval == 1.0
 
 
+def test_cli_accepts_artifact_recovery_commands() -> None:
+    parser = build_cli_parser()
+
+    listed = parser.parse_args(["ARTIFACTS", "--list"])
+    all_debug = parser.parse_args(["ARTIFACTS", "--debug", "--get", "all"])
+    one_debug = parser.parse_args(
+        ["ARTIFACTS", "--debug", "--get", MEASUREMENT_ID]
+    )
+    protocol_results = parser.parse_args(["ARTIFACTS", "--get-results", "ble"])
+
+    assert listed.list is True
+    assert all_debug.debug is True
+    assert all_debug.get == "all"
+    assert one_debug.get == MEASUREMENT_ID
+    assert protocol_results.get_results == "ble"
+
+
 def test_watch_resolution_prefers_explicit_id_and_discovers_active_measurement() -> None:
     class Client:
         def __init__(self, active):
@@ -270,7 +287,13 @@ def test_test_command_reuses_watch_and_downloads_by_submitted_measurement_id(
                 artifacts=[Artifacts(name="result.json", url="/result.json")],
             )
 
-        def download_measurement_artifacts(self, measurement_id, out_dir):
+        def download_measurement_artifacts(
+            self,
+            measurement_id,
+            out_dir,
+            *,
+            debug_persisted=False,
+        ):
             self.downloads.append((measurement_id, out_dir))
             return [out_dir / "result.json"]
 
@@ -332,7 +355,13 @@ def test_artifacts_command_never_uses_last_measurement(tmp_path: Path, monkeypat
         def __init__(self):
             self.downloads = []
 
-        def download_measurement_artifacts(self, measurement_id, out_dir):
+        def download_measurement_artifacts(
+            self,
+            measurement_id,
+            out_dir,
+            *,
+            debug_persisted=False,
+        ):
             self.downloads.append((measurement_id, out_dir))
             return [out_dir / "result.json"]
 
@@ -348,3 +377,46 @@ def test_artifacts_command_never_uses_last_measurement(tmp_path: Path, monkeypat
 
     assert exit_code == 0
     assert client.downloads == [(MEASUREMENT_ID, tmp_path)]
+
+
+def test_artifact_recovery_commands_dispatch_to_expected_client_methods(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def list_saved_measurements(self):
+            self.calls.append(("list",))
+            return []
+
+        def download_bench_artifacts(self, scope, out_dir):
+            self.calls.append(("scope", scope, out_dir))
+            return [out_dir / scope / "artifact.log"]
+
+        def download_debug_measurement_tree(self, measurement_id, out_dir):
+            self.calls.append(("measurement", measurement_id, out_dir))
+            return [out_dir / "cmsd" / "measurements" / measurement_id / "pytest.log"]
+
+    client = Client()
+    monkeypatch.setattr(cms_client, "CMSClient", lambda **kwargs: client)
+
+    assert cms_client.main(["ARTIFACTS", "--list"]) == 0
+    assert cms_client.main(
+        ["ARTIFACTS", "--debug", "--get", "all", "--out-dir", str(tmp_path)]
+    ) == 0
+    assert cms_client.main(
+        ["ARTIFACTS", "--debug", "--get", MEASUREMENT_ID, "--out-dir", str(tmp_path)]
+    ) == 0
+    assert cms_client.main(
+        ["ARTIFACTS", "--get-results", "ble", "--out-dir", str(tmp_path)]
+    ) == 0
+
+    assert client.calls == [
+        ("list",),
+        ("scope", "cmsd", tmp_path),
+        ("scope", "orchestrator", tmp_path),
+        ("measurement", MEASUREMENT_ID, tmp_path),
+        ("scope", "ble", tmp_path),
+    ]

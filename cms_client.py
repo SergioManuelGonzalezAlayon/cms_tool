@@ -596,6 +596,68 @@ class CMSClient:
                 f"measurement artifact response is invalid: {exc}"
             ) from exc
 
+    def list_saved_measurements(self) -> list[dict[str, Any]]:
+        """List recoverable measurement directories retained by the bench."""
+
+        payload = self._request_json(
+            "GET",
+            _observation_path("/artifacts/measurements"),
+        )
+        _validate_observation_envelope(payload)
+        measurements = payload.get("measurements", [])
+        if not isinstance(measurements, list):
+            raise CMSProtocolMismatchError(
+                "saved measurement response contains an invalid measurements list"
+            )
+        return [item for item in measurements if isinstance(item, dict)]
+
+    def list_bench_artifacts(self, scope: str) -> list[dict[str, Any]]:
+        """List files in one bench-local artifact scope."""
+
+        encoded_scope = urllib.parse.quote(scope, safe="")
+        payload = self._request_json(
+            "GET",
+            _observation_path(f"/bench/artifacts/{encoded_scope}"),
+        )
+        _validate_observation_envelope(payload)
+        artifacts = payload.get("artifacts", [])
+        if not isinstance(artifacts, list):
+            raise CMSProtocolMismatchError(
+                f"bench artifact response is invalid for scope: {scope}"
+            )
+        return [item for item in artifacts if isinstance(item, dict)]
+
+    def download_bench_artifacts(self, scope: str, out_dir: Path) -> list[Path]:
+        """Download one complete bench-local artifact scope."""
+
+        artifacts = self.list_bench_artifacts(scope)
+        if not artifacts:
+            raise RuntimeError(f"bench artifact scope is empty or unavailable: {scope}")
+        scope_dir = out_dir / scope
+        return [
+            self._download_artifact_payload(artifact, scope_dir)
+            for artifact in artifacts
+        ]
+
+    def download_debug_measurement_tree(
+        self,
+        measurement_id: str,
+        out_dir: Path,
+    ) -> list[Path]:
+        """Download every retained file for one measurement, including raw logs."""
+
+        artifacts = self.list_measurement_artifacts(
+            measurement_id,
+            debug_persisted=True,
+        )
+        if not artifacts:
+            raise RuntimeError(f"measurement has no retained artifacts: {measurement_id}")
+        measurement_dir = out_dir / "cmsd" / "measurements" / measurement_id
+        return [
+            self._download_artifact_payload(artifact_to_dict(artifact), measurement_dir)
+            for artifact in artifacts
+        ]
+
     def cancel_measurement(self, measurement_id: str) -> MeasurementResult:
         """Request cancellation for the active measurement when the daemon allows it."""
         return measurement_result_from_dict(
@@ -1359,14 +1421,21 @@ def build_cli_parser() -> argparse.ArgumentParser:
     artifacts = subparsers.add_parser(
         "artifacts",
         aliases=["ARTIFACTS"],
-        help="download artifacts from an explicit measurement",
+        help="list or download artifacts from the CMS Bench",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
             "  cms ARTIFACTS <measurement_id> --out-dir artifacts\n"
-            "  cms ARTIFACTS --debug --out-dir artifacts  # saved debug bundle\n\n"
-            "Optional argument:\n"
+            "  cms ARTIFACTS --debug --out-dir artifacts  # saved debug bundle\n"
+            "  cms ARTIFACTS --list\n"
+            "  cms ARTIFACTS --debug --get all --out-dir artifacts\n"
+            "  cms ARTIFACTS --debug --get <measurement_id> --out-dir artifacts\n"
+            "  cms ARTIFACTS --get-results ble --out-dir artifacts\n\n"
+            "Arguments:\n"
             "  measurement_id   explicit measurement whose artifacts should be downloaded\n\n"
+            "  --list            list recoverable measurement IDs\n"
+            "  --get TARGET      download all CMSD/orchestrator or one debug measurement\n"
+            "  --get-results P   download artifacts/<P> from the bench\n\n"
             "Defaults:\n"
             "  --out-dir artifacts\n\n"
             "Next:\n"
@@ -1385,6 +1454,24 @@ def build_cli_parser() -> argparse.ArgumentParser:
         "--debug",
         action="store_true",
         help="download the saved debug measurement's persistent artifact bundle",
+    )
+    artifacts.add_argument(
+        "--list",
+        action="store_true",
+        help="list recoverable measurement IDs retained by the bench",
+    )
+    artifacts.add_argument(
+        "--get",
+        default="",
+        metavar="TARGET",
+        help="download all bench debug scopes or one debug measurement ID",
+    )
+    artifacts.add_argument(
+        "--get-results",
+        dest="get_results",
+        default="",
+        metavar="PROTOCOL",
+        help="download the bench artifacts/<PROTOCOL> tree",
     )
 
     failed = subparsers.add_parser(
@@ -1650,6 +1737,40 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command in {"artifacts", "ARTIFACTS"}:
+        if args.list:
+            if args.measurement_id or args.get or args.get_results or args.debug:
+                raise RuntimeError("ARTIFACTS --list cannot be combined with download options")
+            _print_saved_measurements(client.list_saved_measurements())
+            return CMSCLIExitCode.SUCCESS
+
+        if args.get_results:
+            if args.measurement_id or args.get or args.debug:
+                raise RuntimeError("ARTIFACTS --get-results cannot be combined with other artifact options")
+            for path in client.download_bench_artifacts(
+                args.get_results,
+                Path(args.out_dir),
+            ):
+                print(path)
+            return CMSCLIExitCode.SUCCESS
+
+        if args.get:
+            if args.measurement_id or not args.debug:
+                raise RuntimeError("ARTIFACTS --get requires --debug and no positional measurement ID")
+            if args.get == "all":
+                downloaded = []
+                for scope in ("cmsd", "orchestrator"):
+                    downloaded.extend(
+                        client.download_bench_artifacts(scope, Path(args.out_dir))
+                    )
+            else:
+                downloaded = client.download_debug_measurement_tree(
+                    args.get,
+                    Path(args.out_dir),
+                )
+            for path in downloaded:
+                print(path)
+            return CMSCLIExitCode.SUCCESS
+
         measurement_id = (
             args.measurement_id
             or _saved_debug_measurement_id(args.config)
@@ -1671,7 +1792,22 @@ def _main(argv: list[str] | None = None) -> int:
         _print_operator_recipes(args)
         return CMSCLIExitCode.SUCCESS
 
-    return CMSCLIExitCode.USAGE_ERROR
+        return CMSCLIExitCode.USAGE_ERROR
+
+
+def _print_saved_measurements(measurements: list[dict[str, Any]]) -> None:
+    """Print a compact operator-facing list of retained measurement IDs."""
+
+    if not measurements:
+        print("no recoverable measurements")
+        return
+    for item in measurements:
+        measurement_id = str(item.get("measurement_id", ""))
+        state = str(item.get("state", "unknown")) or "unknown"
+        manifest = "manifest" if bool(item.get("has_manifest", False)) else "files-only"
+        count = int(item.get("artifact_count", 0))
+        modified = str(item.get("last_modified_at", ""))
+        print(f"{measurement_id} state={state} artifacts={count} {manifest} modified={modified}")
 
 
 def _request_from_send_fw_args(

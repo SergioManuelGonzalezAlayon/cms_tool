@@ -129,6 +129,9 @@ def test_cancel_and_artifacts_help_explain_scope(capsys):
     assert "measurement_id" in artifacts_text
     assert "explicit measurement" in artifacts_text
     assert "cms ARTIFACTS <measurement_id> --out-dir artifacts" in artifacts_text
+    assert "cms ARTIFACTS --list" in artifacts_text
+    assert "cms ARTIFACTS --debug --get all" in artifacts_text
+    assert "cms ARTIFACTS --get-results ble" in artifacts_text
 
 
 def test_recipes_help_lists_focused_workflows(capsys):
