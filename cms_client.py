@@ -11,8 +11,10 @@ import argparse
 import base64
 from datetime import datetime
 import hashlib
+from html import escape as html_escape
 import json
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -78,6 +81,152 @@ from cms_variable_filters import (
 )
 
 CMS_CLIENT_CONFIG = "cms_client_config.json"
+
+_MEASUREMENT_ID_TIMESTAMP_RE = re.compile(
+    r"(?P<date>\d{8})T(?P<time>\d{6})(?:\d{1,6})?Z"
+)
+
+
+def _friendly_measurement_directory_name(measurement_id: str) -> str:
+    """Make a retained measurement ID readable as a local directory name."""
+
+    match = _MEASUREMENT_ID_TIMESTAMP_RE.search(measurement_id)
+    if match is None:
+        return measurement_id
+
+    timestamp = datetime.strptime(
+        f"{match.group('date')}{match.group('time')}",
+        "%Y%m%d%H%M%S",
+    ).strftime("%Y-%m-%d_%H-%M-%S")
+    prefix = measurement_id[: match.start()].rstrip("-")
+    suffix = measurement_id[match.end() :].lstrip("-")[:6]
+    return "-".join(part for part in (prefix, timestamp, suffix) if part)
+
+
+def _junit_duration(value: str) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _write_junit_html_report(xml_path: Path) -> Path:
+    """Render one JUnit XML report as a self-contained local HTML report."""
+
+    root = ET.parse(xml_path).getroot()
+    suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+    if not suites:
+        raise RuntimeError(f"JUnit report contains no test suites: {xml_path}")
+
+    records: list[tuple[ET.Element, ET.Element, str, str]] = []
+    for suite in suites:
+        for testcase in suite.findall(".//testcase"):
+            status = "passed"
+            if testcase.find("error") is not None:
+                status = "error"
+            elif testcase.find("failure") is not None:
+                status = "failed"
+            elif testcase.find("skipped") is not None:
+                status = "skipped"
+            records.append(
+                (
+                    suite,
+                    testcase,
+                    status,
+                    testcase.attrib.get("name", "unnamed test"),
+                )
+            )
+
+    totals = {
+        "tests": len(records),
+        "passed": sum(status == "passed" for _, _, status, _ in records),
+        "failed": sum(status == "failed" for _, _, status, _ in records),
+        "errors": sum(status == "error" for _, _, status, _ in records),
+        "skipped": sum(status == "skipped" for _, _, status, _ in records),
+        "duration": sum(
+            _junit_duration(testcase.attrib.get("time", ""))
+            for _, testcase, _, _ in records
+        ),
+    }
+    report_title = xml_path.stem
+    report_path = xml_path.with_suffix(".html")
+    page: list[str] = [
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+        f"<title>{html_escape(report_title)} - JUnit report</title>",
+        "<style>",
+        ":root { color-scheme: light dark; font-family: system-ui, sans-serif; }",
+        "body { margin: 0 auto; max-width: 1180px; padding: 2rem; line-height: 1.4; }",
+        "h1 { margin-top: 0; }",
+        ".summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: .75rem; margin: 1.5rem 0; }",
+        ".card { border: 1px solid #8886; border-radius: .6rem; padding: .8rem 1rem; }",
+        ".card strong { display: block; font-size: 1.5rem; }",
+        ".suite { border: 1px solid #8886; border-radius: .6rem; margin: 1rem 0; overflow: hidden; }",
+        ".suite > summary { cursor: pointer; padding: .8rem 1rem; font-weight: 700; background: #8882; }",
+        ".test { border-top: 1px solid #8884; padding: .65rem 1rem; }",
+        ".test > summary { cursor: pointer; }",
+        ".status { display: inline-block; min-width: 4.5rem; margin-right: .5rem; font-weight: 700; }",
+        ".passed .status { color: #2e9b55; }",
+        ".failed .status, .error .status { color: #e05252; }",
+        ".skipped .status { color: #c58b2b; }",
+        ".duration { float: right; opacity: .75; }",
+        "pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #8882; border-radius: .4rem; padding: .75rem; }",
+        "small { opacity: .75; }",
+        "</style></head><body>",
+        f"<h1>{html_escape(report_title)}</h1>",
+        "<p><small>Generated from JUnit XML by CMS Bench.</small></p>",
+        "<section class=\"summary\">",
+    ]
+    for label, value in (
+        ("Tests", totals["tests"]),
+        ("Passed", totals["passed"]),
+        ("Failed", totals["failed"]),
+        ("Errors", totals["errors"]),
+        ("Skipped", totals["skipped"]),
+        ("Duration", f"{totals['duration']:.3f}s"),
+    ):
+        page.append(
+            f"<div class=\"card\"><strong>{html_escape(str(value))}</strong>{label}</div>"
+        )
+    page.append("</section>")
+
+    for suite in suites:
+        suite_cases = [record for record in records if record[0] is suite]
+        suite_name = suite.attrib.get("name", "unnamed suite")
+        suite_failed = any(status in {"failed", "error"} for _, _, status, _ in suite_cases)
+        suite_open = " open" if suite_failed else ""
+        page.append(
+            f"<details class=\"suite\"{suite_open}><summary>"
+            f"{html_escape(suite_name)} ({len(suite_cases)} tests)</summary>"
+        )
+        for _, testcase, status, testcase_name in suite_cases:
+            classname = testcase.attrib.get("classname", "")
+            duration = _junit_duration(testcase.attrib.get("time", ""))
+            test_label = f"{classname}::" if classname else ""
+            test_open = " open" if status != "passed" else ""
+            details: list[str] = []
+            for child in testcase:
+                child_name = child.tag.rsplit("}", 1)[-1]
+                if child_name not in {"failure", "error", "system-out", "system-err"}:
+                    continue
+                text = "".join(child.itertext()).strip()
+                if text:
+                    details.append(
+                        f"<p><strong>{html_escape(child_name)}</strong></p>"
+                        f"<pre>{html_escape(text)}</pre>"
+                    )
+            page.append(
+                f"<details class=\"test {status}\"{test_open}><summary>"
+                f"<span class=\"status\">{status.upper()}</span>"
+                f"{html_escape(test_label)}{html_escape(testcase_name)}"
+                f"<span class=\"duration\">{duration:.3f}s</span></summary>"
+                f"{''.join(details)}</details>"
+            )
+        page.append("</details>")
+
+    page.append("</section></body></html>")
+    report_path.write_text("".join(page), encoding="utf-8")
+    return report_path
 TERMINAL_MEASUREMENT_STATES = frozenset(
     {
         MeasurementState.PASSED,
@@ -659,7 +808,12 @@ class CMSClient:
         )
         if not artifacts:
             raise RuntimeError(f"measurement has no retained artifacts: {measurement_id}")
-        measurement_dir = out_dir / "cmsd" / "measurements" / measurement_id
+        measurement_dir = (
+            out_dir
+            / "cmsd"
+            / "measurements"
+            / _friendly_measurement_directory_name(measurement_id)
+        )
         return self._download_artifact_list(
             [artifact_to_dict(artifact) for artifact in artifacts],
             measurement_dir,
@@ -686,7 +840,12 @@ class CMSClient:
             ]
             if not junit_artifacts:
                 continue
-            measurement_dir = out_dir / "cmsd" / "measurements" / measurement_id
+            measurement_dir = (
+                out_dir
+                / "cmsd"
+                / "measurements"
+                / _friendly_measurement_directory_name(measurement_id)
+            )
             downloaded.extend(
                 self._download_artifact_list(
                     [artifact_to_dict(artifact) for artifact in junit_artifacts],
@@ -1501,12 +1660,14 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms ARTIFACTS --debug --out-dir artifacts  # saved debug bundle\n"
             "  cms ARTIFACTS --list\n"
             "  cms ARTIFACTS --debug --get all --out-dir artifacts\n"
+            "  cms ARTIFACTS --debug --get junit --html --out-dir artifacts\n"
             "  cms ARTIFACTS --debug --get <measurement_id> --out-dir artifacts\n"
             "  cms ARTIFACTS --get-results ble --out-dir artifacts\n\n"
             "Arguments:\n"
             "  measurement_id   explicit measurement whose artifacts should be downloaded\n\n"
             "  --list            list recoverable measurement IDs\n"
-            "  --get TARGET      download all CMSD/orchestrator or one debug measurement\n"
+            "  --get TARGET      download all CMSD/orchestrator, JUnit, or one debug measurement\n"
+            "  --html            render downloaded JUnit XML as local HTML reports\n"
             "  --get-results P   download artifacts/<P> from the bench\n\n"
             "Defaults:\n"
             "  --out-dir artifacts\n\n"
@@ -1537,6 +1698,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
         default="",
         metavar="TARGET",
         help="download all bench debug scopes, JUnit reports, or one debug measurement ID",
+    )
+    artifacts.add_argument(
+        "--html",
+        action="store_true",
+        help="render downloaded JUnit XML as local HTML reports; requires --get junit",
     )
     artifacts.add_argument(
         "--get-results",
@@ -1809,6 +1975,9 @@ def _main(argv: list[str] | None = None) -> int:
         )
 
     if args.command in {"artifacts", "ARTIFACTS"}:
+        if args.html and (not args.get or args.get.strip().lower() != "junit"):
+            raise RuntimeError("ARTIFACTS --html requires --get junit")
+
         if args.list:
             if args.measurement_id or args.get or args.get_results or args.debug:
                 raise RuntimeError("ARTIFACTS --list cannot be combined with download options")
@@ -1846,6 +2015,9 @@ def _main(argv: list[str] | None = None) -> int:
                     Path(args.out_dir),
                 )
             print(f"downloaded {len(downloaded)} artifacts to {Path(args.out_dir)}")
+            if args.html:
+                html_reports = [_write_junit_html_report(path) for path in downloaded]
+                print(f"generated {len(html_reports)} HTML reports")
             return CMSCLIExitCode.SUCCESS
 
         measurement_id = (
