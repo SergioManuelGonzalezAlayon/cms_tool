@@ -58,6 +58,7 @@ from cms_protocol import (
     MeasurementResult,
     MeasurementState,
     MeasurementSummary,
+    ResultType,
     SuiteSelector,
     VariableFilter,
     artifact_from_dict,
@@ -664,6 +665,38 @@ class CMSClient:
             measurement_dir,
             description=f"debug {measurement_id}",
         )
+
+    def download_debug_junit_artifacts(self, out_dir: Path) -> list[Path]:
+        """Download only JUnit XML files from all retained debug measurements."""
+
+        downloaded: list[Path] = []
+        for measurement in self.list_saved_measurements():
+            measurement_id = str(measurement.get("measurement_id", "")).strip()
+            if not measurement_id:
+                continue
+            artifacts = self.list_measurement_artifacts(
+                measurement_id,
+                debug_persisted=True,
+            )
+            junit_artifacts = [
+                artifact
+                for artifact in artifacts
+                if artifact.result_type is ResultType.PYTEST_JUNIT
+                or Path(artifact.name.replace("\\", "/")).suffix.lower() == ".xml"
+            ]
+            if not junit_artifacts:
+                continue
+            measurement_dir = out_dir / "cmsd" / "measurements" / measurement_id
+            downloaded.extend(
+                self._download_artifact_list(
+                    [artifact_to_dict(artifact) for artifact in junit_artifacts],
+                    measurement_dir,
+                    description=f"junit {measurement_id}",
+                )
+            )
+        if not downloaded:
+            raise RuntimeError("no persisted debug JUnit artifacts are available")
+        return downloaded
 
     def cancel_measurement(self, measurement_id: str) -> MeasurementResult:
         """Request cancellation for the active measurement when the daemon allows it."""
@@ -1503,7 +1536,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         "--get",
         default="",
         metavar="TARGET",
-        help="download all bench debug scopes or one debug measurement ID",
+        help="download all bench debug scopes, JUnit reports, or one debug measurement ID",
     )
     artifacts.add_argument(
         "--get-results",
@@ -1795,7 +1828,8 @@ def _main(argv: list[str] | None = None) -> int:
         if args.get:
             if args.measurement_id or not args.debug:
                 raise RuntimeError("ARTIFACTS --get requires --debug and no positional measurement ID")
-            if args.get == "all":
+            target = args.get.strip().lower()
+            if target == "all":
                 downloaded = []
                 for scope in ("cmsd", "orchestrator"):
                     downloaded.extend(
@@ -1804,6 +1838,8 @@ def _main(argv: list[str] | None = None) -> int:
                             Path(args.out_dir),
                         )
                     )
+            elif target == "junit":
+                downloaded = client.download_debug_junit_artifacts(Path(args.out_dir))
             else:
                 downloaded = client.download_debug_measurement_tree(
                     args.get,
@@ -2034,6 +2070,8 @@ def _request_from_diff_build_manifest(args: argparse.Namespace, build_root: Path
         artifacts = firmware.get("artifacts")
         if not isinstance(artifacts, list):
             raise RuntimeError(f"Differential {name} build manifest has no firmware artifacts")
+        xapi_path = str(build.get("xapi", ""))
+        xapi_hash = str(sdk.get("xapi_sha256", ""))
         all_role_images = tuple(
             FirmwareRoleImage(
                 role=str(item.get("role", "")),
@@ -2062,8 +2100,6 @@ def _request_from_diff_build_manifest(args: argparse.Namespace, build_root: Path
                 f"Differential {name} build contains non-flashable firmware artifact(s): "
                 f"{', '.join(unsupported_roles)}. Run `cms BUILD --diff` to produce .s37 or .hex images."
             )
-        xapi_path = str(build.get("xapi", ""))
-        xapi_hash = str(sdk.get("xapi_sha256", ""))
         return FirmwareData(
             dut_img=by_role["dut_dcdc"],
             tester_img=by_role["tester"],

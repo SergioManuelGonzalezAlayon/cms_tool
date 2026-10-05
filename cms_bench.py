@@ -1352,7 +1352,7 @@ def _prepare_pytest_runtime(
         tester_project,
     )
     bootloader_copied_image = _copy_bootloader_image(session, build_root, active_root)
-    xapi_path = _staged_xapi_path(session, active_root)
+    xapi_path = _verified_xapi_path(session, active_root)
 
     metadata = {
         "identity": (
@@ -1498,6 +1498,35 @@ def _staged_xapi_path(session: BenchSession, active_root: Path | None = None) ->
     if not xapi_path.exists():
         raise RuntimeError(f"staged sl_bt.xapi is missing: {xapi_path}")
     return xapi_path
+
+
+def _verified_xapi_path(session: BenchSession, active_root: Path | None = None) -> Path:
+    """Validate and cache the staged XAPI before handing it to pytest."""
+
+    staged_path = _staged_xapi_path(session, active_root)
+    if session.manifest.xapi_file is None:
+        raise RuntimeError("sl_bt.xapi was not supplied by the CMS client")
+    expected_sha256 = (session.manifest.xapi_file.sha256 or session.manifest.xapi_file_hash).strip()
+    if not expected_sha256:
+        raise RuntimeError("sl_bt.xapi SHA-256 was not supplied by the CMS client")
+
+    actual_sha256 = _sha256_file(staged_path)
+    if actual_sha256.lower() != expected_sha256.lower():
+        raise RuntimeError(
+            "sl_bt.xapi hash mismatch: "
+            f"expected={expected_sha256} actual={actual_sha256}"
+        )
+
+    cache_root = (active_root or session.runtime_dir) / ".xapi-cache"
+    cached_path = cache_root / f"{actual_sha256}.xapi"
+    if cached_path.exists():
+        _validate_firmware_file(cached_path, actual_sha256)
+        return cached_path
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(staged_path, cached_path)
+    _validate_firmware_file(cached_path, actual_sha256)
+    return cached_path
 
 
 def _copy_image_to_project(source: Path, project_dir: Path) -> Path:
@@ -1876,6 +1905,13 @@ def _run_test_orchestrator(
         cmd.extend(["--variable", f"{variable_filter.name}={variable_filter.value}"])
     if session.request.upload_results_to_database:
         cmd.append("--upload-results-to-database")
+    if session.request.debug_artifact_streaming:
+        cmd.extend(
+            [
+                "--aggregate-junit",
+                str(session.runtime_dir / "junit" / "campaign.xml"),
+            ]
+        )
     if session.job_plan_path is not None:
         cmd.extend(["--job-plan", str(session.job_plan_path)])
     if session.variant:

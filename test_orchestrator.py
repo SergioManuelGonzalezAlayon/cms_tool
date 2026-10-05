@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -370,6 +371,36 @@ def junit_path_for_job(results_log: Path, job: Job, ordinal: int) -> Path:
     return results_log.parent / "junit" / filename
 
 
+def aggregate_junit_reports(report_paths: list[Path], output_path: Path) -> Path:
+    """Combine per-job pytest reports into one campaign-level JUnit document."""
+
+    aggregate = ET.Element("testsuites", {"name": "CMS Bench pytest tests"})
+    totals = {name: 0 for name in ("tests", "errors", "failures", "skipped")}
+    total_time = 0.0
+    for report_path in sorted(report_paths):
+        if not report_path.is_file():
+            continue
+        report_root = ET.parse(report_path).getroot()
+        suites = (
+            [report_root]
+            if report_root.tag == "testsuite"
+            else list(report_root.findall("testsuite"))
+        )
+        for suite in suites:
+            suite.set("cms_report", report_path.name)
+            aggregate.append(suite)
+            for name in totals:
+                totals[name] += int(suite.attrib.get(name, "0") or 0)
+            total_time += float(suite.attrib.get("time", "0") or 0.0)
+
+    for name, value in totals.items():
+        aggregate.set(name, str(value))
+    aggregate.set("time", f"{total_time:.6f}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ET.ElementTree(aggregate).write(output_path, encoding="utf-8", xml_declaration=True)
+    return output_path
+
+
 def job_record(
     job: Job,
     ordinal: int,
@@ -564,6 +595,8 @@ def run_job(
     job: Job,
     pytest_args: list[str],
     junit_path: Path,
+    *,
+    include_junit_logs: bool = False,
 ) -> tuple[int, float]:
     cmd = [
         sys.executable,
@@ -578,6 +611,8 @@ def run_job(
         "log_cli=true",
         "--log-cli-level=INFO",
     ]
+    if include_junit_logs:
+        cmd.extend(["-o", "junit_logging=all"])
     cmd.extend(pytest_args)
     junit_path.parent.mkdir(parents=True, exist_ok=True)
     cmd.extend(["--junitxml", str(junit_path)])
@@ -683,6 +718,11 @@ def parse_args_with_pytest(argv: list[str]) -> tuple[argparse.Namespace, list[st
         "--results-log",
         default=str(DEFAULT_RESULTS_LOG),
         help="Path to the JSONL results log.",
+    )
+    parser.add_argument(
+        "--aggregate-junit",
+        default="",
+        help="Write one campaign-level JUnit XML file from all per-job reports.",
     )
     parser.add_argument(
         "--cms-runtime-config",
@@ -800,6 +840,8 @@ def main(argv: list[str] | None = None) -> int:
         job.job_id: junit_path_for_job(results_log, job, ordinal)
         for ordinal, job in enumerate(jobs, start=1)
     }
+    aggregate_junit_path = Path(parsed.aggregate_junit) if parsed.aggregate_junit else None
+    include_junit_logs = aggregate_junit_path is not None
 
     if parsed.resume:
         done = completed_job_ids(results_log)
@@ -827,7 +869,12 @@ def main(argv: list[str] | None = None) -> int:
             job_started_record(job, ordinal, total_jobs, started_at, junit_path),
         )
         retry_count = 0
-        returncode, duration_s = run_job(job, pytest_args, junit_path)
+        returncode, duration_s = run_job(
+            job,
+            pytest_args,
+            junit_path,
+            include_junit_logs=include_junit_logs,
+        )
         while (
             returncode == RETRYABLE_STARTUP_EXIT_CODE
             and retry_count < TEST_RETRY_COUNT
@@ -841,7 +888,12 @@ def main(argv: list[str] | None = None) -> int:
                     "warning",
                 )
             )
-            retry_returncode, retry_duration_s = run_job(job, pytest_args, junit_path)
+            retry_returncode, retry_duration_s = run_job(
+                job,
+                pytest_args,
+                junit_path,
+                include_junit_logs=include_junit_logs,
+            )
             returncode = retry_returncode
             duration_s += retry_duration_s
         finished_at = datetime.now(timezone.utc).isoformat()
@@ -868,10 +920,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             if parsed.max_fail and failures >= parsed.max_fail:
                 print(colors.color(f"Stopping early after {failures} failure(s).", "warning"))
+                if aggregate_junit_path is not None:
+                    aggregate_junit_reports(list(junit_paths.values()), aggregate_junit_path)
                 return 1
         else:
             print(colors.color(f"Passed {ordinal}/{total_jobs}: {job.cfg_arg}", "passed"))
 
+    if aggregate_junit_path is not None:
+        aggregate_junit_reports(list(junit_paths.values()), aggregate_junit_path)
     return 1 if failures else 0
 
 
