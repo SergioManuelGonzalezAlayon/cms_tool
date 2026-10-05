@@ -23,6 +23,7 @@ dependencies = [
   "fastapi>=0.115",
   "uvicorn>=0.30",
   "silabs-datalake-client",
+  "tqdm>=4.70.1",
 ]
 
 [tool.setuptools]

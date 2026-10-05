@@ -27,6 +27,7 @@ from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Callable
+from tqdm import tqdm
 
 from cms_colors import COLOR_CHOICES, ColorFormatter, color_formatter, state_role
 from cms_diff_comparison import (
@@ -627,17 +628,22 @@ class CMSClient:
             )
         return [item for item in artifacts if isinstance(item, dict)]
 
-    def download_bench_artifacts(self, scope: str, out_dir: Path) -> list[Path]:
+    def download_bench_artifacts(
+        self,
+        scope: str,
+        out_dir: Path,
+    ) -> list[Path]:
         """Download one complete bench-local artifact scope."""
 
         artifacts = self.list_bench_artifacts(scope)
         if not artifacts:
             raise RuntimeError(f"bench artifact scope is empty or unavailable: {scope}")
         scope_dir = out_dir / scope
-        return [
-            self._download_artifact_payload(artifact, scope_dir)
-            for artifact in artifacts
-        ]
+        return self._download_artifact_list(
+            artifacts,
+            scope_dir,
+            description=scope,
+        )
 
     def download_debug_measurement_tree(
         self,
@@ -653,10 +659,11 @@ class CMSClient:
         if not artifacts:
             raise RuntimeError(f"measurement has no retained artifacts: {measurement_id}")
         measurement_dir = out_dir / "cmsd" / "measurements" / measurement_id
-        return [
-            self._download_artifact_payload(artifact_to_dict(artifact), measurement_dir)
-            for artifact in artifacts
-        ]
+        return self._download_artifact_list(
+            [artifact_to_dict(artifact) for artifact in artifacts],
+            measurement_dir,
+            description=f"debug {measurement_id}",
+        )
 
     def cancel_measurement(self, measurement_id: str) -> MeasurementResult:
         """Request cancellation for the active measurement when the daemon allows it."""
@@ -692,10 +699,35 @@ class CMSClient:
         )
         if not artifacts:
             raise RuntimeError(f"measurement has no published artifacts: {measurement_id}")
-        return [
-            self._download_artifact_payload(artifact_to_dict(artifact), out_dir)
-            for artifact in artifacts
-        ]
+        return self._download_artifact_list(
+            [artifact_to_dict(artifact) for artifact in artifacts],
+            out_dir,
+            description=measurement_id,
+        )
+
+    def _download_artifact_list(
+        self,
+        artifacts: list[dict[str, Any]],
+        out_dir: Path,
+        *,
+        description: str,
+    ) -> list[Path]:
+        downloaded: list[Path] = []
+        with tqdm(
+            total=len(artifacts),
+            desc=description,
+            unit="file",
+            dynamic_ncols=True,
+            leave=False,
+            file=sys.stderr,
+        ) as progress:
+            for artifact in artifacts:
+                path = self._download_artifact_payload(artifact, out_dir)
+                downloaded.append(path)
+                name = Path(str(artifact.get("name", ""))).name
+                progress.set_postfix_str(name[:48], refresh=False)
+                progress.update(1)
+        return downloaded
 
     def failed_tests(self, measurement_id: str) -> list[dict[str, str]]:
         """Return failed test identities from structured orchestrator results."""
@@ -789,9 +821,16 @@ class CMSClient:
         destination.parent.mkdir(parents=True, exist_ok=True)
         source_url = str(artifact.get("url", ""))
         source_path = str(artifact.get("path", ""))
-        if source_path and Path(source_path).exists():
-            shutil.copy2(source_path, destination)
-            return destination
+        if source_path:
+            local_source = Path(source_path)
+            if local_source.is_absolute() and local_source.exists():
+                try:
+                    same_file = local_source.resolve() == destination.resolve()
+                except OSError:
+                    same_file = False
+                if not same_file:
+                    shutil.copy2(local_source, destination)
+                    return destination
         try:
             if source_url.startswith("http://") or source_url.startswith("https://"):
                 urllib.request.urlretrieve(source_url, destination)
@@ -1746,11 +1785,11 @@ def _main(argv: list[str] | None = None) -> int:
         if args.get_results:
             if args.measurement_id or args.get or args.debug:
                 raise RuntimeError("ARTIFACTS --get-results cannot be combined with other artifact options")
-            for path in client.download_bench_artifacts(
+            downloaded = client.download_bench_artifacts(
                 args.get_results,
                 Path(args.out_dir),
-            ):
-                print(path)
+            )
+            print(f"downloaded {len(downloaded)} artifacts to {Path(args.out_dir) / args.get_results}")
             return CMSCLIExitCode.SUCCESS
 
         if args.get:
@@ -1760,27 +1799,29 @@ def _main(argv: list[str] | None = None) -> int:
                 downloaded = []
                 for scope in ("cmsd", "orchestrator"):
                     downloaded.extend(
-                        client.download_bench_artifacts(scope, Path(args.out_dir))
+                        client.download_bench_artifacts(
+                            scope,
+                            Path(args.out_dir),
+                        )
                     )
             else:
                 downloaded = client.download_debug_measurement_tree(
                     args.get,
                     Path(args.out_dir),
                 )
-            for path in downloaded:
-                print(path)
+            print(f"downloaded {len(downloaded)} artifacts to {Path(args.out_dir)}")
             return CMSCLIExitCode.SUCCESS
 
         measurement_id = (
             args.measurement_id
             or _saved_debug_measurement_id(args.config)
         )
-        for path in client.download_measurement_artifacts(
+        downloaded = client.download_measurement_artifacts(
             measurement_id,
             Path(args.out_dir),
             debug_persisted=args.debug,
-        ):
-            print(path)
+        )
+        print(f"downloaded {len(downloaded)} artifacts to {Path(args.out_dir)}")
         return CMSCLIExitCode.SUCCESS
 
     if args.command in {"failed", "FAILED"}:

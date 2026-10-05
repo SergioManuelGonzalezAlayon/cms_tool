@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import cms_client
 from cms_client import CMSClient, CMSProtocolMismatchError
 from cms_protocol import (
     CMS_OBSERVATION_PROTOCOL_VERSION,
@@ -289,3 +290,43 @@ def test_client_lists_saved_measurements_and_downloads_bench_scopes(tmp_path: Pa
         f"/measurement/{MEASUREMENT_ID}/artifacts?storage=debug&protocol_version="
         f"{CMS_OBSERVATION_PROTOCOL_VERSION}",
     ]
+
+
+def test_client_uses_remote_url_for_relative_server_artifact_paths(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    destination_dir = tmp_path / "artifacts" / "cmsd"
+    destination_dir.mkdir(parents=True)
+    (destination_dir / "result.json").write_text("stale\n", encoding="utf-8")
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self):
+            return b"remote\n"
+
+    def urlopen(request, timeout):
+        assert request == "http://cms-bench:8000/bench/artifacts/cmsd/result.json"
+        assert timeout == 30.0
+        return Response()
+
+    monkeypatch.setattr(cms_client.urllib.request, "urlopen", urlopen)
+    client = _client(lambda method, path: {})
+
+    saved = client._download_artifact_payload(
+        {
+            "name": "result.json",
+            "path": "artifacts/cmsd/result.json",
+            "url": "/bench/artifacts/cmsd/result.json",
+        },
+        destination_dir,
+    )
+
+    assert saved == destination_dir / "result.json"
+    assert saved.read_text(encoding="utf-8") == "remote\n"
