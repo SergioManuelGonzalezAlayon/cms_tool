@@ -164,6 +164,38 @@ def _upload_results_to_database_from_env() -> bool:
         or _env_flag("CURRRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE")
     )
 
+
+def _upload_status_path(out_dir: Path, artifact_stem: str) -> Path:
+    return out_dir / f"{artifact_stem}_upload_status.json"
+
+
+def _write_upload_status(
+    path: Path,
+    *,
+    status: str,
+    phase: str,
+    result_json_path: Path | None = None,
+    png_path: Path | None = None,
+    error: str = "",
+) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": status,
+                "phase": phase,
+                "result_json_path": _relative_path(result_json_path),
+                "png_path": _relative_path(png_path),
+                "upload_results_to_database": status != "disabled",
+                "error": error,
+                "updated_at": utc_now(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
 def _result_phy(test_name: str, advertiser: dict, scanner: dict, connection: dict):
     if test_name == "scanner":
         return scanner.get("phy")
@@ -645,39 +677,96 @@ class ResultGenerator:
         measured_at: str | None = None,
     ) -> Path:    
         effective_measured_at = measured_at or utc_now()
-        result_json_path = write_result_json(
-            profile=profile,
-            out_dir=out_dir,
-            artifact_stem=artifact_stem,
-            test_name=self.context.test_name,
-            config_name=self.context.config_name,
-            config_path=self.context.config_path,
-            config_data=self.context.config_data,
-            result_paths=result_paths,
-            measured_at=effective_measured_at,
-            campaign_id=self.context.campaign_id,
-            supply_v=self.context.supply_v,
-            retain_capture=self.retain_captures_for_debug,
-        )
+        status_path = _upload_status_path(out_dir, artifact_stem)
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        result_json_path = None
         png_path = None
-        capture_path = out_dir / f"{artifact_stem}_capture.npz"
-        if self.upload_results_to_database and capture_path.is_file():
-            from utils.render_capture_image import render_capture_image
-
-            png_path = render_capture_image(
-                capture_path,
-                output_path=capture_path.with_suffix(".png"),
-                result_json_path=result_json_path,
-            )
-        if self.upload_results_to_database:
-            upload_metadata = _upload_metadata(
+        phase = "result_json"
+        _write_upload_status(status_path, status="running", phase=phase)
+        try:
+            result_json_path = write_result_json(
+                profile=profile,
+                out_dir=out_dir,
+                artifact_stem=artifact_stem,
+                test_name=self.context.test_name,
+                config_name=self.context.config_name,
                 config_path=self.context.config_path,
                 config_data=self.context.config_data,
+                result_paths=result_paths,
                 measured_at=effective_measured_at,
+                campaign_id=self.context.campaign_id,
+                supply_v=self.context.supply_v,
+                retain_capture=self.retain_captures_for_debug,
             )
-            response = upload_result_json_to_database(result_json_path, **upload_metadata)
-            log.info("Result JSON uploaded to database: %s", response)
-            if png_path is not None:
-                response = upload_result_file_to_database(png_path, **upload_metadata)
-                log.info("Result PNG uploaded to database: %s", response)
-        return result_json_path
+            log.info("Result JSON written: %s", result_json_path)
+            _write_upload_status(
+                status_path,
+                status="running" if self.upload_results_to_database else "disabled",
+                phase="render_png" if self.upload_results_to_database else "complete",
+                result_json_path=result_json_path,
+            )
+
+            capture_path = out_dir / f"{artifact_stem}_capture.npz"
+            if self.upload_results_to_database and capture_path.is_file():
+                phase = "render_png"
+                from utils.render_capture_image import render_capture_image
+
+                png_path = render_capture_image(
+                    capture_path,
+                    output_path=capture_path.with_suffix(".png"),
+                    result_json_path=result_json_path,
+                )
+                _write_upload_status(
+                    status_path,
+                    status="running",
+                    phase="upload_json",
+                    result_json_path=result_json_path,
+                    png_path=png_path,
+                )
+
+            if self.upload_results_to_database:
+                upload_metadata = _upload_metadata(
+                    config_path=self.context.config_path,
+                    config_data=self.context.config_data,
+                    measured_at=effective_measured_at,
+                )
+                phase = "upload_json"
+                _write_upload_status(
+                    status_path,
+                    status="running",
+                    phase=phase,
+                    result_json_path=result_json_path,
+                    png_path=png_path,
+                )
+                response = upload_result_json_to_database(result_json_path, **upload_metadata)
+                log.info("Result JSON uploaded to database: %s", response)
+                if png_path is not None:
+                    phase = "upload_png"
+                    _write_upload_status(
+                        status_path,
+                        status="running",
+                        phase=phase,
+                        result_json_path=result_json_path,
+                        png_path=png_path,
+                    )
+                    response = upload_result_file_to_database(png_path, **upload_metadata)
+                    log.info("Result PNG uploaded to database: %s", response)
+                _write_upload_status(
+                    status_path,
+                    status="uploaded",
+                    phase="complete",
+                    result_json_path=result_json_path,
+                    png_path=png_path,
+                )
+            return result_json_path
+        except Exception as exc:
+            _write_upload_status(
+                status_path,
+                status="failed",
+                phase=phase,
+                result_json_path=result_json_path,
+                png_path=png_path,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            log.exception("Result processing failed during %s", phase)
+            raise

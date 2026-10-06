@@ -1,5 +1,8 @@
+import json
 from pathlib import Path
 import importlib.util
+
+import pytest
 
 
 _RESULTS_GENERATOR_PATH = Path(__file__).with_name("results_generator.py")
@@ -33,6 +36,46 @@ def test_explicit_upload_flag_overrides_env(monkeypatch):
     generator = results_generator.ResultGenerator(upload_results_to_database=False)
 
     assert generator.upload_results_to_database is False
+
+
+def test_result_generator_records_upload_phase_failure(tmp_path, monkeypatch):
+    result_json = tmp_path / "beacon_default_result.json"
+    result_json.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        results_generator,
+        "write_result_json",
+        lambda **kwargs: result_json,
+    )
+    monkeypatch.setattr(results_generator, "_upload_metadata", lambda **kwargs: {})
+    monkeypatch.setattr(
+        results_generator,
+        "upload_result_json_to_database",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+
+    generator = results_generator.ResultGenerator(upload_results_to_database=True)
+    generator.set_context(
+        test_name="beacon",
+        config_name="default",
+        config_path=Path("tests/configs/ble/beacon/default.json"),
+        config_data={},
+        supply_v=2.4,
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        generator.write(
+            profile={},
+            out_dir=tmp_path,
+            artifact_stem="beacon_default",
+            result_paths={},
+        )
+
+    status = json.loads(
+        (tmp_path / "beacon_default_upload_status.json").read_text(encoding="utf-8")
+    )
+    assert status["status"] == "failed"
+    assert status["phase"] == "upload_json"
+    assert "database unavailable" in status["error"]
 
 
 def test_result_storage_metadata_uses_config_and_firmware_identity():

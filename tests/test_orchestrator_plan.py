@@ -53,6 +53,32 @@ def test_job_plan_preserves_complete_discovery_order():
     ]
 
 
+def test_result_tracking_reads_current_upload_status(tmp_path, monkeypatch):
+    job = _job("default")
+    monkeypatch.setattr(orchestrator, "REPO_ROOT", tmp_path)
+    paths = orchestrator.result_artifact_paths(job)
+    paths["result_json"].parent.mkdir(parents=True)
+    paths["result_json"].write_text("{}\n", encoding="utf-8")
+    paths["upload_status"].write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "phase": "upload_json",
+                "error": "database unavailable",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tracking = orchestrator.result_tracking_for_job(job, 0)
+
+    assert tracking["result_json_exists"] is True
+    assert tracking["upload_status_exists"] is True
+    assert tracking["upload_status"] == "failed"
+    assert tracking["upload_phase"] == "upload_json"
+    assert tracking["upload_error"] == "database unavailable"
+
+
 def test_main_writes_complete_plan_before_first_pytest_job(tmp_path, monkeypatch):
     jobs = [_job("first"), _job("second")]
     results_log = tmp_path / "orchestrator_results.jsonl"
@@ -128,10 +154,25 @@ def test_orchestrator_retries_only_retryable_startup_failures(tmp_path, monkeypa
     records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
     assert [record["record_type"] for record in records] == [
         "job_started",
+        "job_retry",
+        "job_retry",
         "job_completed",
         "job_started",
         "job_completed",
     ]
+    assert [record["status"] for record in records] == [
+        "running",
+        "running",
+        "running",
+        "passed",
+        "running",
+        "passed",
+    ]
+    assert records[1]["retry_reason"] == "retryable_startup_failure"
+    assert records[1]["retry_count"] == 1
+    assert records[2]["retry_count"] == 2
+    assert records[3]["attempt_count"] == 3
+    assert records[3]["retry_count"] == 2
 
 
 def test_orchestrator_continues_after_exhausting_retryable_startup_retries(tmp_path, monkeypatch):
@@ -159,10 +200,24 @@ def test_orchestrator_continues_after_exhausting_retryable_startup_retries(tmp_p
     records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
     assert [record["status"] for record in records] == [
         "running",
+        "running",
+        "running",
+        "running",
         "failed",
         "running",
         "passed",
     ]
+    assert [record["record_type"] for record in records] == [
+        "job_started",
+        "job_retry",
+        "job_retry",
+        "job_retry",
+        "job_completed",
+        "job_started",
+        "job_completed",
+    ]
+    assert records[4]["attempt_count"] == 4
+    assert records[4]["retry_count"] == 3
 
 
 def test_orchestrator_does_not_retry_ordinary_pytest_failures(tmp_path, monkeypatch):

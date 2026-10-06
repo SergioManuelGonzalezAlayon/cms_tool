@@ -371,6 +371,63 @@ def junit_path_for_job(results_log: Path, job: Job, ordinal: int) -> Path:
     return results_log.parent / "junit" / filename
 
 
+def _artifact_component(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+
+
+def result_artifact_paths(job: Job) -> dict[str, Path]:
+    """Return the deterministic result paths produced by one pytest job."""
+
+    if job.mode == "full_sweep":
+        output_dir = REPO_ROOT / "artifacts" / job.suite / job.feature / "full_sweep" / job.partition
+    elif job.mode == "default":
+        output_dir = REPO_ROOT / "artifacts" / job.suite / job.feature / "default"
+    else:
+        output_dir = REPO_ROOT / "artifacts" / job.suite / job.feature / "one_factor"
+    artifact_stem = f"{_artifact_component(job.feature)}_{_artifact_component(Path(job.cfg_arg).stem)}"
+    return {
+        "result_json": output_dir / f"{artifact_stem}_result.json",
+        "upload_status": output_dir / f"{artifact_stem}_upload_status.json",
+    }
+
+
+def result_tracking_for_job(job: Job, started_at_ns: int) -> dict[str, object]:
+    """Read only result state created or updated by this job execution."""
+
+    paths = result_artifact_paths(job)
+    tracking: dict[str, object] = {
+        "result_json_path": str(paths["result_json"]),
+        "result_json_exists": False,
+        "upload_status_path": str(paths["upload_status"]),
+        "upload_status_exists": False,
+        "upload_status": "missing",
+        "upload_phase": "missing",
+        "upload_error": "",
+    }
+    result_path = paths["result_json"]
+    if result_path.is_file() and result_path.stat().st_mtime_ns >= started_at_ns:
+        tracking["result_json_exists"] = True
+    status_path = paths["upload_status"]
+    if not status_path.is_file() or status_path.stat().st_mtime_ns < started_at_ns:
+        return tracking
+    try:
+        status = load_json(status_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        tracking["upload_status_exists"] = True
+        tracking["upload_status"] = "invalid"
+        tracking["upload_error"] = f"{type(exc).__name__}: {exc}"
+        return tracking
+    tracking.update(
+        {
+            "upload_status_exists": True,
+            "upload_status": str(status.get("status", "unknown")),
+            "upload_phase": str(status.get("phase", "unknown")),
+            "upload_error": str(status.get("error", "")),
+        }
+    )
+    return tracking
+
+
 def aggregate_junit_reports(report_paths: list[Path], output_path: Path) -> Path:
     """Combine per-job pytest reports into one campaign-level JUnit document."""
 
@@ -534,6 +591,9 @@ def job_completed_record(
     started_at: str,
     finished_at: str,
     junit_path: Path,
+    *,
+    retry_count: int = 0,
+    result_tracking: dict[str, object] | None = None,
 ) -> dict:
     status = TestCaseState.PASSED if returncode == 0 else TestCaseState.FAILED
     record = job_record(job, ordinal, total_jobs, junit_path)
@@ -547,6 +607,39 @@ def job_completed_record(
             "duration_s": round(duration_s, 3),
             "status": status.value,
             "result_type": ResultType.PYTEST_JUNIT.value,
+            "attempt_count": retry_count + 1,
+            "retry_count": retry_count,
+            "result_tracking": result_tracking or {},
+        }
+    )
+    return record
+
+
+def job_retry_record(
+    job: Job,
+    ordinal: int,
+    total_jobs: int,
+    returncode: int,
+    duration_s: float,
+    timestamp: str,
+    junit_path: Path,
+    *,
+    retry_count: int,
+) -> dict:
+    """Record a retryable attempt without making it a terminal test failure."""
+
+    record = job_record(job, ordinal, total_jobs, junit_path)
+    record.update(
+        {
+            "record_type": "job_retry",
+            "timestamp": timestamp,
+            "status": TestCaseState.RUNNING.value,
+            "attempt": retry_count,
+            "attempt_count": retry_count,
+            "retry_count": retry_count,
+            "exit_code": returncode,
+            "duration_s": round(duration_s, 3),
+            "retry_reason": "retryable_startup_failure",
         }
     )
     return record
@@ -877,6 +970,7 @@ def main(argv: list[str] | None = None) -> int:
             job_started_record(job, ordinal, total_jobs, started_at, junit_path),
         )
         retry_count = 0
+        job_started_ns = time.time_ns()
         returncode, duration_s = run_job(
             job,
             pytest_args,
@@ -888,6 +982,19 @@ def main(argv: list[str] | None = None) -> int:
             and retry_count < TEST_RETRY_COUNT
         ):
             retry_count += 1
+            append_result(
+                results_log,
+                job_retry_record(
+                    job,
+                    ordinal,
+                    total_jobs,
+                    returncode,
+                    duration_s,
+                    datetime.now(timezone.utc).isoformat(),
+                    junit_path,
+                    retry_count=retry_count,
+                ),
+            )
             print(
                 colors.color(
                     f"Retrying {ordinal}/{total_jobs}: {job.cfg_arg} "
@@ -916,6 +1023,8 @@ def main(argv: list[str] | None = None) -> int:
                 started_at,
                 finished_at,
                 junit_path,
+                retry_count=retry_count,
+                result_tracking=result_tracking_for_job(job, job_started_ns),
             ),
         )
         if returncode != 0:
