@@ -637,7 +637,11 @@ class CMSClient:
 
         config_hash = (
             ""
-            if feature == "all" or _is_mutable_custom_config_name(config)
+            if (
+                feature == "all"
+                or _is_mutable_custom_config_name(config)
+                or (mode is not MeasurementMode.DEFAULT and config == "default")
+            )
             else _validate_local_test_config(feature, config)
         )
         payload = self._request_json(
