@@ -1,9 +1,6 @@
-import hashlib
-import json
 import os
 import re
 from pathlib import Path
-from datetime import datetime, timezone
 
 
 TENANT_KEY_ENV_VAR = "TENANT_KEY"
@@ -29,28 +26,18 @@ def _tenant_key(*, tenant_key: str | None = None, tenant_key_file: str | Path | 
     )
 
 
-def _upload_file_name(path: Path, now: datetime) -> str:
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
-    timestamp = _record_timestamp(path) or now.strftime("%Y%m%dT%H%M%SZ")
-    return f"{path.stem}_{timestamp}_{digest}{path.suffix}"
-
-
-def _record_timestamp(path: Path) -> str | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
-
-    measured_at = str(data.get("test_run", {}).get("measured_at", "")).strip()
-    if not measured_at:
-        return None
-    return (
-        measured_at.replace(":", "")
+def _upload_file_name(path: Path, measured_at: str) -> str:
+    timestamp = str(measured_at or "").strip()
+    if not timestamp:
+        raise ValueError("measured_at is required for the data-lake filename")
+    timestamp = (
+        timestamp.replace(":", "")
         .replace("-", "")
         .replace(".", "")
         .replace("+0000", "Z")
         .replace("+00:00", "Z")
     )
+    return f"{path.stem}_{timestamp}{path.suffix}"
 
 
 def _safe_component(value: object, *, default: str = "unknown", allow_empty: bool = False) -> str:
@@ -64,97 +51,66 @@ def _safe_component(value: object, *, default: str = "unknown", allow_empty: boo
     return text
 
 
-def _config_path_storage_parts(config_path: object) -> tuple[str | None, str | None, str | None]:
-    if not config_path:
-        return None, None, None
-    parts = Path(str(config_path)).parts
-    if "configs" not in parts:
-        return None, None, None
-    index = parts.index("configs")
-    protocol = parts[index + 1] if len(parts) > index + 1 else None
-    test_case = parts[index + 2] if len(parts) > index + 2 else None
-    partition = None
-    if "full_sweep" in parts:
-        full_sweep_index = parts.index("full_sweep")
-        partition = parts[full_sweep_index + 1] if len(parts) > full_sweep_index + 1 else None
-    return protocol, test_case, partition
-
-
-def _record_upload_location(path: Path) -> tuple[str, str]:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        now = datetime.now(timezone.utc)
-        return path.stem, f"cms/unknown/unknown/unknown/unknown/{now:%Y%m%dT%H%M%SZ}"
-
-    storage = data.get("storage", {})
-    dataset = data.get("dataset", {})
-    test_run = data.get("test_run", {})
-    firmware = data.get("firmware", {})
-    protocol_from_path, test_case_from_path, partition_from_path = _config_path_storage_parts(
-        test_run.get("config_path")
-    )
-
-    cms_bench_id = _safe_component(
-        storage.get("cms_bench_id") or dataset.get("cms_bench_id")
-    )
-    protocol = _safe_component(
-        storage.get("protocol") or protocol_from_path or dataset.get("wireless_stack")
-    )
-    test_case = _safe_component(
-        storage.get("test_case") or test_case_from_path or test_run.get("test_name")
-    )
-    partition_name = _safe_component(
-        storage.get("partition") or dataset.get("partition") or partition_from_path
-    )
-    part_number = _safe_component(
-        storage.get("part_number")
-        or firmware.get("part_number")
-        or firmware.get("device")
-        or dataset.get("part_number")
-        or dataset.get("chip_id")
-    )
-    board = _safe_component(storage.get("board") or firmware.get("board") or dataset.get("board_id"))
-    board_revision = _safe_component(
-        storage.get("board_revision")
-        or firmware.get("board_revision")
-        or firmware.get("brev")
-        or firmware.get("board_rev")
-    )
-    serial_number = _safe_component(
-        storage.get("serial_number") or firmware.get("serial_number"),
-        allow_empty=True,
-    )
-    config_name = _safe_component(
-        storage.get("config_name") or test_run.get("config_name") or path.stem
-    )
-    board_dir = f"{board}_{board_revision}"
-
-    partition = "/".join(
-        [
-            "cms",
-            cms_bench_id,
-            part_number,
-            board_dir,
-            serial_number,
-            protocol,
-            partition_name,
-            test_case,
-        ]
-    )
-    return f"{config_name}{path.suffix}", partition
+def _record_upload_location(
+    path: Path,
+    *,
+    cms_bench_id: object,
+    sisdk_version: object,
+    part_number: object,
+    board: object,
+    board_revision: object,
+    serial_number: object,
+    protocol: object,
+    application_variant: object,
+    test_case: object,
+    measured_at: str,
+) -> tuple[str, str]:
+    components = [
+        "cms",
+        _safe_component(cms_bench_id),
+        _safe_component(sisdk_version),
+        _safe_component(part_number),
+        f"{_safe_component(board)}_{_safe_component(board_revision)}",
+        _safe_component(serial_number, allow_empty=True),
+        _safe_component(protocol),
+        _safe_component(application_variant),
+        _safe_component(test_case),
+    ]
+    return _upload_file_name(path, measured_at), "/".join(components)
 
 
 def upload_json_to_data_lake(
     local_json_path: str,
     *,
+    cms_bench_id: object,
+    sisdk_version: object,
+    part_number: object,
+    board: object,
+    board_revision: object,
+    serial_number: object,
+    protocol: object,
+    application_variant: object,
+    test_case: object,
+    measured_at: str,
     tenant_key: str | None = None,
     tenant_key_file: str | Path | None = None,
 ):
     from datalake_client import send_file_to_data_lake
 
     path = Path(local_json_path)
-    file_name, partition = _record_upload_location(path)
+    file_name, partition = _record_upload_location(
+        path,
+        cms_bench_id=cms_bench_id,
+        sisdk_version=sisdk_version,
+        part_number=part_number,
+        board=board,
+        board_revision=board_revision,
+        serial_number=serial_number,
+        protocol=protocol,
+        application_variant=application_variant,
+        test_case=test_case,
+        measured_at=measured_at,
+    )
 
     return send_file_to_data_lake(
         file_path=str(path),
@@ -164,7 +120,3 @@ def upload_json_to_data_lake(
         partition=partition,
         disable_date_partition=True,
     )
-
-
-if __name__ == "__main__":
-    print(upload_json_to_data_lake("./laura_test.json"))

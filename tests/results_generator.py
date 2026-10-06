@@ -172,9 +172,73 @@ def _result_phy(test_name: str, advertiser: dict, scanner: dict, connection: dic
     return advertiser.get("phy") or connection.get("phy") or scanner.get("phy")
 
 
-def upload_result_json_to_database(result_json_path: Path | str):
+def _upload_application_variant(firmware: dict) -> str:
+    application_variants = {
+        "ncp_ble_dut_dcdc.slcp": "dcdc",
+        "ncp_ble_dut.slcp": "nodcdc",
+    }
+    dut_slcp_name = Path(str(firmware["dut_slcp"])).name.lower()
+    try:
+        return application_variants[dut_slcp_name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported DUT SLCP for upload application variant: {dut_slcp_name}"
+        ) from exc
+
+
+def _upload_metadata(
+    *,
+    config_path: Path,
+    config_data: dict,
+    measured_at: str,
+) -> dict[str, object]:
+    firmware = config_data["firmware"]
+    config_parts = config_path.parts
+    configs_index = config_parts.index("configs")
+    protocol = config_parts[configs_index + 1]
+    test_case = config_parts[configs_index + 2]
+    return {
+        "cms_bench_id": firmware["cms_bench_id"],
+        "sisdk_version": firmware["sisdk_version"],
+        "part_number": firmware["part_number"],
+        "board": firmware["board"],
+        "board_revision": firmware["board_revision"],
+        "serial_number": firmware["serial_number"],
+        "protocol": protocol,
+        "application_variant": _upload_application_variant(firmware),
+        "test_case": test_case,
+        "measured_at": measured_at,
+    }
+
+
+def upload_result_json_to_database(
+    result_json_path: Path | str,
+    *,
+    cms_bench_id: object,
+    sisdk_version: object,
+    part_number: object,
+    board: object,
+    board_revision: object,
+    serial_number: object,
+    protocol: object,
+    application_variant: object,
+    test_case: object,
+    measured_at: str,
+):
     from s3_upload import upload_json_to_data_lake
-    return upload_json_to_data_lake(result_json_path)
+    return upload_json_to_data_lake(
+        result_json_path,
+        cms_bench_id=cms_bench_id,
+        sisdk_version=sisdk_version,
+        part_number=part_number,
+        board=board,
+        board_revision=board_revision,
+        serial_number=serial_number,
+        protocol=protocol,
+        application_variant=application_variant,
+        test_case=test_case,
+        measured_at=measured_at,
+    )
 
 def _representative_indices(total: int, count: int) -> list[int]:
     if total <= 0 or count <= 0:
@@ -539,6 +603,7 @@ class ResultGenerator:
         result_paths: dict,
         measured_at: str | None = None,
     ) -> Path:    
+        effective_measured_at = measured_at or utc_now()
         result_json_path = write_result_json(
             profile=profile,
             out_dir=out_dir,
@@ -548,11 +613,18 @@ class ResultGenerator:
             config_path=self.context.config_path,
             config_data=self.context.config_data,
             result_paths=result_paths,
-            measured_at=measured_at or utc_now(),
+            measured_at=effective_measured_at,
             campaign_id=self.context.campaign_id,
             supply_v=self.context.supply_v,
         )
         if self.upload_results_to_database:
-            response = upload_result_json_to_database(result_json_path)
+            response = upload_result_json_to_database(
+                result_json_path,
+                **_upload_metadata(
+                    config_path=self.context.config_path,
+                    config_data=self.context.config_data,
+                    measured_at=effective_measured_at,
+                ),
+            )
             log.info("Result JSON uploaded to database: %s", response)
         return result_json_path
