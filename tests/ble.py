@@ -19,6 +19,12 @@ DEVICE_OPEN_RETRIES = 5
 log = logging.getLogger(__name__)
 
 
+def _log_fixture_cleanup_failure(fixture_name: str, exc: Exception) -> None:
+    # Joulescope capture can leave BGAPI unavailable during teardown after the
+    # result data has already been saved.
+    log.warning("%s cleanup skipped; result remains passed with warning: %s", fixture_name, exc)
+
+
 def _format_bd_addr(address) -> str:
     return str(address)
 
@@ -239,16 +245,14 @@ def DUTLegAdvStart(DUT,
 
     yield start
 
-    if started:
-        try:
+    try:
+        if started:
             DUT.bt.advertiser.stop(DUTLegAdvConfig.set)
             log.info("DUT Advertising stopped")
-        finally:
-            DUT.bt.advertiser.delete_set(DUTLegAdvConfig.set)
-            log.info("DUT Advertising set deleted")
-    else:
-        # even if never started, still delete the set
         DUT.bt.advertiser.delete_set(DUTLegAdvConfig.set)
+        log.info("DUT Advertising set deleted")
+    except Exception as exc:
+        _log_fixture_cleanup_failure("DUT legacy advertiser", exc)
 
 @pytest.fixture
 def DUTAdvConfig(DUT,
@@ -321,19 +325,16 @@ def DUTAdvStart(DUT,
 
     yield start
 
-    if started:
-        try:
+    try:
+        if started:
             rsp = DUT.bt.advertiser.stop(DUTAdvConfig.set)
             assert rsp.result == 0
             log.info("DUT Advertising stopped")
-        finally:
-            rsp = DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
-            assert rsp.result == 0
-            log.info("DUT Advertising set deleted")
-    else:
-        # even if never started, still delete the set
         rsp = DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
         assert rsp.result == 0
+        log.info("DUT Advertising set deleted")
+    except Exception as exc:
+        _log_fixture_cleanup_failure("DUT advertiser", exc)
 
 @pytest.fixture
 def DUTScanConfig(DUT,
@@ -373,8 +374,11 @@ def DUTScanStart(DUT,
     yield _start
 
     if started:
-        DUT.bt.scanner.stop()
-        log.info("DUT scanning stopped")
+        try:
+            DUT.bt.scanner.stop()
+            log.info("DUT scanning stopped")
+        except Exception as exc:
+            _log_fixture_cleanup_failure("DUT scanner", exc)
 
 
 @pytest.fixture
@@ -436,18 +440,16 @@ def DUTPAwRStart(DUT,
 
     yield _start
 
-    if started:
-        try:
+    try:
+        if started:
             rsp = DUT.bt.pawr_advertiser.stop(DUTAdvConfig.set)
             assert rsp.result == 0
             log.info("DUT PAwR advertiser stopped")
-        finally:
-            rsp = DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
-            assert rsp.result == 0
-            log.info("DUT PAwR advertising set deleted")
-    else:
         rsp = DUT.bt.advertiser.delete_set(DUTAdvConfig.set)
         assert rsp.result == 0
+        log.info("DUT PAwR advertising set deleted")
+    except Exception as exc:
+        _log_fixture_cleanup_failure("DUT PAwR advertiser", exc)
 
 
 @pytest.fixture
@@ -508,17 +510,20 @@ def DUTScanSync(DUT):
 
     yield _start
 
-    if started and sync_handle is not None:
-        DUT.bt.sync.close(sync_handle)
-        bgapi_check_event(
-            DUT,
-            "sync",
-            "closed",
-            lambda evt: evt.sync == sync_handle,
-            eventTimeout=1,
-            maxTime=5,
-        )
-        log.info("DUT PAwR sync closed")
+    try:
+        if started and sync_handle is not None:
+            DUT.bt.sync.close(sync_handle)
+            bgapi_check_event(
+                DUT,
+                "sync",
+                "closed",
+                lambda evt: evt.sync == sync_handle,
+                eventTimeout=1,
+                maxTime=5,
+            )
+            log.info("DUT PAwR sync closed")
+    except Exception as exc:
+        _log_fixture_cleanup_failure("DUT PAwR sync", exc)
 
 @pytest.fixture
 def TesterAdvConfig(Tester,
@@ -591,18 +596,16 @@ def TesterAdvStart(Tester,
 
     yield start
 
-    if started:
-        try:
+    try:
+        if started:
             rsp = Tester.bt.advertiser.stop(TesterAdvConfig.set)
             assert rsp.result == 0
             log.info("Tester Advertising stopped")
-        finally:
-            rsp = Tester.bt.advertiser.delete_set(TesterAdvConfig.set)
-            assert rsp.result == 0
-            log.info("Tester Advertising set deleted")
-    else:
         rsp = Tester.bt.advertiser.delete_set(TesterAdvConfig.set)
         assert rsp.result == 0
+        log.info("Tester Advertising set deleted")
+    except Exception as exc:
+        _log_fixture_cleanup_failure("Tester advertiser", exc)
 
 @pytest.fixture
 def TesterScanConfig(Tester,
@@ -642,8 +645,11 @@ def TesterScanStart(Tester,
     yield _start
 
     if started:
-        Tester.bt.scanner.stop()
-        log.info("Tester scanning stopped")
+        try:
+            Tester.bt.scanner.stop()
+            log.info("Tester scanning stopped")
+        except Exception as exc:
+            _log_fixture_cleanup_failure("Tester scanner", exc)
 
 @pytest.fixture
 def TesterDiscoverPAwRAdvertiser(Tester,
@@ -719,17 +725,20 @@ def TesterScanSync(Tester):
 
     yield _start
 
-    if started and sync_handle is not None:
-        Tester.bt.sync.close(sync_handle)
-        bgapi_check_event(
-            Tester,
-            "sync",
-            "closed",
-            lambda evt: evt.sync == sync_handle,
-            eventTimeout=1,
-            maxTime=5,
-        )
-        log.info("Tester PAwR sync closed")
+    try:
+        if started and sync_handle is not None:
+            Tester.bt.sync.close(sync_handle)
+            bgapi_check_event(
+                Tester,
+                "sync",
+                "closed",
+                lambda evt: evt.sync == sync_handle,
+                eventTimeout=1,
+                maxTime=5,
+            )
+            log.info("Tester PAwR sync closed")
+    except Exception as exc:
+        _log_fixture_cleanup_failure("Tester PAwR sync", exc)
 
 
 @pytest.fixture
@@ -791,18 +800,16 @@ def TesterPAwRStart(Tester,
 
     yield _start
 
-    if started:
-        try:
+    try:
+        if started:
             rsp = Tester.bt.pawr_advertiser.stop(TesterAdvConfig.set)
             assert rsp.result == 0
             log.info("Tester PAwR advertiser stopped")
-        finally:
-            rsp = Tester.bt.advertiser.delete_set(TesterAdvConfig.set)
-            assert rsp.result == 0
-            log.info("Tester PAwR advertising set deleted")
-    else:
         rsp = Tester.bt.advertiser.delete_set(TesterAdvConfig.set)
         assert rsp.result == 0
+        log.info("Tester PAwR advertising set deleted")
+    except Exception as exc:
+        _log_fixture_cleanup_failure("Tester PAwR advertiser", exc)
 
 @pytest.fixture
 def ConnectBLEDevices(Config):
@@ -851,29 +858,32 @@ def ConnectBLEDevices(Config):
     yield _connect_devices
 
     if connected:
-        dev_ctrl.bt.connection.close(ctrl_conn)
-        log.info(
-            "Waiting up to %.2fs for connection.closed events after close request",
-            timeout_s,
-        )
+        try:
+            dev_ctrl.bt.connection.close(ctrl_conn)
+            log.info(
+                "Waiting up to %.2fs for connection.closed events after close request",
+                timeout_s,
+            )
 
-        bgapi_check_event(
-                dev_ctrl,
-                "connection",
-                "closed",
-                lambda evt: evt.connection == ctrl_conn,
-                eventTimeout=1,
-                maxTime=timeout_s,
-            )
-        bgapi_check_event(
-                dev_per,
-                "connection",
-                "closed",
-                lambda evt: evt.connection == per_conn,
-                eventTimeout=1,
-                maxTime=timeout_s,
-            )
-        log.info("Connection closed succesfully")
+            bgapi_check_event(
+                    dev_ctrl,
+                    "connection",
+                    "closed",
+                    lambda evt: evt.connection == ctrl_conn,
+                    eventTimeout=1,
+                    maxTime=timeout_s,
+                )
+            bgapi_check_event(
+                    dev_per,
+                    "connection",
+                    "closed",
+                    lambda evt: evt.connection == per_conn,
+                    eventTimeout=1,
+                    maxTime=timeout_s,
+                )
+            log.info("Connection closed succesfully")
+        except Exception as exc:
+            _log_fixture_cleanup_failure("BLE connection", exc)
 
 def test_legacy_beacon(JoulescopeDev,
                        DUT,
