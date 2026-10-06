@@ -59,6 +59,7 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
     metadata = _load_json(metadata_path) if metadata_path else {}
 
     devices = runtime.get("devices", {})
+    bench = runtime.get("bench", {})
     dut = runtime.get("dut", {})
     tester = runtime.get("tester", {})
     tools = runtime.get("tools", {})
@@ -89,6 +90,10 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
                 or metadata.get("joulescope", {}).get("id")
                 or metadata.get("Joulescope", {}).get("id")
             ),
+        },
+        "bench": {
+            "bench_id": bench.get("bench_id"),
+            "profile": bench.get("profile"),
         },
         "firmware": {
             "build_root": fw_metadata.get("build_root"),

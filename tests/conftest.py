@@ -41,6 +41,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="Upload generated result JSON files to the configured database/data lake.",
     )
+    parser.addoption(
+        "--cms-debug",
+        action="store_true",
+        default=False,
+        help="Retain measurement captures for the CMS debug artifact bundle.",
+    )
 
 
 def _test_config_dir(request: pytest.FixtureRequest) -> Path:
@@ -113,7 +119,15 @@ def Config(request: pytest.FixtureRequest) -> dict:
 
     cfg_data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     dev_cfg = _effective_dev_config(request)
+    dev_bench = dev_cfg.get("bench", {})
     dev_fw = dev_cfg.get("firmware", {})
+
+    bench = dict(cfg_data.get("bench", {}))
+    for key in ("bench_id", "profile"):
+        value = dev_bench.get(key)
+        if value:
+            bench[key] = value
+    cfg_data["bench"] = bench
 
     fw = dict(cfg_data.get("firmware", {}))
 
@@ -125,6 +139,7 @@ def Config(request: pytest.FixtureRequest) -> dict:
     for key in (
         "board_rev",
         "board_revision",
+        "cms_bench_id",
         "part_number",
         "serial_number",
         "sisdk_name",
@@ -183,7 +198,8 @@ def HWInit(request: pytest.FixtureRequest) -> None:
 def ResultGeneratorFixture(request: pytest.FixtureRequest) -> ResultGenerator:
     upload_flag = bool(request.config.getoption("--upload-results-to-database"))
     return ResultGenerator(
-        upload_results_to_database=True if upload_flag else None
+        upload_results_to_database=True if upload_flag else None,
+        retain_captures_for_debug=bool(request.config.getoption("--cms-debug")),
     )
 
 

@@ -79,8 +79,8 @@ def _record_upload_location(
     return _upload_file_name(path, measured_at), "/".join(components)
 
 
-def upload_json_to_data_lake(
-    local_json_path: str,
+def upload_file_to_data_lake(
+    local_file_path: str | Path,
     *,
     cms_bench_id: object,
     sisdk_version: object,
@@ -97,7 +97,7 @@ def upload_json_to_data_lake(
 ):
     from datalake_client import send_file_to_data_lake
 
-    path = Path(local_json_path)
+    path = Path(local_file_path)
     file_name, partition = _record_upload_location(
         path,
         cms_bench_id=cms_bench_id,
@@ -119,4 +119,37 @@ def upload_json_to_data_lake(
         compression=None,
         partition=partition,
         disable_date_partition=True,
+    )
+
+
+def upload_json_to_data_lake(
+    local_json_path: str | Path,
+    *,
+    cms_bench_id: object,
+    sisdk_version: object,
+    part_number: object,
+    board: object,
+    board_revision: object,
+    serial_number: object,
+    protocol: object,
+    application_variant: object,
+    test_case: object,
+    measured_at: str,
+    tenant_key: str | None = None,
+    tenant_key_file: str | Path | None = None,
+):
+    return upload_file_to_data_lake(
+        local_json_path,
+        cms_bench_id=cms_bench_id,
+        sisdk_version=sisdk_version,
+        part_number=part_number,
+        board=board,
+        board_revision=board_revision,
+        serial_number=serial_number,
+        protocol=protocol,
+        application_variant=application_variant,
+        test_case=test_case,
+        measured_at=measured_at,
+        tenant_key=tenant_key,
+        tenant_key_file=tenant_key_file,
     )

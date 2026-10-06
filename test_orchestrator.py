@@ -750,6 +750,12 @@ def parse_args_with_pytest(argv: list[str]) -> tuple[argparse.Namespace, list[st
         default=False,
         help="Upload generated results JSON files to the configured database/data lake.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Retain measurement captures for the CMS debug artifact bundle.",
+    )
 
     parsed, pytest_args = parser.parse_known_args(argv)
     return parsed, pytest_args
@@ -763,6 +769,8 @@ def cms_pytest_args(parsed: argparse.Namespace) -> list[str]:
         args.extend(["--cms-fw-metadata", parsed.cms_fw_metadata])
     if parsed.upload_results_to_database:
         args.append("--upload-results-to-database")
+    if parsed.debug:
+        args.append("--cms-debug")
     return args
 
 

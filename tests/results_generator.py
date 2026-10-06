@@ -191,23 +191,24 @@ def _upload_metadata(
     config_path: Path,
     config_data: dict,
     measured_at: str,
-) -> dict[str, object]:
-    firmware = config_data["firmware"]
-    config_parts = config_path.parts
-    configs_index = config_parts.index("configs")
-    protocol = config_parts[configs_index + 1]
-    test_case = config_parts[configs_index + 2]
-    return {
-        "cms_bench_id": firmware["cms_bench_id"],
-        "sisdk_version": firmware["sisdk_version"],
-        "part_number": firmware["part_number"],
-        "board": firmware["board"],
-        "board_revision": firmware["board_revision"],
-        "serial_number": firmware["serial_number"],
-        "protocol": protocol,
-        "application_variant": _upload_application_variant(firmware),
-        "test_case": test_case,
-        "measured_at": measured_at,
+    ) -> dict[str, object]:
+        firmware = config_data["firmware"]
+        bench = config_data["bench"]
+        config_parts = config_path.parts
+        configs_index = config_parts.index("configs")
+        protocol = config_parts[configs_index + 1]
+        test_case = config_parts[configs_index + 2]
+        return {
+            "cms_bench_id": bench["bench_id"],
+            "sisdk_version": firmware["sisdk_version"],
+            "part_number": firmware["part_number"],
+            "board": firmware["board"],
+            "board_revision": firmware["board_revision"],
+            "serial_number": firmware["serial_number"],
+            "protocol": protocol,
+            "application_variant": _upload_application_variant(firmware),
+            "test_case": test_case,
+            "measured_at": measured_at,
     }
 
 
@@ -225,9 +226,39 @@ def upload_result_json_to_database(
     test_case: object,
     measured_at: str,
 ):
-    from s3_upload import upload_json_to_data_lake
-    return upload_json_to_data_lake(
+    return upload_result_file_to_database(
         result_json_path,
+        cms_bench_id=cms_bench_id,
+        sisdk_version=sisdk_version,
+        part_number=part_number,
+        board=board,
+        board_revision=board_revision,
+        serial_number=serial_number,
+        protocol=protocol,
+        application_variant=application_variant,
+        test_case=test_case,
+        measured_at=measured_at,
+    )
+
+
+def upload_result_file_to_database(
+    result_file_path: Path | str,
+    *,
+    cms_bench_id: object,
+    sisdk_version: object,
+    part_number: object,
+    board: object,
+    board_revision: object,
+    serial_number: object,
+    protocol: object,
+    application_variant: object,
+    test_case: object,
+    measured_at: str,
+):
+    from s3_upload import upload_file_to_data_lake
+
+    return upload_file_to_data_lake(
+        result_file_path,
         cms_bench_id=cms_bench_id,
         sisdk_version=sisdk_version,
         part_number=part_number,
@@ -431,6 +462,7 @@ def write_result_json(
     measured_at: str,
     campaign_id: str,
     supply_v: float | None,
+    retain_capture: bool = False,
 ) -> Path:
     if config_path is None:
         raise RuntimeError("Missing result context config_path for result JSON generation")
@@ -438,6 +470,8 @@ def write_result_json(
     campaign_id = campaign_id or measured_at
     result_json_path = out_dir / f"{artifact_stem}_result.json"
     capture_policy = _capture_policy(config_path)
+    if retain_capture:
+        capture_policy = {**capture_policy, "retained": True}
     capture_path = _save_capture_npz(profile, out_dir, artifact_stem) if capture_policy["retained"] else None
     firmware = config_data.get("firmware", {})
     bench = config_data.get("bench", {})
@@ -567,7 +601,13 @@ def write_result_json(
 
 
 class ResultGenerator:
-    def __init__(self, *, campaign_id: str | None = None, upload_results_to_database: bool | None = None):
+    def __init__(
+        self,
+        *,
+        campaign_id: str | None = None,
+        upload_results_to_database: bool | None = None,
+        retain_captures_for_debug: bool = False,
+    ):
         self.context = ResultContext(
             campaign_id=campaign_id
             or os.environ.get("CURRENT_MEASUREMENT_CAMPAIGN_ID")
@@ -578,6 +618,7 @@ class ResultGenerator:
             if upload_results_to_database is None
             else upload_results_to_database
         )
+        self.retain_captures_for_debug = retain_captures_for_debug
 
     def set_context(
         self,
@@ -616,15 +657,27 @@ class ResultGenerator:
             measured_at=effective_measured_at,
             campaign_id=self.context.campaign_id,
             supply_v=self.context.supply_v,
+            retain_capture=self.retain_captures_for_debug,
         )
-        if self.upload_results_to_database:
-            response = upload_result_json_to_database(
-                result_json_path,
-                **_upload_metadata(
-                    config_path=self.context.config_path,
-                    config_data=self.context.config_data,
-                    measured_at=effective_measured_at,
-                ),
+        png_path = None
+        capture_path = out_dir / f"{artifact_stem}_capture.npz"
+        if self.upload_results_to_database and capture_path.is_file():
+            from utils.render_capture_image import render_capture_image
+
+            png_path = render_capture_image(
+                capture_path,
+                output_path=capture_path.with_suffix(".png"),
+                result_json_path=result_json_path,
             )
+        if self.upload_results_to_database:
+            upload_metadata = _upload_metadata(
+                config_path=self.context.config_path,
+                config_data=self.context.config_data,
+                measured_at=effective_measured_at,
+            )
+            response = upload_result_json_to_database(result_json_path, **upload_metadata)
             log.info("Result JSON uploaded to database: %s", response)
+            if png_path is not None:
+                response = upload_result_file_to_database(png_path, **upload_metadata)
+                log.info("Result PNG uploaded to database: %s", response)
         return result_json_path

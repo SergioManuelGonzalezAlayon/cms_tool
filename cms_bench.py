@@ -1026,6 +1026,8 @@ class CMSBench:
         )
         try:
             self.test_smoke(session)
+            if self.identity is None:
+                raise RuntimeError("bench identity is not loaded")
             phase = "runtime_preparation"
             _write_setup_status(
                 session,
@@ -1036,6 +1038,7 @@ class CMSBench:
             prepared = _prepare_pytest_runtime(
                 session,
                 self.resources or BenchResources(),
+                cms_bench_id=self.identity.bench_id,
                 active_root=active_root,
             )
             phase = "pytest"
@@ -1307,6 +1310,7 @@ def _prepare_pytest_runtime(
     session: BenchSession,
     resources: BenchResources,
     *,
+    cms_bench_id: str = "",
     active_root: Path | None = None,
 ) -> dict[str, Path]:
     """Prepare one run; active firmware/build data may live apart from evidence."""
@@ -1376,6 +1380,7 @@ def _prepare_pytest_runtime(
             },
         },
         "firmware": {
+            "cms_bench_id": cms_bench_id,
             "build_root": str(build_root),
             "provision_state_root": str(Path("artifacts") / "cmsd" / "provision_state"),
             "board": resources.board,
@@ -1910,6 +1915,7 @@ def _run_test_orchestrator(
             [
                 "--aggregate-junit",
                 str(session.runtime_dir / "junit" / "campaign.xml"),
+                "--debug",
             ]
         )
     if session.job_plan_path is not None:

@@ -10,6 +10,9 @@ def test_effective_dev_config_accepts_pytest_string_paths(tmp_path: Path) -> Non
     runtime_path.write_text(
         json.dumps(
             {
+                "bench": {
+                    "bench_id": "cms-bench-001",
+                },
                 "devices": {
                     "board": "brd4182a",
                     "device": "EFR32MG22C224F512IM40",
@@ -56,6 +59,7 @@ def test_effective_dev_config_accepts_pytest_string_paths(tmp_path: Path) -> Non
     assert config["tools"]["commander"] == "/opt/silabs/commander"
     assert config["tools"]["jlink_library"] == "/opt/silabs/libjlinkarm.so"
     assert config["firmware"]["board"] == "brd4182a"
+    assert config["firmware"]["cms_bench_id"] == "cms-bench-001"
     assert config["firmware"]["sisdk"] == "2025.12.3"
     assert config["firmware"]["sisdk_name"] == "com.silabs.sdk.stack.sisdk"
     assert config["firmware"]["sisdk_version"] == "2025.12.3"
