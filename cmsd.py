@@ -8,13 +8,20 @@ and keeps request/runtime files inside daemon-owned directories.
 from __future__ import annotations
 
 import base64
+import argparse
+import errno
 import json
 import os
 import platform
 import re
+import signal
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -127,6 +134,22 @@ def _default_execution_timeout_s() -> float | None:
     return float(value)
 
 
+def _default_startup_timeout_s() -> float:
+    value = os.getenv("CMSD_STARTUP_TIMEOUT_S", "30").strip()
+    timeout = float(value)
+    if timeout <= 0:
+        raise ValueError("CMSD_STARTUP_TIMEOUT_S must be positive")
+    return timeout
+
+
+def _default_stop_timeout_s() -> float:
+    value = os.getenv("CMSD_STOP_TIMEOUT_S", "10").strip()
+    timeout = float(value)
+    if timeout <= 0:
+        raise ValueError("CMSD_STOP_TIMEOUT_S must be positive")
+    return timeout
+
+
 @dataclass(slots=True)
 class DaemonConfig:
     """Configuration needed to run one daemon instance."""
@@ -141,6 +164,8 @@ class DaemonConfig:
     max_console_log_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES
     max_console_event_bytes: int = DEFAULT_CONSOLE_EVENT_MAX_BYTES
     execution_timeout_s: float | None = field(default_factory=_default_execution_timeout_s)
+    startup_timeout_s: float = field(default_factory=_default_startup_timeout_s)
+    stop_timeout_s: float = field(default_factory=_default_stop_timeout_s)
     completed_measurement_retention: int = 100
 
     def __post_init__(self) -> None:
@@ -158,8 +183,620 @@ class DaemonConfig:
             raise ValueError("max_console_event_bytes must be at least 512")
         if self.execution_timeout_s is not None and self.execution_timeout_s <= 0:
             raise ValueError("execution_timeout_s must be positive when configured")
+        if self.startup_timeout_s <= 0:
+            raise ValueError("startup_timeout_s must be positive")
+        if self.stop_timeout_s <= 0:
+            raise ValueError("stop_timeout_s must be positive")
         if self.completed_measurement_retention < 1:
             raise ValueError("completed_measurement_retention must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class DaemonControlPaths:
+    """Persistent files used to control and inspect one daemon instance."""
+
+    root: Path
+    pid: Path
+    log: Path
+    status: Path
+    lifecycle: Path
+
+    @classmethod
+    def for_config(cls, config: DaemonConfig) -> "DaemonControlPaths":
+        root = config.artifacts_root / "control"
+        return cls(
+            root=root,
+            pid=root / "cmsd.pid",
+            log=root / "cmsd.log",
+            status=root / "cmsd.status.json",
+            lifecycle=root / "cmsd.lifecycle.jsonl",
+        )
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "root": str(self.root),
+            "pid": str(self.pid),
+            "log": str(self.log),
+            "status": str(self.status),
+            "lifecycle": str(self.lifecycle),
+        }
+
+
+def daemon_control_paths(config: DaemonConfig) -> DaemonControlPaths:
+    """Return the control-file locations for a daemon configuration."""
+
+    return DaemonControlPaths.for_config(config)
+
+
+def daemon_pid_is_alive(pid: int) -> bool:
+    """Return whether *pid* currently identifies a live process.
+
+    ``kill(pid, 0)`` checks process existence without sending a signal.  A
+    permission error still means that the process exists, while ``ESRCH``
+    means that it does not.  This keeps the check usable on the Linux CMS
+    Bench without requiring a process-inspection package.
+    """
+
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        raise
+    return True
+
+
+def read_daemon_pid_record(path: Path) -> dict[str, Any] | None:
+    """Read and minimally validate a structured daemon PID record.
+
+    Invalid or unreadable records are treated as absent by the control layer;
+    callers can then report an invalid/stale control file without trusting an
+    arbitrary value as a process identifier.
+    """
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pid = payload.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    return payload
+
+
+def read_daemon_status_record(path: Path) -> dict[str, Any] | None:
+    """Read a persisted daemon status snapshot without trusting its state."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _append_daemon_lifecycle_event(
+    config: DaemonConfig,
+    event: str,
+    **details: Any,
+) -> None:
+    """Append one controller lifecycle event without affecting control flow."""
+
+    paths = daemon_control_paths(config)
+    payload: dict[str, Any] = {
+        "event": event,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "controller_pid": os.getpid(),
+        "host": config.host,
+        "port": config.port,
+    }
+    payload.update(details)
+    try:
+        paths.lifecycle.parent.mkdir(parents=True, exist_ok=True)
+        with paths.lifecycle.open("a", encoding="utf-8") as lifecycle_file:
+            lifecycle_file.write(json.dumps(payload, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def _write_daemon_control_status(
+    config: DaemonConfig,
+    state: str,
+    **details: Any,
+) -> None:
+    """Persist a controller-observed status transition without masking failures."""
+
+    paths = daemon_control_paths(config)
+    payload = read_daemon_status_record(paths.status) or {}
+    payload.update(
+        {
+            "state": state,
+            "command": "serve",
+            "host": config.host,
+            "port": config.port,
+            "controller_pid": os.getpid(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "status_file": str(paths.status),
+        }
+    )
+    payload.update(details)
+    try:
+        _write_json_atomically(paths.status, payload)
+    except OSError:
+        pass
+
+
+def daemon_pid_state(path: Path) -> str:
+    """Return ``missing``, ``invalid``, ``stale`` or ``running`` for a PID file."""
+
+    if not path.exists():
+        return "missing"
+    record = read_daemon_pid_record(path)
+    if record is None:
+        return "invalid"
+    return "running" if daemon_pid_is_alive(record["pid"]) else "stale"
+
+
+def _daemon_process_matches_record(record: dict[str, Any]) -> bool:
+    """Verify the recorded PID still belongs to this daemon where supported."""
+
+    if os.name == "nt":
+        return True
+    command = record.get("command")
+    if not isinstance(command, str) or not command:
+        return False
+    cmdline_path = Path("/proc") / str(record["pid"]) / "cmdline"
+    try:
+        command_line = [part for part in cmdline_path.read_bytes().split(b"\0") if part]
+    except OSError:
+        return False
+    decoded_command_line = [part.decode(errors="replace") for part in command_line]
+    return str(Path(__file__).resolve()) in decoded_command_line and command in decoded_command_line
+
+
+def wait_for_daemon_exit(pid: int, timeout_s: float) -> bool:
+    """Wait for a daemon PID to disappear without escalating to SIGKILL."""
+
+    deadline = time.monotonic() + timeout_s
+    while daemon_pid_is_alive(pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.1, remaining))
+    return True
+
+
+def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    temporary_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+
+
+def _detached_process_options() -> dict[str, Any]:
+    if os.name == "nt":
+        creation_flags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        return {"creationflags": creation_flags}
+    return {"start_new_session": True}
+
+
+def _daemon_url(config: DaemonConfig, path: str) -> str:
+    host = config.host
+    if host in {"", "0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    elif ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{config.port}{path}"
+
+
+def _daemon_json_request(
+    config: DaemonConfig,
+    path: str,
+) -> tuple[bool, dict[str, Any] | None]:
+    try:
+        with urllib.request.urlopen(_daemon_url(config, path), timeout=1.0) as response:
+            if not 200 <= response.status < 300:
+                return False, None
+            try:
+                payload = json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return True, None
+            return True, payload if isinstance(payload, dict) else None
+    except (OSError, urllib.error.URLError):
+        return False, None
+
+
+def _daemon_health_ready(config: DaemonConfig) -> bool:
+    responding, _ = _daemon_json_request(config, "/health")
+    return responding
+
+
+def _daemon_startup_window_active(record: dict[str, Any], config: DaemonConfig) -> bool:
+    started_at = record.get("started_at")
+    if not isinstance(started_at, str):
+        return False
+    try:
+        started_timestamp = datetime.fromisoformat(started_at.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False
+    return time.time() - started_timestamp <= config.startup_timeout_s
+
+
+def get_daemon_status(config: DaemonConfig) -> dict[str, Any]:
+    """Return process and service state for the locally controlled daemon."""
+
+    paths = daemon_control_paths(config)
+    pid_file_state = daemon_pid_state(paths.pid)
+    record = read_daemon_pid_record(paths.pid)
+    persisted_status = read_daemon_status_record(paths.status)
+    recorded_pid = record.get("pid") if record is not None else None
+    process_alive = bool(record is not None and daemon_pid_is_alive(record["pid"]))
+
+    if (
+        pid_file_state == "stale"
+        and record is not None
+        and persisted_status is not None
+        and persisted_status.get("pid") == recorded_pid
+        and persisted_status.get("state") in {"starting", "running", "running_unhealthy"}
+    ):
+        _write_daemon_control_status(
+            config,
+            "child_exit",
+            pid=recorded_pid,
+            exit_code=persisted_status.get("exit_code"),
+            exit_reason=persisted_status.get("exit_reason") or "process_not_alive",
+            child_exit_detected_at=datetime.now(timezone.utc).isoformat(),
+        )
+        persisted_status = read_daemon_status_record(paths.status)
+
+    health_responding = False
+    health_payload: dict[str, Any] | None = None
+    bench_payload: dict[str, Any] | None = None
+    if process_alive:
+        health_responding, health_payload = _daemon_json_request(config, "/health")
+        _, bench_payload = _daemon_json_request(config, "/bench")
+
+    if pid_file_state == "missing":
+        state = "stopped"
+    elif record is None or not process_alive:
+        state = "stale_pid"
+    elif health_responding:
+        state = "running" if health_payload is None or health_payload.get("state") != "error" else "running_unhealthy"
+    elif _daemon_startup_window_active(record, config):
+        state = "starting"
+    else:
+        state = "running_unhealthy"
+
+    daemon_initialized = None
+    bench_state = None
+    active_measurement_id = None
+    startup_error = None
+    exit_code = None
+    exit_reason = None
+    child_exit_detected_at = None
+    status_payload = bench_payload if bench_payload is not None else persisted_status
+    if status_payload is not None:
+        daemon_initialized = status_payload.get("daemon_initialized")
+        bench_state = status_payload.get("bench_state")
+        active_measurement_id = status_payload.get("active_measurement_id")
+        startup_error = status_payload.get("startup_error")
+        exit_code = status_payload.get("exit_code")
+        exit_reason = status_payload.get("exit_reason")
+        child_exit_detected_at = status_payload.get("child_exit_detected_at")
+
+    return {
+        "state": state,
+        "pid_file": str(paths.pid),
+        "status_file": str(paths.status),
+        "pid_file_state": pid_file_state,
+        "recorded_pid": recorded_pid,
+        "process_alive": process_alive,
+        "health_responding": health_responding,
+        "daemon_initialized": daemon_initialized,
+        "bench_state": bench_state,
+        "active_measurement_id": active_measurement_id,
+        "host": config.host,
+        "port": config.port,
+        "log_path": (
+            str(record.get("log_path", paths.log)) if record is not None else str(paths.log)
+        ),
+        "startup_error": startup_error,
+        "exit_code": exit_code,
+        "exit_reason": exit_reason,
+        "child_exit_detected_at": child_exit_detected_at,
+        "status_updated_at": (
+            persisted_status.get("updated_at") if persisted_status is not None else None
+        ),
+    }
+
+
+def wait_for_daemon_health(process: Any, config: DaemonConfig) -> None:
+    """Wait until the detached daemon serves health or fail startup."""
+
+    deadline = time.monotonic() + config.startup_timeout_s
+    while True:
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(f"CMS daemon exited before becoming ready: returncode={return_code}")
+        if _daemon_health_ready(config):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"CMS daemon health check timed out after {config.startup_timeout_s:.1f}s"
+            )
+        time.sleep(min(0.2, remaining))
+
+
+def start_daemon(config: DaemonConfig) -> dict[str, Any]:
+    """Start a detached foreground-server child and record its PID."""
+
+    paths = daemon_control_paths(config)
+    _append_daemon_lifecycle_event(config, "start_requested")
+    process: Any | None = None
+    record: dict[str, Any] | None = None
+    state: str | None = None
+    pid_written = False
+    try:
+        state = daemon_pid_state(paths.pid)
+        if state == "running":
+            raise RuntimeError(f"CMS daemon is already running: {paths.pid}")
+        if paths.pid.exists():
+            paths.pid.unlink()
+
+        paths.root.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--host",
+            config.host,
+            "--port",
+            str(config.port),
+            "--runtime-root",
+            str(config.runtime_root),
+            "--artifacts-root",
+            str(config.artifacts_root),
+            "--bench-config",
+            str(config.bench_config),
+            "serve",
+        ]
+        with paths.log.open("a", encoding="utf-8") as log_file:
+            process = subprocess.Popen(
+                command,
+                cwd=str(Path.cwd()),
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                **_detached_process_options(),
+            )
+
+        record = {
+            "pid": process.pid,
+            "command": "serve",
+            "host": config.host,
+            "port": config.port,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "log_path": str(paths.log),
+        }
+        _write_json_atomically(paths.pid, record)
+        pid_written = True
+        wait_for_daemon_health(process, config)
+    except Exception as exc:
+        child_exit_code = None
+        if process is not None:
+            poll = getattr(process, "poll", None)
+            if callable(poll):
+                child_exit_code = poll()
+        _append_daemon_lifecycle_event(
+            config,
+            "start_failed",
+            error=str(exc),
+            pid=process.pid if process is not None else None,
+        )
+        if state != "running":
+            _write_daemon_control_status(
+                config,
+                "start_failed",
+                pid=process.pid if process is not None else None,
+                startup_error=str(exc),
+                last_error=str(exc),
+                exit_code=child_exit_code,
+                exit_reason="startup_failed",
+            )
+        if process is not None:
+            process.terminate()
+            process.wait(timeout=5)
+        if pid_written:
+            paths.pid.unlink(missing_ok=True)
+        raise
+    assert record is not None
+    _append_daemon_lifecycle_event(config, "started", pid=record["pid"], log_path=record["log_path"])
+    return record
+
+
+def stop_daemon(config: DaemonConfig) -> dict[str, Any]:
+    """Gracefully stop the recorded daemon process."""
+
+    paths = daemon_control_paths(config)
+    _append_daemon_lifecycle_event(config, "stop_requested")
+    record: dict[str, Any] | None = None
+    try:
+        pid_file_state = daemon_pid_state(paths.pid)
+        if pid_file_state == "missing":
+            result = {
+                "state": "stopped",
+                "already_stopped": True,
+                "pid": None,
+                "pid_file": str(paths.pid),
+            }
+        else:
+            record = read_daemon_pid_record(paths.pid)
+            if record is None:
+                raise RuntimeError(f"CMS daemon PID file is invalid: {paths.pid}")
+
+            pid = record["pid"]
+            if not daemon_pid_is_alive(pid):
+                paths.pid.unlink(missing_ok=True)
+                result = {
+                    "state": "stopped",
+                    "already_stopped": True,
+                    "pid": pid,
+                    "pid_file": str(paths.pid),
+                }
+            else:
+                if not _daemon_process_matches_record(record):
+                    raise RuntimeError(f"CMS daemon PID does not belong to the recorded daemon: {pid}")
+
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except PermissionError as exc:
+                    raise RuntimeError(f"permission denied stopping CMS daemon PID {pid}") from exc
+
+                if not wait_for_daemon_exit(pid, config.stop_timeout_s):
+                    raise RuntimeError(
+                        f"CMS daemon PID {pid} did not exit within {config.stop_timeout_s:.1f}s"
+                    )
+
+                paths.pid.unlink(missing_ok=True)
+                result = {
+                    "state": "stopped",
+                    "already_stopped": False,
+                    "pid": pid,
+                    "pid_file": str(paths.pid),
+                }
+    except Exception as exc:
+        _append_daemon_lifecycle_event(
+            config,
+            "stop_failed",
+            error=str(exc),
+            pid=record.get("pid") if record is not None else None,
+        )
+        raise
+
+    _append_daemon_lifecycle_event(
+        config,
+        "stopped",
+        pid=result["pid"],
+        already_stopped=result["already_stopped"],
+    )
+    return result
+
+
+def restart_daemon(config: DaemonConfig) -> dict[str, Any]:
+    """Stop the current daemon, then start a fresh detached instance."""
+
+    _append_daemon_lifecycle_event(config, "restart", phase="requested")
+    try:
+        stop_result = stop_daemon(config)
+        start_result = start_daemon(config)
+    except Exception as exc:
+        _append_daemon_lifecycle_event(config, "restart", phase="failed", error=str(exc))
+        raise
+    result = {"stop": stop_result, "start": start_result}
+    _append_daemon_lifecycle_event(
+        config,
+        "restart",
+        phase="completed",
+        stopped_pid=stop_result["pid"],
+        started_pid=start_result["pid"],
+    )
+    return result
+
+
+def build_daemon_parser() -> argparse.ArgumentParser:
+    """Build the local CMS daemon command parser."""
+
+    parser = argparse.ArgumentParser(description="Run and inspect the CMS daemon.")
+    parser.add_argument("--host", default=None, help="HTTP bind host")
+    parser.add_argument("--port", type=int, default=None, help="HTTP bind port")
+    parser.add_argument("--runtime-root", type=Path, default=None, help="Runtime storage root")
+    parser.add_argument("--artifacts-root", type=Path, default=None, help="Persistent artifact root")
+    parser.add_argument("--bench-config", type=Path, default=None, help="CMS bench runtime configuration")
+    parser.add_argument("--startup-timeout", type=float, default=None, help="Seconds to wait for /health")
+    parser.add_argument(
+        "--stop-timeout",
+        dest="stop_timeout_s",
+        type=float,
+        default=None,
+        help="Seconds to wait for graceful daemon shutdown",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("serve", help="Run the daemon in the foreground")
+    parser.set_defaults(command="serve")
+    subparsers.add_parser("start", help="Start the daemon detached from the terminal")
+    subparsers.add_parser("status", help="Report daemon process and service state")
+    subparsers.add_parser("stop", help="Gracefully stop the daemon")
+    subparsers.add_parser("restart", help="Restart the daemon")
+    return parser
+
+
+def daemon_config_from_args(args: argparse.Namespace) -> DaemonConfig:
+    """Construct daemon configuration while preserving existing defaults."""
+
+    overrides: dict[str, Any] = {}
+    for name in (
+        "host",
+        "port",
+        "runtime_root",
+        "artifacts_root",
+        "bench_config",
+        "startup_timeout_s",
+        "stop_timeout_s",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            overrides[name] = value
+    return DaemonConfig(**overrides)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the requested local daemon command."""
+
+    args = build_daemon_parser().parse_args(argv)
+    config = daemon_config_from_args(args)
+    if args.command == "start":
+        record = start_daemon(config)
+        print(f"CMS daemon started: pid={record['pid']} log={record['log_path']}")
+        return 0
+    if args.command == "status":
+        print(json.dumps(get_daemon_status(config), indent=2, sort_keys=True))
+        return 0
+    if args.command == "stop":
+        result = stop_daemon(config)
+        if result["already_stopped"]:
+            print("CMS daemon is already stopped")
+        else:
+            print(f"CMS daemon stopped: pid={result['pid']}")
+        return 0
+    if args.command == "restart":
+        result = restart_daemon(config)
+        stop_result = result["stop"]
+        start_result = result["start"]
+        print(f"CMS daemon restart: stop state={stop_result['state']}")
+        print(f"CMS daemon restart: started pid={start_result['pid']} log={start_result['log_path']}")
+        return 0
+    if args.command != "serve":
+        raise ValueError(f"unsupported CMS daemon command: {args.command}")
+    CMSDaemon(config).start_service()
+    return 0
 
 
 @dataclass(slots=True)
@@ -201,6 +838,8 @@ class CMSDaemon:
     def __init__(self, config: DaemonConfig | None = None):
         self.config = config or DaemonConfig()
         self.active_measurement_id: str | None = None
+        self._status_persistence_enabled = False
+        self._status_started_at = datetime.now(timezone.utc).isoformat()
         self.files = self._daemon_files()
         self.initialized = False
         self.startup_error = ""
@@ -216,6 +855,38 @@ class CMSDaemon:
         self.cancelled_measurements: set[str] = set()
         self.cancellation_events: dict[str, threading.Event] = {}
         self.debug_artifact_measurements: set[str] = set()
+
+    def _write_status_snapshot(self, state: str, **details: Any) -> None:
+        """Persist the current daemon state without affecting measurement requests."""
+
+        if not self._status_persistence_enabled:
+            return
+        bench_state = self.bench.state.value if self.bench is not None else None
+        paths = daemon_control_paths(self.config)
+        payload = {
+            "state": state,
+            "pid": os.getpid(),
+            "command": "serve",
+            "host": self.config.host,
+            "port": self.config.port,
+            "started_at": self._status_started_at,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "daemon_initialized": self.initialized,
+            "bench_state": bench_state,
+            "active_measurement_id": self.active_measurement_id,
+            "last_measurement_id": self.last_measurement_id,
+            "startup_error": self.startup_error,
+            "runtime_root": str(self.config.runtime_root),
+            "artifacts_root": str(self.config.artifacts_root),
+            "pid_file": str(paths.pid),
+            "log_path": str(paths.log),
+            "status_file": str(paths.status),
+        }
+        payload.update(details)
+        try:
+            _write_json_atomically(paths.status, payload)
+        except OSError:
+            pass
 
     def initialize(self) -> None:
         """Prepare daemon runtime directories, staging files, and local bench."""
@@ -718,6 +1389,7 @@ class CMSDaemon:
         """Stage the current measurement request without launching execution."""
 
         self.active_measurement_id = request.request_id
+        self._write_status_snapshot("running")
         if request.debug_artifact_streaming:
             self.debug_artifact_measurements.add(request.request_id)
         self.cancellation_events.setdefault(request.request_id, threading.Event())
@@ -805,6 +1477,7 @@ class CMSDaemon:
                 self._retain_staged_normal_firmware(request, runtime_dir)
                 if self.active_measurement_id == request.request_id:
                     self.active_measurement_id = None
+                    self._write_status_snapshot("running")
         except (OSError, RuntimeError, ValueError) as exc:
             self._release_staging_workspace(runtime_dir)
             result = MeasurementResult(
@@ -819,6 +1492,7 @@ class CMSDaemon:
         self.measurements[request.request_id] = result
         if self.active_measurement_id == request.request_id:
             self.active_measurement_id = None
+            self._write_status_snapshot("running")
         self.cancellation_events.pop(request.request_id, None)
         return result
 
@@ -1100,6 +1774,7 @@ class CMSDaemon:
         )
         self.measurements[request.request_id] = started
         self.active_measurement_id = request.request_id
+        self._write_status_snapshot("running")
         self.cancellation_events[request.request_id] = threading.Event()
         thread = threading.Thread(
             target=self.execute_measurement,
@@ -1165,6 +1840,7 @@ class CMSDaemon:
         self.last_measurement_id = result.measurement_id
         if self.active_measurement_id == result.measurement_id:
             self.active_measurement_id = None
+            self._write_status_snapshot("running")
         self.cancellation_events.pop(result.measurement_id, None)
         self.cancelled_measurements.discard(result.measurement_id)
         return result
@@ -1797,8 +2473,29 @@ class CMSDaemon:
 
         import uvicorn
 
+        self._status_persistence_enabled = True
+        self._write_status_snapshot("starting")
         self.initialize()
-        uvicorn.run(self.create_app(), host=self.config.host, port=self.config.port)
+        self._write_status_snapshot("running" if self.initialized else "running_unhealthy")
+        try:
+            uvicorn.run(self.create_app(), host=self.config.host, port=self.config.port)
+        except BaseException as exc:
+            exit_code = (
+                exc.code
+                if isinstance(exc, SystemExit) and isinstance(exc.code, int)
+                else 1
+            )
+            self._write_status_snapshot(
+                "child_exit",
+                exit_code=exit_code,
+                exit_reason=str(exc) or exc.__class__.__name__,
+            )
+            raise
+        self._write_status_snapshot(
+            "stopped",
+            exit_code=0,
+            exit_reason="server_stopped",
+        )
 
     def _bench_health(self) -> BenchHealthReport:
         if self.bench is None:
@@ -2707,5 +3404,4 @@ def _validation_failure_message(session: BenchSession) -> str:
 
 
 if __name__ == "__main__":
-    cmsd = CMSDaemon()
-    cmsd.start_service()
+    raise SystemExit(main())

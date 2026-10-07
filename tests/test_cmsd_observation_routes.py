@@ -499,6 +499,36 @@ def test_daemon_startup_marks_unfinished_runtime_workspace_interrupted(tmp_path:
     assert summary["current_test"]["job_id"] == "job-1"
 
 
+def test_daemon_initialize_marks_unfinished_workspace_interrupted(tmp_path: Path) -> None:
+    daemon = _daemon(tmp_path)
+    daemon.debug_artifact_measurements.add(MEASUREMENT_ID)
+    runtime_dir = _seed_observation(daemon)
+    (runtime_dir / "current_status.json").write_text(
+        json.dumps(
+            {
+                "measurement_id": MEASUREMENT_ID,
+                "state": "running",
+                "progress_percent": 45,
+                "current_step": "running measurement",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    daemon.initialize()
+
+    result = daemon.get_measurement_result(MEASUREMENT_ID)
+    assert result.state is MeasurementState.INTERRUPTED
+    assert result.progress_percent == 45
+    published_result = (
+        daemon.config.artifacts_root
+        / "measurements"
+        / MEASUREMENT_ID
+        / "measurement_result.json"
+    )
+    assert json.loads(published_result.read_text(encoding="utf-8"))["state"] == "interrupted"
+
+
 def test_daemon_startup_does_not_interrupt_published_or_staging_only_workspaces(
     tmp_path: Path,
 ) -> None:
