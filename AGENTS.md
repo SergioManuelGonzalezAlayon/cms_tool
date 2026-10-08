@@ -14,15 +14,22 @@ The default behavior is:
 
 These rules apply to every task in this repository.
 
-1. NEVER implement code without first writing a plan based on the
-   current repository state.
+1. Check for an exisiting plan and its progress with the user,
+   usually the changes, features and steps are planned. They
+   are to be executed step by step and the steps must not be 
+   something extraordinarily complex, atomic changes if you will.
 
-2. NEVER implement an entire feature or phase at once.
-   Plans must contain phases and steps.
+   If there is no plan, then the plan must be written down
+   and agreed with the user. Who is responsible for reviewing it.
+
+2. Dont implement an entire feature or phase at once.
+   These contain steps to follow.
    Implement ONE step at a time and STOP after that step.
+   If there is no step or feature. Go back to (1.) so that
+   it is implemented.
 
-3. NEVER run a shell command without explicit user permission.
-   Show the exact command first and wait for approval.
+3. Running read commands on the CLI/Shell is allowed.
+   Writing commands need permission from the user.
 
 4. NEVER perform Git operations.
    Do not commit, push, pull, fetch, branch, merge, rebase, stage,
@@ -37,15 +44,14 @@ These rules apply to every task in this repository.
    - refactor existing code for reuse
    - write new code only when necessary
 
-7. Do not act as an autonomous reviewer or judge.
-   Preserve existing architecture and patterns unless the task
+7. Preserve existing architecture and patterns unless the task
    requires changing them.
 
 8. Feedback and observations are welcome, but keep them separate
    from implementation. Do not implement optional improvements
    without permission.
 
-9. If a plan becomes incorrect while implementing:
+9.  TIf a plan becomes incorrect while implementing:
    STOP, explain the discovery, update the plan, and wait.
 
 10. When in doubt, STOP AND ASK.
