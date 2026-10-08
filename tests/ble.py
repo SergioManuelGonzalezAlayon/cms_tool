@@ -188,19 +188,27 @@ def BLEDev(EffectiveDevConfig):
 
 @pytest.fixture
 def DUT(BLEDev,
-        JoulescopeDev):
+        JoulescopeDev,
+        ProvisionFirmware):
     dut = BLEDev("dut")
-    yield open_ble_dev_for_pytest(
+    dut = open_ble_dev_for_pytest(
         dut,
         wakeUp=JoulescopeDev,
         open_retries=DUT_OPEN_RETRIES,
         retry_sleep_s=DUT_OPEN_RETRY_SLEEP_S,
     )
+    if ProvisionFirmware is not None:
+        ProvisionFirmware("dut")
+    yield dut
 
 @pytest.fixture
-def Tester(BLEDev):
+def Tester(BLEDev,
+           ProvisionFirmware):
     tester = BLEDev("tester")
-    yield open_ble_dev_for_pytest(tester)
+    tester = open_ble_dev_for_pytest(tester)
+    if ProvisionFirmware is not None:
+        ProvisionFirmware("tester")
+    yield tester
 
 @pytest.fixture
 def DUTLegAdvConfig(DUT,

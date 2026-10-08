@@ -309,9 +309,10 @@ def _find_prebuilt_image(build_root: Path, *, slcp: Path, project_name: str) -> 
 
 def _provision_state_root(build_root: Path, dev_cfg: dict) -> Path:
     configured = dev_cfg.get("firmware", {}).get("provision_state_root")
-    if configured:
-        return Path(str(configured))
-    return build_root
+    state_root = Path(str(configured)) if configured else build_root
+    if not state_root.is_absolute():
+        state_root = Path(__file__).resolve().parent.parent / state_root
+    return state_root.resolve()
 
 
 def _dut_state_path(state_root: Path) -> Path:
@@ -332,9 +333,69 @@ def _read_provision_state(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _verified_last_flashed(state: dict | None, measurement_id: str) -> dict | None:
+    if (
+        not state
+        or state.get("readiness") != "verified"
+        or state.get("measurement_id") != measurement_id
+    ):
+        return None
+    return state.get("last_flashed")
+
+
+def _sent_last_flashed(state: dict | None, measurement_id: str) -> dict | None:
+    if not state or state.get("measurement_id") != measurement_id:
+        return None
+    if state.get("status") == "sent":
+        return state.get("last_sent")
+    if state.get("readiness") == "verified":
+        return state.get("last_flashed")
+    return None
+
+
 def _write_provision_state(path: Path, state: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_pending_provision_state(
+    path: Path,
+    *,
+    cfg_path: str,
+    measurement_id: str,
+    required: dict,
+) -> None:
+    _write_provision_state(
+        path,
+        {
+            "cfg_path": cfg_path,
+            "measurement_id": measurement_id,
+            "status": "flash_attempted",
+            "readiness": "unverified",
+            "last_attempted": required,
+            "reason": "startup_verification_pending",
+        },
+    )
+
+
+def _write_sent_provision_state(
+    path: Path,
+    *,
+    cfg_path: str,
+    measurement_id: str,
+    required: dict,
+) -> None:
+    _write_provision_state(
+        path,
+        {
+            "cfg_path": cfg_path,
+            "measurement_id": measurement_id,
+            "status": "sent",
+            "readiness": "unverified",
+            "last_sent": required,
+            "reason": "startup_verification_pending",
+        },
+    )
 
 
 def _same_image(current: dict, previous: dict | None) -> bool:
@@ -362,31 +423,64 @@ def _short_hash(image_meta: dict | None) -> str:
     return str(image_meta.get("sha256", "missing"))[:12]
 
 
-def _log_flash_decision(label: str, required: dict, previous: dict | None, should_flash: bool) -> None:
+def _log_flash_decision(
+    label: str,
+    required: dict,
+    previous: dict | None,
+    should_flash: bool,
+    *,
+    measurement_id: str,
+    previous_measurement_id: str = "",
+) -> None:
     if should_flash:
-        if previous:
+        if previous and previous_measurement_id != measurement_id:
             log.info(
-                "%s flash required: hash changed %s -> %s image=%s",
+                "%s flash required: measurement scope changed previous=%s current=%s image=%s hash=%s",
+                label,
+                previous_measurement_id or "missing",
+                measurement_id,
+                required["image"],
+                _short_hash(required),
+            )
+        elif previous:
+            log.info(
+                "%s flash required: hash changed %s -> %s measurement=%s image=%s",
                 label,
                 _short_hash(previous),
                 _short_hash(required),
+                measurement_id,
                 required["image"],
             )
         else:
             log.info(
-                "%s flash required: no previous state image=%s hash=%s",
+                "%s flash required: no verified state for measurement=%s image=%s hash=%s",
                 label,
+                measurement_id,
                 required["image"],
                 _short_hash(required),
             )
         return
 
     log.info(
-        "%s flash skipped: image unchanged image=%s hash=%s",
+        "%s flash skipped: matching image unchanged measurement=%s image=%s hash=%s",
         label,
+        measurement_id,
         required["image"],
         _short_hash(required),
     )
+
+
+def _provision_measurement_id(request: pytest.FixtureRequest, cfg_path: str) -> str:
+    metadata_path_value = request.config.getoption("--cms-fw-metadata")
+    if metadata_path_value:
+        metadata_path = Path(str(metadata_path_value))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        identity = metadata.get("identity", {})
+        measurement_id = identity.get("measurement_id") if isinstance(identity, dict) else None
+        if not str(measurement_id or "").strip():
+            pytest.fail(f"CMS firmware metadata has no identity.measurement_id: {metadata_path}")
+        return str(measurement_id)
+    return f"local:{cfg_path}"
 
 def _wait_for_serial_port(serial_port):
     if not serial_port:
@@ -413,6 +507,7 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
         return
 
     cfg_path = str(_test_config_path(request).resolve())
+    measurement_id = _provision_measurement_id(request, cfg_path)
 
     config = request.getfixturevalue("Config")
     fw = config.get("firmware", {})
@@ -455,10 +550,35 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
     tester_state_path = _tester_ready_path(state_root)
     dut_bootloader_state_path = _bootloader_state_path(state_root, "dut")
     tester_bootloader_state_path = _bootloader_state_path(state_root, "tester")
+    log.info(
+        "Provisioning state root: %s",
+        state_root,
+    )
+    log.info(
+        "Provisioning state files: DUT=%s Tester=%s DUT_bootloader=%s Tester_bootloader=%s",
+        dut_state_path,
+        tester_state_path,
+        dut_bootloader_state_path,
+        tester_bootloader_state_path,
+    )
     previous_dut_state = _read_provision_state(dut_state_path)
     previous_tester_state = _read_provision_state(tester_state_path)
     previous_dut_bootloader_state = _read_provision_state(dut_bootloader_state_path)
     previous_tester_bootloader_state = _read_provision_state(tester_bootloader_state_path)
+    previous_dut_flashed = _sent_last_flashed(previous_dut_state, measurement_id)
+    previous_tester_flashed = _sent_last_flashed(previous_tester_state, measurement_id)
+    previous_dut_bootloader_flashed = _sent_last_flashed(
+        previous_dut_bootloader_state,
+        measurement_id,
+    )
+    previous_tester_bootloader_flashed = _sent_last_flashed(
+        previous_tester_bootloader_state,
+        measurement_id,
+    )
+    previous_dut_image = previous_dut_flashed
+    previous_tester_image = previous_tester_flashed
+    previous_dut_bootloader_image = previous_dut_bootloader_flashed
+    previous_tester_bootloader_image = previous_tester_bootloader_flashed
 
     dut_slcp = Path(fw["dut_slcp"])
     tester_slcp = Path(fw["tester_slcp"])
@@ -501,88 +621,188 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
             probe_sn=tester_probe_sn,
             expected_sha256=bootloader_sha,
         )
-    dut_matches = _same_image(dut_required, previous_dut_state.get("last_flashed"))
-    tester_matches = _same_image(tester_required, previous_tester_state.get("last_flashed"))
+    dut_matches = _same_image(dut_required, previous_dut_flashed)
+    tester_matches = _same_image(tester_required, previous_tester_flashed)
     dut_bootloader_matches = (
         True if bootloader_required_dut is None
-        else _same_image(bootloader_required_dut, previous_dut_bootloader_state.get("last_flashed"))
+        else _same_image(bootloader_required_dut, previous_dut_bootloader_flashed)
     )
     tester_bootloader_matches = (
         True if bootloader_required_tester is None
-        else _same_image(bootloader_required_tester, previous_tester_bootloader_state.get("last_flashed"))
+        else _same_image(bootloader_required_tester, previous_tester_bootloader_flashed)
     )
     if bootloader_required_dut is not None and bootloader_required_tester is not None:
         _log_flash_decision(
             "DUT bootloader",
             bootloader_required_dut,
-            previous_dut_bootloader_state.get("last_flashed"),
+            previous_dut_bootloader_image,
             not dut_bootloader_matches,
+            measurement_id=measurement_id,
+            previous_measurement_id=str(previous_dut_bootloader_state.get("measurement_id", "")),
         )
         _log_flash_decision(
             "Tester bootloader",
             bootloader_required_tester,
-            previous_tester_bootloader_state.get("last_flashed"),
+            previous_tester_bootloader_image,
             not tester_bootloader_matches,
+            measurement_id=measurement_id,
+            previous_measurement_id=str(previous_tester_bootloader_state.get("measurement_id", "")),
         )
-    _log_flash_decision("DUT", dut_required, previous_dut_state.get("last_flashed"), not dut_matches)
-    _log_flash_decision("Tester", tester_required, previous_tester_state.get("last_flashed"), not tester_matches)
+    _log_flash_decision(
+        "DUT",
+        dut_required,
+        previous_dut_image,
+        not dut_matches,
+        measurement_id=measurement_id,
+        previous_measurement_id=str(previous_dut_state.get("measurement_id", "")),
+    )
+    _log_flash_decision(
+        "Tester",
+        tester_required,
+        previous_tester_image,
+        not tester_matches,
+        measurement_id=measurement_id,
+        previous_measurement_id=str(previous_tester_state.get("measurement_id", "")),
+    )
+
+    def mark_device_flash_pending(
+        device_name: str,
+        *,
+        state_path: Path,
+        required: dict,
+        bootloader_state_path: Path,
+        bootloader_required: dict | None,
+        flash_required: bool,
+    ) -> None:
+        if not flash_required:
+            return
+        _write_pending_provision_state(
+            state_path,
+            cfg_path=cfg_path,
+            measurement_id=measurement_id,
+            required=required,
+        )
+        if bootloader_required is not None:
+            _write_pending_provision_state(
+                bootloader_state_path,
+                cfg_path=cfg_path,
+                measurement_id=measurement_id,
+                required=bootloader_required,
+            )
+        log.info(
+            "%s reusable provisioning state invalidated: flash attempted; startup verification pending",
+            device_name,
+        )
+
+    mark_device_flash_pending(
+        "DUT",
+        state_path=dut_state_path,
+        required=dut_required,
+        bootloader_state_path=dut_bootloader_state_path,
+        bootloader_required=bootloader_required_dut,
+        flash_required=not dut_matches or not dut_bootloader_matches,
+    )
+    mark_device_flash_pending(
+        "Tester",
+        state_path=tester_state_path,
+        required=tester_required,
+        bootloader_state_path=tester_bootloader_state_path,
+        bootloader_required=bootloader_required_tester,
+        flash_required=not tester_matches or not tester_bootloader_matches,
+    )
 
     if bootloader_required_dut is not None and not dut_bootloader_matches:
         _flash(bootloader_image, dut_probe_sn, commander=commander)
+        _write_sent_provision_state(
+            dut_bootloader_state_path,
+            cfg_path=cfg_path,
+            measurement_id=measurement_id,
+            required=bootloader_required_dut,
+        )
         log.info("DUT bootloader flashed successfully: %s", bootloader_image)
     
     if bootloader_required_tester is not None and not tester_bootloader_matches:
         _flash(bootloader_image, tester_probe_sn, commander=commander)
+        _write_sent_provision_state(
+            tester_bootloader_state_path,
+            cfg_path=cfg_path,
+            measurement_id=measurement_id,
+            required=bootloader_required_tester,
+        )
         log.info("Tester bootloader flashed successfully: %s", bootloader_image)
 
     if not dut_matches:
         _flash(dut_image, dut_probe_sn, commander=commander)
+        _write_sent_provision_state(
+            dut_state_path,
+            cfg_path=cfg_path,
+            measurement_id=measurement_id,
+            required=dut_required,
+        )
         log.info("DUT flashed successfully: %s", dut_image)
         _wait_for_serial_port(dut_serial_port)
 
     if not tester_matches:
         _flash(tester_image, tester_probe_sn, commander=commander)
+        _write_sent_provision_state(
+            tester_state_path,
+            cfg_path=cfg_path,
+            measurement_id=measurement_id,
+            required=tester_required,
+        )
         log.info("Tester flashed successfully: %s", tester_image)
         _wait_for_serial_port(tester_serial_port)
 
     # Having a small 250ms wait gives a short grace period in case something took a little longer
     time.sleep(0.25)
 
-    if bootloader_required_dut is not None:
+    ready_devices: set[str] = set()
+
+    def mark_device_ready(device_name: str) -> None:
+        """Persist reusable state after the device passed startup verification."""
+
+        if device_name in ready_devices:
+            return
+        if device_name == "dut":
+            bootloader_state_path = dut_bootloader_state_path
+            bootloader_required = bootloader_required_dut
+            bootloader_matches = dut_bootloader_matches
+            state_path = dut_state_path
+            required = dut_required
+            matches = dut_matches
+        elif device_name == "tester":
+            bootloader_state_path = tester_bootloader_state_path
+            bootloader_required = bootloader_required_tester
+            bootloader_matches = tester_bootloader_matches
+            state_path = tester_state_path
+            required = tester_required
+            matches = tester_matches
+        else:
+            raise ValueError(f"unknown provisioned device: {device_name}")
+
+        if bootloader_required is not None:
+            _write_provision_state(
+                bootloader_state_path,
+                {
+                    "cfg_path": cfg_path,
+                    "measurement_id": measurement_id,
+                    "status": "reused" if bootloader_matches else "flashed",
+                    "readiness": "verified",
+                    "required": bootloader_required,
+                    "last_flashed": bootloader_required,
+                },
+            )
         _write_provision_state(
-            dut_bootloader_state_path,
+            state_path,
             {
                 "cfg_path": cfg_path,
-                "status": "reused" if dut_bootloader_matches else "flashed",
-                "required": bootloader_required_dut,
-                "last_flashed": bootloader_required_dut,
+                "measurement_id": measurement_id,
+                "status": "reused" if matches else "flashed",
+                "readiness": "verified",
+                "required": required,
+                "last_flashed": required,
             },
         )
-    if bootloader_required_tester is not None:
-        _write_provision_state(
-            tester_bootloader_state_path,
-            {
-                "cfg_path": cfg_path,
-                "status": "reused" if tester_bootloader_matches else "flashed",
-                "required": bootloader_required_tester,
-                "last_flashed": bootloader_required_tester,
-            },
-        )
-    _write_provision_state(
-        dut_state_path,
-        {
-            "cfg_path": cfg_path,
-            "status": "reused" if dut_matches else "flashed",
-            "required": dut_required,
-            "last_flashed": dut_required,
-        },
-    )
-    _write_provision_state(
-        tester_state_path,
-        {
-            "cfg_path": cfg_path,
-            "status": "reused" if tester_matches else "flashed",
-            "required": tester_required,
-            "last_flashed": tester_required,
-        },
-    )
+        ready_devices.add(device_name)
+
+    return mark_device_ready

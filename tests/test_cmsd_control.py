@@ -109,6 +109,17 @@ def test_parser_accepts_restart() -> None:
     assert args.command == "restart"
 
 
+def test_parser_maps_timeout_overrides_to_daemon_config() -> None:
+    args = cmsd.build_daemon_parser().parse_args(
+        ["--startup-timeout", "12.5", "--stop-timeout", "3.0", "status"]
+    )
+
+    config = cmsd.daemon_config_from_args(args)
+
+    assert config.startup_timeout_s == 12.5
+    assert config.stop_timeout_s == 3.0
+
+
 def test_config_from_args_overrides_only_explicit_values(tmp_path: Path) -> None:
     args = argparse.Namespace(
         host="127.0.0.1",

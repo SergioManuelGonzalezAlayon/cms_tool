@@ -730,7 +730,13 @@ def build_daemon_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-root", type=Path, default=None, help="Runtime storage root")
     parser.add_argument("--artifacts-root", type=Path, default=None, help="Persistent artifact root")
     parser.add_argument("--bench-config", type=Path, default=None, help="CMS bench runtime configuration")
-    parser.add_argument("--startup-timeout", type=float, default=None, help="Seconds to wait for /health")
+    parser.add_argument(
+        "--startup-timeout",
+        dest="startup_timeout_s",
+        type=float,
+        default=None,
+        help="Seconds to wait for /health",
+    )
     parser.add_argument(
         "--stop-timeout",
         dest="stop_timeout_s",
