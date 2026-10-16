@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -22,28 +23,33 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="Action in kind:value form; actions execute in the supplied order.",
     )
+    parser.add_argument("--cleanup-marker", default="")
     args = parser.parse_args(argv)
 
-    for action in args.action:
-        kind, separator, value = action.partition(":")
-        if not separator:
-            raise ValueError(f"invalid fake child action: {action}")
-        if kind == "stdout":
-            print(value, file=sys.stdout, flush=True)
-        elif kind == "stderr":
-            print(value, file=sys.stderr, flush=True)
-        elif kind == "pause":
-            time.sleep(float(value))
-        elif kind == "stdout-repeat":
-            _emit_repeated(sys.stdout, "stdout", int(value))
-        elif kind == "stderr-repeat":
-            _emit_repeated(sys.stderr, "stderr", int(value))
-        elif kind == "exit":
-            return int(value)
-        elif kind == "abrupt-exit":
-            os._exit(int(value))
-        else:
-            raise ValueError(f"unknown fake child action: {kind}")
+    try:
+        for action in args.action:
+            kind, separator, value = action.partition(":")
+            if not separator:
+                raise ValueError(f"invalid fake child action: {action}")
+            if kind == "stdout":
+                print(value, file=sys.stdout, flush=True)
+            elif kind == "stderr":
+                print(value, file=sys.stderr, flush=True)
+            elif kind == "pause":
+                time.sleep(float(value))
+            elif kind == "stdout-repeat":
+                _emit_repeated(sys.stdout, "stdout", int(value))
+            elif kind == "stderr-repeat":
+                _emit_repeated(sys.stderr, "stderr", int(value))
+            elif kind == "exit":
+                return int(value)
+            elif kind == "abrupt-exit":
+                os._exit(int(value))
+            else:
+                raise ValueError(f"unknown fake child action: {kind}")
+    finally:
+        if args.cleanup_marker:
+            Path(args.cleanup_marker).write_text("cleanup\n", encoding="utf-8")
     return 0
 
 

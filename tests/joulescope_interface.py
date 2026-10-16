@@ -274,6 +274,7 @@ def write_single_pattern_results(profile, out_dir, *, test_name=None, config_nam
             "note_path": note_path,
         }
 
+
     consolidated_csv = analyzer.dump_consolidated_csv_report(
         out_dir,
         filename=f"{stem}_consolidated_report.csv",
@@ -300,6 +301,7 @@ def write_joulescope_artifacts(
     test_name: str,
     config_name: str,
     config_path: Path,
+    device_version: str,
     voltage_override: float | None = None,
     result_generator=None,
 ):
@@ -307,7 +309,7 @@ def write_joulescope_artifacts(
         return None
 
     log.info("Saving analysis outputs for %s/%s", test_name, config_name)
-    profile = get_profile(js, js.capture_data)
+    profile = get_profile(js, js.capture_data, device_version)
 
     out_dir = _artifact_out_dir(config_path)
 

@@ -210,6 +210,15 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixt
         return
 
     js = request.getfixturevalue("JoulescopeDev")
+    effective_config = _effective_dev_config(request)
+    joulescope_config = effective_config.get("joulescope", effective_config.get("Joulescope", {}))
+    device_version = str(joulescope_config.get("model", "")).strip().lower()
+    if device_version not in {"js220", "js320"}:
+        pytest.fail(
+            f"Invalid 'joulescope.model' value: {device_version!r}. "
+            "Expected 'js220' or 'js320' in the CMS bench runtime config."
+        )
+
     capture_sequence_before = getattr(js, "capture_sequence", 0)
     test_name = request.node.name.removeprefix("test_")
     cfg_opt = request.config.getoption("--cfg")
@@ -245,6 +254,7 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixt
         test_name=test_name,
         config_name=config_name,
         config_path=config_path,
+        device_version=device_version,
         voltage_override=supply_v,
         result_generator=ResultGeneratorFixture,
     )

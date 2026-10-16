@@ -11,7 +11,7 @@ def test_configured_dut_slcp_selects_the_matching_dcdc_or_no_dcdc_project() -> N
     assert _firmware_project_name(Path("apps/ncp_ble_dut.slcp")) == "ncp_ble_dut"
 
 
-def test_failed_startup_does_not_make_provision_state_reusable(
+def test_failed_startup_reuses_firmware_already_sent_for_same_measurement(
     tmp_path,
     monkeypatch,
     caplog,
@@ -88,14 +88,16 @@ def test_failed_startup_does_not_make_provision_state_reusable(
     assert f"Tester={state_root / 'tester_ready.json'}" in caplog.text
     failed_dut_state = conftest._read_provision_state(state_root / "dut_last_flashed.json")
     failed_tester_state = conftest._read_provision_state(state_root / "tester_ready.json")
-    assert failed_dut_state["status"] == "flash_attempted"
-    assert failed_tester_state["status"] == "flash_attempted"
+    assert failed_dut_state["status"] == "sent"
+    assert failed_tester_state["status"] == "sent"
     assert failed_dut_state["measurement_id"] == "measurement-1"
     assert failed_tester_state["measurement_id"] == "measurement-1"
     assert failed_dut_state["readiness"] == "unverified"
     assert failed_tester_state["readiness"] == "unverified"
     assert "last_flashed" not in failed_dut_state
     assert "last_flashed" not in failed_tester_state
+    assert failed_dut_state["last_sent"]["sha256"] == conftest._file_sha256(dut_image)
+    assert failed_tester_state["last_sent"]["sha256"] == conftest._file_sha256(tester_image)
     assert run_attempt() is True
     verified_dut_state = conftest._read_provision_state(state_root / "dut_last_flashed.json")
     verified_tester_state = conftest._read_provision_state(state_root / "tester_ready.json")
@@ -106,9 +108,33 @@ def test_failed_startup_does_not_make_provision_state_reusable(
     assert flash_calls == [
         (dut_image, "dut-probe"),
         (tester_image, "tester-probe"),
-        (dut_image, "dut-probe"),
-        (tester_image, "tester-probe"),
     ]
+
+
+def test_sent_provision_state_reuse_requires_measurement_and_matching_firmware() -> None:
+    required = {
+        "project_name": "ncp_ble_dut",
+        "slcp": "ncp_ble_dut.slcp",
+        "board": "brd4182a",
+        "probe_sn": "dut-probe",
+        "sha256": "dut-hash",
+    }
+    state = {
+        "measurement_id": "measurement-1",
+        "status": "sent",
+        "readiness": "unverified",
+        "last_sent": required,
+    }
+
+    assert conftest._same_image(
+        required,
+        conftest._sent_last_flashed(state, "measurement-1"),
+    )
+    assert conftest._sent_last_flashed(state, "measurement-2") is None
+    assert not conftest._same_image(
+        {**required, "sha256": "other-hash"},
+        conftest._sent_last_flashed(state, "measurement-1"),
+    )
 
 
 def test_provision_state_root_resolves_relative_paths_from_repository_root(tmp_path) -> None:

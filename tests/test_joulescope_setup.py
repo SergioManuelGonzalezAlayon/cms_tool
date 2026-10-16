@@ -92,6 +92,41 @@ def test_capture_restores_debug_mode_and_vcom_after_capture_failure(monkeypatch)
     ]
 
 
+def test_capture_restores_debug_mode_and_vcom_after_keyboard_interrupt(monkeypatch) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(joulescope_interface, "_effective_wpk_config", lambda: {})
+    monkeypatch.setattr(
+        joulescope_interface,
+        "setVCOM",
+        lambda _config, enabled: events.append("vcom_on" if enabled else "vcom_off"),
+    )
+    monkeypatch.setattr(
+        joulescope_interface,
+        "setDebugMode",
+        lambda _config, mode: events.append(f"debug_{mode}"),
+    )
+    js = _FakeCaptureJoulescope(events)
+
+    def interrupt_capture(*_args, **_kwargs):
+        events.append("capture")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(js, "read", interrupt_capture)
+
+    with pytest.raises(KeyboardInterrupt):
+        js.capture(1.0)
+
+    assert events == [
+        "sleep",
+        "vcom_off",
+        "debug_OFF",
+        "capture",
+        "debug_MCU",
+        "vcom_on",
+        "wake",
+    ]
+
+
 class _FakeCaptureJoulescope(joulescope_interface.WakePinJoulescope):
     def __init__(
         self,

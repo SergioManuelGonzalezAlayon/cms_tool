@@ -226,6 +226,49 @@ def test_managed_process_cancellation_stops_child_and_drains_output(tmp_path: Pa
     assert states[-1] == "process_cancelled"
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="CMS Bench cancellation currently targets Linux process groups")
+def test_managed_process_cancellation_runs_child_cleanup(tmp_path: Path) -> None:
+    event_stream = MeasurementEventStream(
+        "measurement-123",
+        MeasurementRuntimePaths.from_root(tmp_path),
+    )
+    cancel_event = threading.Event()
+    cleanup_marker = tmp_path / "cleanup.marker"
+    outcomes: list[subprocess.CompletedProcess] = []
+    worker = threading.Thread(
+        target=lambda: outcomes.append(
+            cms_bench._run_managed_process(
+                [
+                    *_fake_command("stdout:ready", "pause:30"),
+                    "--cleanup-marker",
+                    str(cleanup_marker),
+                ],
+                cwd=Path("."),
+                stdout_path=tmp_path / "stdout.log",
+                stderr_path=tmp_path / "stderr.log",
+                event_stream=event_stream,
+                cancel_event=cancel_event,
+            )
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    stdout_path = tmp_path / "stdout.log"
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if stdout_path.exists() and "ready" in stdout_path.read_text(encoding="utf-8"):
+            break
+        time.sleep(0.01)
+
+    cancel_event.set()
+    worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert outcomes[0].returncode != 0
+    assert cleanup_marker.read_text(encoding="utf-8") == "cleanup\n"
+
+
 def test_linux_process_tree_termination_escalates_process_group(monkeypatch) -> None:
     sent_signals = []
     sigkill = getattr(signal, "SIGKILL", 9)
