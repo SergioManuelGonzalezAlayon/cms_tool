@@ -168,7 +168,8 @@ def cms_firmware_metadata(path: str) -> dict:
 
 
 def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
 
 
 def build_jobs(
@@ -196,13 +197,9 @@ def build_jobs(
         config_paths = discover_config_files(config_dir, mode)
         if exact_config:
             selected_config_path = exact_config_path(config_dir, exact_config)
-            config_paths = [
-                config_path
-                for config_path in config_paths
-                if config_path.resolve() == selected_config_path
-            ]
-            if not config_paths:
+            if not selected_config_path.is_file():
                 raise ValueError(f"exact config was not found: {exact_config}")
+            config_paths = [selected_config_path]
 
         for config_path in config_paths:
             config = load_json(config_path)

@@ -412,16 +412,11 @@ def DUTPAwRStart(DUT,
             advertising_phy_to_str(DUTAdvConfig.secondary_phy),
         )
 
-        rsp = DUT.bt.pawr_advertiser.start(
+        rsp = start_pawr_advertising(
+            DUT,
             DUTAdvConfig.set,
-            DUTAdvConfig.min_interval,
-            DUTAdvConfig.max_interval,
-            flags,
-            pawr_cfg.num_subevents,
-            pawr_cfg.subevent_interval,
-            pawr_cfg.response_slot_delay,
-            pawr_cfg.response_slot_spacing,
-            pawr_cfg.response_slots,
+            pawr_cfg,
+            flags=flags,
         )
         assert rsp.result == 0
 
@@ -772,16 +767,11 @@ def TesterPAwRStart(Tester,
             advertising_phy_to_str(TesterAdvConfig.secondary_phy),
         )
 
-        rsp = Tester.bt.pawr_advertiser.start(
+        rsp = start_pawr_advertising(
+            Tester,
             TesterAdvConfig.set,
-            TesterAdvConfig.min_interval,
-            TesterAdvConfig.max_interval,
-            flags,
-            pawr_cfg.num_subevents,
-            pawr_cfg.subevent_interval,
-            pawr_cfg.response_slot_delay,
-            pawr_cfg.response_slot_spacing,
-            pawr_cfg.response_slots,
+            pawr_cfg,
+            flags=flags,
         )
         assert rsp.result == 0
 

@@ -90,6 +90,12 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
                 or metadata.get("joulescope", {}).get("id")
                 or metadata.get("Joulescope", {}).get("id")
             ),
+            "model": str(
+                joulescope.get("model")
+                or metadata.get("joulescope", {}).get("model")
+                or metadata.get("Joulescope", {}).get("model")
+                or ""
+            ).strip().lower(),
         },
         "bench": {
             "bench_id": bench.get("bench_id"),

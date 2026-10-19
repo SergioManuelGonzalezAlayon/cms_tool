@@ -1,6 +1,11 @@
 import json
 
+import pytest
+
 import s3_upload
+
+
+pytestmark = pytest.mark.skip(reason="S3 upload tests are run separately")
 
 
 def test_record_upload_location_uses_cms_storage_metadata(tmp_path):

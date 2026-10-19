@@ -21,7 +21,7 @@ from cms_protocol import (
 )
 
 
-FAKE_CHILD = Path(__file__).parent / "helpers" / "fake_child_process.py"
+FAKE_CHILD = Path(__file__).resolve().parents[2] / "tests" / "helpers" / "fake_child_process.py"
 
 
 def _fake_command(*actions: str) -> list[str]:
@@ -355,6 +355,10 @@ def test_orchestrator_starts_python_unbuffered_and_uses_runtime_logs(
         cwd,
         stdout_path,
         stderr_path,
+        persistent_stdout_path,
+        persistent_stderr_path,
+        pytest_log_source_path,
+        persistent_pytest_log_path,
         event_stream,
         relay_event_stream,
         relay_variant,
@@ -367,6 +371,10 @@ def test_orchestrator_starts_python_unbuffered_and_uses_runtime_logs(
             cwd=cwd,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
+            persistent_stdout_path=persistent_stdout_path,
+            persistent_stderr_path=persistent_stderr_path,
+            pytest_log_source_path=pytest_log_source_path,
+            persistent_pytest_log_path=persistent_pytest_log_path,
             event_stream=event_stream,
             relay_event_stream=relay_event_stream,
             relay_variant=relay_variant,
@@ -389,6 +397,10 @@ def test_orchestrator_starts_python_unbuffered_and_uses_runtime_logs(
     assert command[:3] == [sys.executable, "-u", "test_orchestrator.py"]
     assert observed["stdout_path"] == session.runtime_paths.stdout
     assert observed["stderr_path"] == session.runtime_paths.stderr
+    assert observed["persistent_stdout_path"] is None
+    assert observed["persistent_stderr_path"] is None
+    assert observed["pytest_log_source_path"] == tmp_path / "pytest.log"
+    assert observed["persistent_pytest_log_path"] is None
     assert observed["event_stream"] is session.event_stream
     assert observed["relay_event_stream"] is None
     assert observed["relay_variant"] == ""

@@ -32,6 +32,11 @@ def _job(name: str) -> orchestrator.Job:
     )
 
 
+def _normalized_sha256(path: Path) -> str:
+    data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(data).hexdigest()
+
+
 def test_job_plan_preserves_complete_discovery_order():
     jobs = [_job("first"), _job("second"), _job("third")]
 
@@ -85,7 +90,7 @@ def test_main_writes_complete_plan_before_first_pytest_job(tmp_path, monkeypatch
     observed_job_ids = []
     monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: jobs)
 
-    def fake_run_job(job, pytest_args, junit_path):
+    def fake_run_job(job, pytest_args, junit_path, *, include_junit_logs=False):
         plan_path = tmp_path / "orchestrator_plan.json"
         assert plan_path.exists()
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
@@ -144,7 +149,10 @@ def test_orchestrator_retries_only_retryable_startup_failures(tmp_path, monkeypa
     monkeypatch.setattr(
         orchestrator,
         "run_job",
-        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or next(outcomes), 0.01),
+        lambda job, pytest_args, junit_path, *, include_junit_logs=False: (
+            executed.append(job.job_id) or next(outcomes),
+            0.01,
+        ),
     )
 
     exit_code = orchestrator.main(["--results-log", str(results_log)])
@@ -184,7 +192,10 @@ def test_orchestrator_continues_after_exhausting_retryable_startup_retries(tmp_p
     monkeypatch.setattr(
         orchestrator,
         "run_job",
-        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or next(outcomes), 0.01),
+        lambda job, pytest_args, junit_path, *, include_junit_logs=False: (
+            executed.append(job.job_id) or next(outcomes),
+            0.01,
+        ),
     )
 
     exit_code = orchestrator.main(["--results-log", str(results_log)])
@@ -227,7 +238,10 @@ def test_orchestrator_does_not_retry_ordinary_pytest_failures(tmp_path, monkeypa
     monkeypatch.setattr(
         orchestrator,
         "run_job",
-        lambda job, pytest_args, junit_path: (calls.append(job.job_id) or 1, 0.01),
+        lambda job, pytest_args, junit_path, *, include_junit_logs=False: (
+            calls.append(job.job_id) or 1,
+            0.01,
+        ),
     )
 
     exit_code = orchestrator.main(["--results-log", str(tmp_path / "results.jsonl")])
@@ -251,7 +265,10 @@ def test_orchestrator_retries_startup_failures_in_every_mode(tmp_path, monkeypat
     monkeypatch.setattr(
         orchestrator,
         "run_job",
-        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or next(outcomes), 0.01),
+        lambda job, pytest_args, junit_path, *, include_junit_logs=False: (
+            executed.append(job.job_id) or next(outcomes),
+            0.01,
+        ),
     )
 
     exit_code = orchestrator.main(
@@ -276,7 +293,10 @@ def test_resume_plan_keeps_jobs_that_execution_skips(tmp_path, monkeypatch):
     monkeypatch.setattr(
         orchestrator,
         "run_job",
-        lambda job, pytest_args, junit_path: (executed.append(job.job_id) or 0, 0.01),
+        lambda job, pytest_args, junit_path, *, include_junit_logs=False: (
+            executed.append(job.job_id) or 0,
+            0.01,
+        ),
     )
 
     exit_code = orchestrator.main(["--resume", "--results-log", str(results_log)])
@@ -320,7 +340,11 @@ def test_failed_job_gets_terminal_failed_record(tmp_path, monkeypatch):
     job = _job("failure")
     results_log = tmp_path / "orchestrator_results.jsonl"
     monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: [job])
-    monkeypatch.setattr(orchestrator, "run_job", lambda job, pytest_args, junit_path: (7, 1.2345))
+    monkeypatch.setattr(
+        orchestrator,
+        "run_job",
+        lambda job, pytest_args, junit_path, *, include_junit_logs=False: (7, 1.2345),
+    )
 
     exit_code = orchestrator.main(["--results-log", str(results_log)])
     records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
@@ -399,7 +423,7 @@ def test_build_jobs_hashes_config_and_propagates_measurement_identity(tmp_path, 
     )
 
     assert len(jobs) == 1
-    assert jobs[0].config_hash == hashlib.sha256(config_path.read_bytes()).hexdigest()
+    assert jobs[0].config_hash == _normalized_sha256(config_path)
     assert jobs[0].measurement_id == "measurement-123"
     assert jobs[0].run_name == "Readable Run"
     assert jobs[0].measurement_created_at == "2026-08-18T09:30:00+00:00"
@@ -412,7 +436,7 @@ def test_build_jobs_propagates_requested_config_hash_from_cms_metadata(tmp_path,
     (feature_dir / "parameters.json").write_text("{}\n", encoding="utf-8")
     config_path = feature_dir / "default.json"
     config_path.write_text("{}\n", encoding="utf-8")
-    config_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    config_hash = _normalized_sha256(config_path)
     metadata_path = tmp_path / "cms_fw_metadata.json"
     metadata_path.write_text(
         json.dumps(
@@ -822,7 +846,7 @@ def test_build_jobs_can_select_one_exact_named_config(tmp_path, monkeypatch):
     assert len(jobs) == 1
     assert jobs[0].cfg_arg == "dcdc.json"
     assert jobs[0].config_path == exact_path
-    assert jobs[0].config_hash == hashlib.sha256(exact_path.read_bytes()).hexdigest()
+    assert jobs[0].config_hash == _normalized_sha256(exact_path)
 
 
 def test_exact_named_config_rejects_missing_and_out_of_scope_paths(tmp_path, monkeypatch):
@@ -888,41 +912,58 @@ def test_run_job_passes_authoritative_unique_junit_path(tmp_path, monkeypatch):
     assert captured["cmd"][-2:] == ["--junitxml", str(junit_path)]
 
 
-def test_run_job_retries_retryable_pytest_return_code(tmp_path, monkeypatch):
+def test_orchestrator_retries_retryable_startup_return_code(tmp_path, monkeypatch):
     job = _job("default")
-    junit_path = tmp_path / "junit" / "0001-beacon-default.xml"
-    returncodes = [2, 0]
+    results_log = tmp_path / "orchestrator_results.jsonl"
+    returncodes = iter([RETRYABLE_STARTUP_EXIT_CODE, 0])
     calls = []
 
     def fake_subprocess_run(cmd, **kwargs):
         calls.append(cmd)
-        return SimpleNamespace(returncode=returncodes.pop(0))
+        return SimpleNamespace(returncode=next(returncodes))
 
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: [job])
     monkeypatch.setattr(orchestrator.subprocess, "run", fake_subprocess_run)
 
-    returncode, _ = orchestrator.run_job(job, [], junit_path)
+    exit_code = orchestrator.main(["--results-log", str(results_log)])
 
-    assert returncode == 0
+    assert exit_code == 0
     assert len(calls) == 2
     assert calls[0] == calls[1]
+    records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
+    assert [record["record_type"] for record in records] == [
+        "job_started",
+        "job_retry",
+        "job_completed",
+    ]
+    assert records[-1]["retry_count"] == 1
 
 
-def test_run_job_stops_after_retryable_return_code_budget(tmp_path, monkeypatch):
+def test_orchestrator_stops_after_retryable_startup_retry_budget(tmp_path, monkeypatch):
     job = _job("default")
-    junit_path = tmp_path / "junit" / "0001-beacon-default.xml"
+    results_log = tmp_path / "orchestrator_results.jsonl"
     calls = []
 
     def fake_subprocess_run(cmd, **kwargs):
         calls.append(cmd)
-        return SimpleNamespace(returncode=2)
+        return SimpleNamespace(returncode=RETRYABLE_STARTUP_EXIT_CODE)
 
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: [job])
     monkeypatch.setattr(orchestrator.subprocess, "run", fake_subprocess_run)
 
-    returncode, _ = orchestrator.run_job(job, [], junit_path)
+    exit_code = orchestrator.main(["--results-log", str(results_log)])
 
-    assert returncode == 2
-    assert len(calls) == 3
-    assert calls[0] == calls[1] == calls[2]
+    assert exit_code == 1
+    assert len(calls) == orchestrator.TEST_RETRY_COUNT + 1
+    assert all(cmd == calls[0] for cmd in calls)
+    records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
+    assert [record["record_type"] for record in records] == [
+        "job_started",
+        *(["job_retry"] * orchestrator.TEST_RETRY_COUNT),
+        "job_completed",
+    ]
+    assert records[-1]["retry_count"] == orchestrator.TEST_RETRY_COUNT
+    assert records[-1]["attempt_count"] == orchestrator.TEST_RETRY_COUNT + 1
 
 
 def test_orchestrated_job_does_not_write_configured_global_junit(tmp_path, monkeypatch):
@@ -961,7 +1002,7 @@ def test_standalone_orchestrator_still_strips_forwarded_pytest_cfg(tmp_path, mon
     monkeypatch.setattr(
         orchestrator,
         "run_job",
-        lambda job, pytest_args, junit_path: (
+        lambda job, pytest_args, junit_path, *, include_junit_logs=False: (
             observed_pytest_args.extend(pytest_args) or 0,
             0.01,
         ),

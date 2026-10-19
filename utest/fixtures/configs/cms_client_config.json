@@ -1,0 +1,39 @@
+{
+  "daemon": {
+    "scheme": "http",
+    "host": "127.0.0.1",
+    "port": 8000,
+    "api_token": "dummy-daemon-token-not-for-use",
+    "timeout_s": 12.0
+  },
+  "benches": {
+    "cms-bench-dummy-001": {
+      "scheme": "http",
+      "host": "127.0.0.1",
+      "port": 8001,
+      "api_token": "dummy-bench-token-not-for-use",
+      "timeout_s": 8.0
+    }
+  },
+  "tools": {
+    "slt": "tools/slt",
+    "slc": "tools/slc",
+    "cmake": "tools/cmake",
+    "commander": "tools/commander"
+  },
+  "build": {
+    "root": ".fw_build",
+    "bootloader_slcp": "apps/bootloader-uart-bgapi.slcp"
+  },
+  "target": {
+    "board": "BRD4182A",
+    "board_rev": "B06",
+    "device": "EFR32MG22C224F512IM40-C",
+    "sisdk": "dummy-sdk-version",
+    "dut_jlink_serial": "DUMMY-DUT-PROBE"
+  },
+  "diff": {
+    "sisdk_version2_path": "sdk/child",
+    "sisdk_version1_path": "sdk/parent"
+  }
+}

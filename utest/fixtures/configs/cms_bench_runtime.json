@@ -1,0 +1,35 @@
+{
+  "bench": {
+    "bench_id": "cms-bench-dummy-001",
+    "hostname": "cms-bench-dummy-host",
+    "profile": "bench-lite"
+  },
+  "joulescope": {
+    "id": "DUMMY-JOULESCOPE-USB-ID",
+    "model": "JS320",
+    "wake_gpio": 4
+  },
+  "dut": {
+    "serial_port": "DUMMY-DUT-SERIAL-PORT",
+    "baudrate": 115200,
+    "probe_sn": "DUMMY-DUT-PROBE"
+  },
+  "tester": {
+    "serial_port": "DUMMY-TESTER-SERIAL-PORT",
+    "baudrate": 115200,
+    "probe_sn": "DUMMY-TESTER-PROBE"
+  },
+  "tools": {
+    "commander": "tools/commander"
+  },
+  "ble": {
+    "xapi": "fixtures/sl_bt.xapi"
+  },
+  "devices": {
+    "board": "BRD4182A",
+    "board_rev": "B06",
+    "part_number": "EFR32MG22C224F512IM40",
+    "serial_number": "DUMMY-RADIO-BOARD-SERIAL",
+    "device": "EFR32MG22C224F512IM40-C"
+  }
+}

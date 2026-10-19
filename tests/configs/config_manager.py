@@ -336,18 +336,29 @@ def is_pawr_config_valid(response_slot_number,
         3   # CRC
     )
 
-    byte_time_ms = pawr_phy_byte_time_ms(phy)
+    # Config files store PAwR timing values in BGAPI units, while packet
+    # airtime and T_IFS are measured in milliseconds.
+    response_slot_spacing_ms = Decimal(response_slot_spacing) * Decimal("0.125")
+    subevent_interval_ms = Decimal(subevent_interval) * Decimal("1.25")
+    pawr_interval_ms = Decimal(str(pawr_interval))
+    response_slot_delay_ms = Decimal(response_slot_delay) * Decimal("1.25")
+    t_ifs_ms = Decimal(str(t_ifs))
+    byte_time_ms = Decimal(str(pawr_phy_byte_time_ms(phy)))
 
-    used_airtime_per_payload = (overhead_bytes + payload_size)* byte_time_ms
-    if(used_airtime_per_payload + t_ifs > response_slot_spacing):
+    used_airtime_per_payload = Decimal(overhead_bytes + payload_size) * byte_time_ms
+    if used_airtime_per_payload + t_ifs_ms > response_slot_spacing_ms:
        return False
 
-    used_airtime_per_subevent_interval = response_slot_number * (response_slot_spacing + t_ifs) + (response_slot_delay + t_ifs)
-    if(used_airtime_per_subevent_interval > subevent_interval):
+    used_airtime_per_subevent_interval = (
+        Decimal(response_slot_number) * (response_slot_spacing_ms + t_ifs_ms)
+        + response_slot_delay_ms
+        + t_ifs_ms
+    )
+    if used_airtime_per_subevent_interval > subevent_interval_ms:
         return False
 
-    used_airtime_per_pawr_interval = subevent_number * used_airtime_per_subevent_interval
-    if(used_airtime_per_pawr_interval > pawr_interval):
+    used_airtime_per_pawr_interval = Decimal(subevent_number) * subevent_interval_ms
+    if used_airtime_per_pawr_interval > pawr_interval_ms:
         return False
     
     return True

@@ -14,7 +14,7 @@ from cms_protocol import (
 from cmsd import CMSDaemon, DaemonConfig
 
 
-_RESULTS_GENERATOR_PATH = Path(__file__).with_name("results_generator.py")
+_RESULTS_GENERATOR_PATH = Path(__file__).resolve().parents[1] / "tests" / "results_generator.py"
 _SPEC = importlib.util.spec_from_file_location("results_generator_result_types", _RESULTS_GENERATOR_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 results_generator = importlib.util.module_from_spec(_SPEC)
@@ -34,7 +34,7 @@ def test_protocol_keeps_artifact_and_campaign_result_types_explicit():
     )["result_type"] == "campaign"
 
 
-def test_daemon_publishes_overall_result_as_campaign(tmp_path):
+def test_debug_manifest_publishes_overall_result_as_campaign(tmp_path):
     daemon = CMSDaemon(
         DaemonConfig(
             runtime_root=tmp_path / "runtime",
@@ -42,16 +42,20 @@ def test_daemon_publishes_overall_result_as_campaign(tmp_path):
             bench_config=tmp_path / "bench.json",
         )
     )
+    daemon.debug_artifact_measurements.add("measurement-123")
 
     result = daemon.publish_results(
         MeasurementResult(measurement_id="measurement-123", state=MeasurementState.PASSED)
     )
 
-    campaign_artifact = next(
-        artifact for artifact in result.artifacts if artifact.path and artifact.path.name == "measurement_result.json"
+    manifest_path = (
+        daemon.config.artifacts_root
+        / "measurements"
+        / "measurement-123"
+        / "measurement_result.json"
     )
-    payload = json.loads(campaign_artifact.path.read_text(encoding="utf-8"))
-    assert campaign_artifact.result_type is ResultType.CAMPAIGN
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert measurement_result_to_dict(result)["result_type"] == ResultType.CAMPAIGN.value
     assert payload["result_type"] == "campaign"
 
 

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -6,6 +7,7 @@ import pytest
 import cms_bench
 from cms_bench import BenchResources, BenchSession, CMSBench
 from cms_protocol import (
+    BenchIdentity,
     FirmwareData,
     FirmwareImage,
     MeasurementIdentity,
@@ -17,6 +19,10 @@ from cms_protocol import (
     SuiteSelector,
     VariableFilter,
 )
+
+
+_XAPI_BYTES = b"sl_bt.xapi"
+_XAPI_SHA256 = hashlib.sha256(_XAPI_BYTES).hexdigest()
 
 
 def _session(
@@ -31,7 +37,7 @@ def _session(
     firmware = FirmwareData(
         dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut-hash"),
         tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester-hash"),
-        xapi_file=FirmwareImage(name="sl_bt.xapi", url="sl_bt.xapi", sha256="xapi-hash"),
+        xapi_file=FirmwareImage(name="sl_bt.xapi", url="sl_bt.xapi", sha256=_XAPI_SHA256),
     )
     request = MeasurementRequest(
         request_id="measurement-123",
@@ -62,7 +68,7 @@ def test_pytest_runtime_metadata_contains_measurement_identity(tmp_path, monkeyp
     firmware = FirmwareData(
         dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut-hash"),
         tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester-hash"),
-        xapi_file=FirmwareImage(name="sl_bt.xapi", url="sl_bt.xapi", sha256="xapi-hash"),
+        xapi_file=FirmwareImage(name="sl_bt.xapi", url="sl_bt.xapi", sha256=_XAPI_SHA256),
     )
     request = MeasurementRequest(
         request_id=identity.measurement_id,
@@ -191,7 +197,16 @@ def test_pytest_runtime_materializes_named_dut_variants(tmp_path, monkeypatch):
 
 
 def test_pytest_runtime_metadata_contains_requested_config_hash(tmp_path, monkeypatch):
-    session = _session(tmp_path, config="dcdc", config_hash="sha256:dcdc")
+    config_root = tmp_path / "tests" / "configs" / "ble" / "beacon"
+    config_root.mkdir(parents=True)
+    config_path = config_root / "dcdc.json"
+    config_path.write_text(
+        '{"firmware":{"dut_slcp":"dut.slcp","tester_slcp":"tester.slcp"}}\n',
+        encoding="utf-8",
+    )
+    config_hash = cms_bench._sha256_text_file_lf_normalized(config_path)
+    monkeypatch.chdir(tmp_path)
+    session = _session(tmp_path, config="dcdc", config_hash=config_hash)
     for name in ("dut.s37", "tester.s37", "sl_bt.xapi"):
         (tmp_path / name).write_bytes(name.encode("ascii"))
     monkeypatch.setattr(
@@ -207,7 +222,7 @@ def test_pytest_runtime_metadata_contains_requested_config_hash(tmp_path, monkey
         "mode": "ble",
         "feature": "beacon",
         "config": "dcdc",
-        "config_hash": "sha256:dcdc",
+        "config_hash": config_hash,
         "variable_filters": [],
     }
 
@@ -522,15 +537,17 @@ def test_generic_runner_passes_campaign_active_root_to_runtime_preparation(tmp_p
     session = _session(tmp_path)
     bench = CMSBench()
     bench.initialized = True
+    bench.identity = BenchIdentity(bench_id="cms-bench-dummy-001")
     captured = {}
     monkeypatch.setattr(bench, "test_smoke", lambda session: None)
     monkeypatch.setattr(
         cms_bench,
         "_prepare_pytest_runtime",
-        lambda session, resources, *, active_root=None: captured.setdefault("prepared", {
+        lambda session, resources, *, cms_bench_id="", active_root=None: captured.setdefault("prepared", {
             "results_log": tmp_path / "results.jsonl",
             "metadata_path": tmp_path / "metadata.json",
             "artifact_since": 0,
+            "cms_bench_id": cms_bench_id,
             "active_root": active_root,
         }),
     )
@@ -544,6 +561,7 @@ def test_generic_runner_passes_campaign_active_root_to_runtime_preparation(tmp_p
     active_root = tmp_path / "active"
     bench.measurement_run(session, active_root=active_root)
 
+    assert captured["prepared"]["cms_bench_id"] == "cms-bench-dummy-001"
     assert captured["prepared"]["active_root"] == active_root
 
 

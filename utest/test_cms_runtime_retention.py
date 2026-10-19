@@ -10,7 +10,7 @@ from cms_protocol import FirmwareData, FirmwareImage, MeasurementRequest, SuiteS
 from cmsd import CMSDaemon, DaemonConfig
 
 
-FAKE_CHILD = Path(__file__).parent / "helpers" / "fake_child_process.py"
+FAKE_CHILD = Path(__file__).resolve().parents[1] / "tests" / "helpers" / "fake_child_process.py"
 
 
 def test_console_event_segments_are_bounded_and_keep_structured_records(tmp_path: Path) -> None:

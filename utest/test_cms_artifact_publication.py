@@ -22,7 +22,7 @@ from cms_protocol import (
 from cmsd import CMSDaemon, DaemonConfig
 
 
-FAKE_CHILD = Path(__file__).parent / "helpers" / "fake_child_process.py"
+FAKE_CHILD = Path(__file__).resolve().parents[1] / "tests" / "helpers" / "fake_child_process.py"
 
 
 def _request(measurement_id: str) -> MeasurementRequest:

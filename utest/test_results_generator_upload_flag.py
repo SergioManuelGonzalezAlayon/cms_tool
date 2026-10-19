@@ -5,7 +5,7 @@ import importlib.util
 import pytest
 
 
-_RESULTS_GENERATOR_PATH = Path(__file__).with_name("results_generator.py")
+_RESULTS_GENERATOR_PATH = Path(__file__).resolve().parents[1] / "tests" / "results_generator.py"
 _SPEC = importlib.util.spec_from_file_location("results_generator_local_upload_flag", _RESULTS_GENERATOR_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 results_generator = importlib.util.module_from_spec(_SPEC)

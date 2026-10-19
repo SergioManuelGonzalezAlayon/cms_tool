@@ -165,6 +165,16 @@ uv run python .\tests\configs\config_manager.py generate --mode full_sweep
 uv run python .\test_orchestrator.py .\tests\configs\ble\beacon --mode full_sweep
 ```
 
+### Pre-push unit tests
+
+The repository includes a pre-push hook at `.githooks/pre-push`. Enable it for this checkout with:
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+Before each push, the hook runs `uv run pytest utest` from the repository root and blocks the push if the suite fails. Run the same command manually at any time.
+
 ## Notes On Current Status
 
 The repository has been migrated to `uv` structurally, but environment validation is still machine-dependent.
@@ -175,3 +185,4 @@ Known caveat:
 - if that happens, a missing MSVC / Windows SDK install can block `uv sync`
 
 If `uv sync` or pytest collection fails while building Joulescope dependencies, verify the local Visual C++ build tools and Windows SDK installation first.
+

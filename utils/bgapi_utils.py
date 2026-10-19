@@ -14,12 +14,15 @@ log = logging.getLogger(__name__)
 
 ADV_INTERVAL_UNIT_MS = Decimal("0.625")
 CONN_INTERVAL_UNIT_MS = Decimal("1.25")
+PAWR_INTERVAL_UNIT_MS = Decimal("1.25")
 CONN_SUPERVISION_TIMEOUT_UNIT_MS = Decimal("10")
 ADV_DURATION_UNIT_MS = Decimal("10")
 ADV_INTERVAL_MIN_UNITS = 0x20
 ADV_INTERVAL_MAX_UNITS = 0xFFFFFF
 CONN_INTERVAL_MIN_UNITS = 0x0006
 CONN_INTERVAL_MAX_UNITS = 0x0C80
+PAWR_INTERVAL_MIN_UNITS = 0x0006
+PAWR_INTERVAL_MAX_UNITS = 0xFFFF
 CONN_TIMEOUT_MIN_UNITS = 0x000A
 CONN_TIMEOUT_MAX_UNITS = 0x0C80
 PHY_1M = 0x1
@@ -167,6 +170,34 @@ def advertising_ms_from_units(units: int) -> Decimal:
 
 def connection_units_from_ms(milliseconds) -> int:
     return bgapi_units_from_ms(milliseconds, CONN_INTERVAL_UNIT_MS)
+
+
+def pawr_interval_units_from_ms(milliseconds) -> int:
+    """Convert a PAwR periodic interval in milliseconds to BGAPI units."""
+    units = bgapi_units_from_ms(milliseconds, PAWR_INTERVAL_UNIT_MS)
+    if units < PAWR_INTERVAL_MIN_UNITS:
+        raise ValueError(
+            f"PAwR interval must be >= 7.5 ms, got {milliseconds!r} ms"
+        )
+    if units > PAWR_INTERVAL_MAX_UNITS:
+        raise ValueError("PAwR interval exceeds BGAPI range")
+    return units
+
+
+def start_pawr_advertising(dev, advertising_set: int, config: PAWRConfig, *, flags=0):
+    """Start PAwR using its configured periodic interval and BGAPI units."""
+    interval = pawr_interval_units_from_ms(config.interval)
+    return dev.bt.pawr_advertiser.start(
+        advertising_set,
+        interval,
+        interval,
+        flags,
+        config.num_subevents,
+        config.subevent_interval,
+        config.response_slot_delay,
+        config.response_slot_spacing,
+        config.response_slots,
+    )
 
 
 def connection_ms_from_units(units: int) -> Decimal:

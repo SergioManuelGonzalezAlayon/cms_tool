@@ -1,9 +1,17 @@
+import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import conftest
-from conftest import _firmware_project_name
+
+_CONFTEST_PATH = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+_CONFTEST_SPEC = importlib.util.spec_from_file_location("cms_test_conftest", _CONFTEST_PATH)
+assert _CONFTEST_SPEC is not None and _CONFTEST_SPEC.loader is not None
+conftest = importlib.util.module_from_spec(_CONFTEST_SPEC)
+sys.modules[_CONFTEST_SPEC.name] = conftest
+_CONFTEST_SPEC.loader.exec_module(conftest)
+_firmware_project_name = conftest._firmware_project_name
 
 
 def test_configured_dut_slcp_selects_the_matching_dcdc_or_no_dcdc_project() -> None:

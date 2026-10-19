@@ -39,6 +39,7 @@ from cms_bench import (
     CMS_BENCH_CONFIG,
     MeasurementEventStream,
     MeasurementRuntimePaths,
+    _read_js_model,
     load_bench_runtime_config,
 )
 from cms_protocol import (
@@ -905,6 +906,21 @@ class CMSDaemon:
             self.reconstruct_interrupted_runtime_workspaces()
 
             identity, resources = load_bench_runtime_config(self.config.bench_config)
+            if resources.joulescope_serial:
+                if resources.joulescope_model not in {"js220", "js320"}:
+                    if resources.joulescope_model:
+                        raise ValueError(
+                            "unsupported joulescope.model: "
+                            f"{resources.joulescope_model!r}; expected 'js220' or 'js320'"
+                        )
+                    raise ValueError("missing required bench config: joulescope.model")
+
+                detected_js_model = _read_js_model()
+                if resources.joulescope_model != detected_js_model:
+                    raise ValueError(
+                        "configured joulescope.model does not match connected device: "
+                        f"configured={resources.joulescope_model}, detected={detected_js_model}"
+                    )
             self.bench = CMSBench(
                 identity=identity,
                 resources=resources,
@@ -1831,6 +1847,11 @@ class CMSDaemon:
         tracked_result = self.measurements.get(result.measurement_id)
         if result.identity is None and tracked_result is not None:
             result.identity = tracked_result.identity
+        result.artifacts = [
+            artifact
+            for artifact in result.artifacts
+            if _is_publishable_final_artifact(artifact)
+        ]
         for artifact in result.artifacts:
             if artifact.path is None or not artifact.path.exists():
                 continue

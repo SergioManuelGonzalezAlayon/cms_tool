@@ -19,7 +19,7 @@
         "num_subevents": 1,
         "subevent_interval": 6,
         "response_slot_delay": 1,
-        "response_slot_spacing": 2,
+        "response_slot_spacing": 3,
         "response_slots": 1
     },
     "firmware": {

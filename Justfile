@@ -3,6 +3,14 @@ set shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 default:
     @just --list
 
+# Run the hardware-independent unit test suite.
+test-unit:
+    uv run pytest utest
+
+# Enable the repository's tracked Git hooks for this checkout.
+install-hooks:
+    git config core.hooksPath .githooks
+
 # Build, stage, and run normal then differential beacon measurements through
 # the configured CMS bench. Each command is a PowerShell invocation.
 run-test-normal:

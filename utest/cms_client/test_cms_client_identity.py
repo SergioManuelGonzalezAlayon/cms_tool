@@ -645,16 +645,16 @@ def test_test_preview_shows_exact_submission_without_contacting_daemon(capsys, m
     monkeypatch.setattr("cms_client.CMSClient", lambda **kwargs: Client())
 
     exit_code = cms_client.main(
-        ["test", "--mode", "default", "--feature", "beacon", "--config-name", "dcdc", "--preview"]
+        ["test", "--mode", "default", "--feature", "beacon", "--config-name", "default", "--preview"]
     )
 
     output = capsys.readouterr().out
     assert exit_code == 0
     assert "mode: default" in output
     assert "feature: beacon" in output
-    assert "config: dcdc" in output
+    assert "config: default" in output
     assert "config_path:" in output
-    assert "tests\\configs\\ble\\beacon\\dcdc.json" in output or "tests/configs/ble/beacon/dcdc.json" in output
+    assert "tests\\configs\\ble\\beacon\\default.json" in output or "tests/configs/ble/beacon/default.json" in output
     assert "config_hash:" in output
     assert "expected_jobs: 1" in output
     assert "results_destination: database" in output

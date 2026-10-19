@@ -4,7 +4,8 @@
     "profile": "bench-lite"
   },
   "joulescope": {
-    "id": "replace-with-joulescope-usb-id"
+    "id": "replace-with-joulescope-usb-id",
+    "model": "replace-with-js220-or-js320"
   },
   "dut": {
     "serial_port": "replace-with-dut-serial-port",

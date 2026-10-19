@@ -62,6 +62,35 @@ MAX_CONSOLE_EVENT_SEGMENT_BYTES = 64 * 1024
 COMMANDER_PROBE_TIMEOUT_S = 15.0
 
 
+def _read_js_model() -> str:
+    """Read the connected Joulescope model from ``lsusb`` output."""
+
+    try:
+        result = subprocess.run(
+            ["lsusb"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"unable to read Joulescope model from lsusb: {exc}") from exc
+
+    for line in result.stdout.splitlines():
+        match = re.search(r"\b(JS\d{3})\b", line, flags=re.IGNORECASE)
+        if match is None:
+            continue
+
+        model = match.group(1).lower()
+        if model not in {"js220", "js320"}:
+            raise ValueError(
+                f"unsupported Joulescope model detected: {model}; expected js220 or js320"
+            )
+        return model
+
+    raise ValueError("Joulescope model js220 or js320 was not found in lsusb output")
+
+
 def _event_stream_lock(root: Path) -> threading.RLock:
     """Return the one in-process lock for all writers to one event workspace."""
 
@@ -91,6 +120,7 @@ class BenchResources:
     dut_serial_port: str = ""
     tester_serial_port: str = ""
     joulescope_serial: str = ""
+    joulescope_model: str = ""
     joulescope_wake_gpio: int | None = None
     board: str = ""
     board_rev: str = ""
@@ -1220,6 +1250,7 @@ def load_bench_runtime_config(path: str | Path = CMS_BENCH_CONFIG) -> tuple[Benc
         joulescope_serial=str(
             joulescope.get("serial_number", joulescope.get("serial_port", joulescope.get("id", "")))
         ),
+        joulescope_model=str(joulescope.get("model", "")).strip().lower(),
         joulescope_wake_gpio=_optional_int(joulescope.get("wake_gpio")),
         board=identity.board,
         board_rev=str(devices.get("board_rev", devices.get("brev", ""))),
@@ -1248,6 +1279,7 @@ def resolve_cms_resources_from_dev_config(dev_config: dict[str, Any]) -> BenchRe
         joulescope_serial=str(
             joulescope.get("serial_number", joulescope.get("serial_port", joulescope.get("id", "")))
         ),
+        joulescope_model=str(joulescope.get("model", "")).strip().lower(),
         joulescope_wake_gpio=_optional_int(joulescope.get("wake_gpio")),
         board=str(firmware.get("board", "")),
         board_rev=str(firmware.get("brev", firmware.get("board_rev", ""))),
