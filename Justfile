@@ -5,7 +5,13 @@ default:
 
 # Run the hardware-independent unit test suite.
 test-unit:
-    uv run pytest utest
+    uv run pytest utest --ignore=utest/test_s3_upload_live.py
+
+# Run the live data-lake tenant-key probe on the Linux bench.
+# This uploads one small, uniquely named object and leaves it in the data lake.
+test-datalake-tenant-key:
+    #!/usr/bin/env bash
+    CURRENT_MEASUREMENT_RUN_LIVE_DATALAKE_UPLOAD_PROBE=1 .venv/bin/python -m pytest -q utest/test_s3_upload_live.py
 
 # Enable the repository's tracked Git hooks for this checkout.
 install-hooks:
