@@ -68,6 +68,19 @@ bench is not available for another run.
 `cms_bench_runtime.json` is persistent, local bench configuration. It identifies
 the physical bench and maps the host-visible resources needed to run tests:
 
+### Daemon Environment
+
+The current Datalake tenant key is for the `dev` environment. The Datalake
+client defaults to `prod` when `DATALAKE_ENV` is unset, so the CMS daemon and
+its child test processes must receive `DATALAKE_ENV=dev`.
+
+When the CMS daemon is later managed by systemd as `admin`, configure this in
+the service environment, using `Environment=` or an `EnvironmentFile=`. Do not
+rely on `admin`'s `.bashrc`; systemd services do not source shell startup files.
+A future `scripts/setup_env_vars.py` should configure the environment file read
+by the service. Setting `os.environ` in a standalone Python process would not
+change the systemd service environment.
+
 The daemon bounds each orchestrator execution to five minutes by default. Set
 `CMSD_EXECUTION_TIMEOUT_S` when starting `cmsd.py` to allow a longer campaign;
 for example, use `CMSD_EXECUTION_TIMEOUT_S=3600` for a one-hour limit. A timeout
