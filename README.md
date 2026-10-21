@@ -1,188 +1,64 @@
-# Current Measurement
+﻿# Current Measurement System
 
-Current Measurement is a hardware-backed test tool for measuring power consumption on Silicon Labs EFR32 devices across BLE scenarios. The repository contains firmware build helpers, BLE test cases, Joulescope capture utilities, and config-generation tooling for parameter sweeps.
+Current Measurement System (CMS) Tool coordinates firmware builds and current-consumption measurements for Silicon Labs devices. It's the main data
+generation method for the Battery Estimator tool and aimed to aid the current
+measurement between different firmware images.
 
-## Current Scope
+## Start with the CMS guides
 
-The main BLE test logic lives in `tests/ble.py`.
+The guides below are the operational documentation. Use this README for orientation and the test entry points; use the guides for setup and full workflows.
 
-Implemented and wired into the current workflow:
+| Guide | Use it for |
+| --- | --- |
+| [CMS Client](docs/cms_client.md) | Select a bench, build and stage firmware, run or monitor measurements, and download artifacts. |
+| [CMS Bench](docs/cms_bench.md) | Configure the hardware-facing bench, understand measurement execution, and inspect results and artifacts. |
+| [CMS Daemon](docs/cms_daemon.md) | Start, inspect, stop, and restart the service running on a bench. |
 
-- `legacy_beacon`
-- `legacy_conn_adv`
-- `beacon`
-- `conn_adv`
-- `conn_central`
-- `conn_peripheral`
-- `scanner`
-- `PAwR_obs`
+## Requirements
 
-## Prerequisites
+- Python 3.10
+- [uv](https://docs.astral.sh/uv/) for dependency and environment management
+- [Just](https://just.systems/) for repository task recipes
 
-- Python `3.10`
-- `uv`
-- Windows machine with the required hardware tools on `PATH` for firmware workflows:
-  - `slc`
-  - `cmake`
-  - `commander`
-- Joulescope-connected test setup for hardware-backed capture and BLE power tests
+Firmware builds and hardware-backed measurements also require the Silicon Labs tools, local configuration, and connected lab equipment described in the CMS guides.
 
-For some environments, installing `pyjoulescope-driver` may also require a working Visual C++ / Windows SDK toolchain.
-
-## Setup
-
-This repository uses `uv` for dependency management and command execution.
+Create the project environment with:
 
 ```powershell
 uv sync
 ```
 
-If you want to include development dependencies when they are added later:
+Local configuration is based on the `dev_config.json.template`, `cms_client_config.json.template`, and `cms_bench_runtime.json.template` files. Follow the relevant CMS guide for which configuration belongs on each machine.
+
+## Run tests
+
+Run the hardware-independent unit suite with the repository task in the [Justfile](Justfile):
 
 ```powershell
-uv sync --dev
+just test-unit
 ```
 
-This repository no longer depends on `just`, `make`, or `make.bat` wrappers for normal workflows. Use the direct `uv`, Python, and pytest commands shown below.
+The `test-unit` recipe excludes `utest/test_s3_upload_live.py`, which performs a live data-lake upload. Pytest writes JUnit results to `artifacts/pytest-results.xml`. The portable collection and dry-run checks are defined in the [GitHub Actions workflow](.github/workflows/container-portable-checks.yml).
 
-## Which Tool To Use
+Actual firmware builds and measurements use the CMS Client and a configured bench. Start with the [CMS Client guide](docs/cms_client.md); its bench prerequisites are covered by the [CMS Bench guide](docs/cms_bench.md).
 
-Use the repo tools by responsibility:
+## Repository layout
 
-- `uv sync` installs and locks the Python environment for this repository
-- `uv run pytest ...` is the supported way to run tests
-- `uv run python .\tests\configs\config_manager.py ...` manages generated test configs
-- `uv run python .\test_orchestrator.py ...` runs multi-config test campaigns
-- `uv run python .\apps\app_manager.py ...` manages `.slcp` project generation, upgrade, and firmware builds
+| Path | Contents |
+| --- | --- |
+| `apps/` | Silicon Labs application projects and the firmware build manager. |
+| `tests/` | Hardware-backed test scenarios, fixtures, and test configurations. |
+| `utest/` | Unit tests for orchestration, CMS components, and utilities. |
+| `docs/` | CMS usage guides and architecture documentation. |
+| `scripts/` | Container and repository helper scripts. |
+| `utils/` | Shared runtime utilities. |
+| `container/` | Container build inputs and bundled vendor-tool location. |
+| `.github/workflows/` | GitHub Actions workflows. |
+| `artifacts/` | Generated test reports and measurement artifacts. |
+| `.fw_build/` | Generated firmware build workspace. |
 
-In other words:
+The main CMS entry points are `cms_client.py` (client CLI), `cmsd.py` (bench daemon), `cms_bench.py` (local bench execution), and `cms_protocol.py` (shared request and result models). `test_orchestrator.py` runs the test campaigns used by the bench.
 
-- use `pytest` when you want to run one test or one test file
-- use `config_manager.py` when you want to generate or clean config matrices
-- use `test_orchestrator.py` when you want to execute many configs as a campaign
-- use `app_manager.py` when you want to generate, upgrade, rebuild, or clean firmware outputs
+## GitHub Actions
 
-## SDK And Toolchain
-
-The Silicon Labs SDK is not installed or version-managed by this repository itself.
-
-What the repo expects from the host machine:
-
-- Simplicity Studio command-line tools on `PATH`
-- `slc` for `.slcp` project generation and upgrade
-- `cmake` for firmware builds after project generation
-- `commander` for probe interaction, flashing, and adapter voltage setup
-- a valid BGAPI XAPI file path for `sl_bt.xapi`
-
-How the repo uses those tools:
-
-- `apps/app_manager.py` drives `slc generate`, `slc upgrade`, and `cmake --workflow --preset project`
-- pytest fixtures in `tests/conftest.py` use `commander` to set adapter voltage and flash prebuilt images when required
-- BGAPI device creation in `utils/bgapi_utils.py` reads `ble.xapi` from `dev_config.json`, or falls back to `BGAPI_XAPI`
-
-What you need to configure locally:
-
-- copy `dev_config.json.template` to `dev_config.json`
-- set `ble.xapi` to your host's `sl_bt.xapi`
-- if the CLI tools are not already on `PATH`, set `tools.slc`, `tools.commander`, and optionally `tools.cmake`
-- set DUT/tester serial ports and probe serial numbers
-- optionally set `firmware.build_root`, `firmware.board`, and `firmware.bootloader_slcp`
-
-## Common Workflows
-
-Every pytest run now writes a JUnit XML result file to `artifacts/pytest-results.xml`, which is useful for CI test reporting and local run inspection.
-
-### Building the applications
-
-There are multiple applications to test a wireless stack, we have chosen an NCP App in our testing system to easy not only development but to simplify having to use use too many applications and potentially wearing the flash of the DUT as we run multiple test batches.
-
-The first suggested step is to clean the previously build applications, the test system wont flash previously used aplications but this will generate test results based on previous firmware, which is not desired.
-
-```powershell
-uv run python .\apps\app_manager.py clean
-```
-
-Then using the `app_manager.py` you can clean, generate, build and rebuild applications. The sensible way would be to clean the workspace, once created the projects are generated under `.fw_build` and you can build said applications. The application details are defined in `dev_config.json`
-
-```powershell
-uv run python .\apps\app_manager.py clean
-uv run python .\apps\app_manager.py generate
-uv run python .\apps\app_manager.py build
-```
-
-The `rebuild` option is intented to allow for iterative development of an application that has potentially had any changes on the SLC configuration SiSDK that has been chosen. This is intended to be used to custom changes to an application.
-
-```powershell
-uv run python .\apps\app_manager.py rebuild
-```
-
-Future work needs to address building applications for protocol specific tests, since not all applications or devices support the same technologies or features.
-
-
-### Test Configs
-
-The CMS uses test configurations in a file to be able to trace back the actual paramters in a test that has been run. There are `default` configurations that are generic options for the protocol in question that allow for a quick test iteration. 
-
-For more detailed testing the `config_manager.py` is used to generate two types of configs:
-
-* `one_factor`: One variable is modified at a time, keeping all other settings at their default values.
-* `full_sweep`: Configurations are varied across multiple parameters allowing to generate a greater result generation, that can be used to extrapolate other power consumption values.
-
-#### Generating Test Configs
-
-Generate both one-factor and full-sweep matrices:
-
-```powershell
-uv run python .\tests\configs\config_manager.py generate --mode both
-```
-
-Generate only one subset:
-
-```powershell
-uv run python .\tests\configs\config_manager.py generate --mode one_factor
-uv run python .\tests\configs\config_manager.py generate --mode full_sweep
-```
-
-### Running tests
-
-In order to run a test there first has to be the corresponding test config, in the repo there are default configurations that allow to run a generic configuration to obtain results. For the sake of simplicity these examples assume that you want to run the BLE Beacon test, where the DUT uses non-connectable Extended Advertising to broadcast a payload:
-
-```powershell
-uv run python .\test_orchestrator.py .\tests\configs\ble\beacon --mode default --feature beacon
-```
-
-There is another option for test running that includes a generated set of tests that cover multiple ranges of variables without going into a deep variable sweep, but these are generated by the `config_manager.py` and have to be created first.
-
-```powershell
-uv run python .\tests\configs\config_manager.py generate --mode one_factor
-uv run python .\test_orchestrator.py .\tests\configs\ble\beacon --mode one_factor --feature beacon
-```
-
-Finally, the full sweep mode is intended to generate within all the variables for the test cases multiple points called `steps`, this will create a considerable set of tests that will test all the features.
-
-```powershell
-uv run python .\tests\configs\config_manager.py generate --mode full_sweep
-uv run python .\test_orchestrator.py .\tests\configs\ble\beacon --mode full_sweep
-```
-
-### Pre-push unit tests
-
-The repository includes a pre-push hook at `.githooks/pre-push`. Enable it for this checkout with:
-
-```powershell
-git config core.hooksPath .githooks
-```
-
-Before each push, the hook runs `uv run pytest utest` from the repository root and blocks the push if the suite fails. Run the same command manually at any time.
-
-## Notes On Current Status
-
-The repository has been migrated to `uv` structurally, but environment validation is still machine-dependent.
-
-Known caveat:
-
-- `pyjoulescope-driver` may require native compilation on Windows
-- if that happens, a missing MSVC / Windows SDK install can block `uv sync`
-
-If `uv sync` or pytest collection fails while building Joulescope dependencies, verify the local Visual C++ build tools and Windows SDK installation first.
-
+The current portable workflow is [container-portable-checks.yml](.github/workflows/container-portable-checks.yml). It builds the container, collects BLE tests, and runs an orchestrator dry run; hardware-backed measurements require a configured lab bench.
