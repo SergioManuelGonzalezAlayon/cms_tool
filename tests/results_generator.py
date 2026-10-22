@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import logging
@@ -8,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from cms_protocol import ResultType
+from pipeline.sequential import AnalysisConfig, OutputConfig, ProfileResult
 
 
 log = logging.getLogger(__name__)
@@ -25,6 +27,12 @@ class ResultContext:
     config_data: dict = field(default_factory=dict)
     supply_v: float | None = None
     campaign_id: str | None = None
+
+
+@dataclass(frozen=True)
+class StreamingProfileConfig:
+    analysis: AnalysisConfig
+    output: OutputConfig
 
 
 def _relative_path(path: Path | str | None) -> str | None:
@@ -132,8 +140,8 @@ def _config_mode_and_partition(config_path: Path) -> tuple[str, str | None]:
     return "one_factor", None
 
 
-def _current_mean_ma_from_label(analyzer, token: str):
-    for label, stats in analyzer.aggr_sub_event_stats.items():
+def _current_mean_ma_from_label(subevent_stats, token: str):
+    for label, stats in subevent_stats.items():
         if token in label.upper():
             return stats["current"]["mean"]
     return None
@@ -481,6 +489,44 @@ def _select_plot_window(
     return {"selection_reason": selection_reason, **selected}
 
 
+def _read_streaming_reports(result: ProfileResult) -> tuple[list[dict], list[dict]]:
+    summary = []
+    summary_columns = {
+        "i_mean_ma": "I_mean_mA", "i_std_ma": "I_std_mA",
+        "t_mean_us": "t_mean_us", "t_std_us": "t_std_us",
+        "e_mean_nj": "E_mean_nJ", "e_std_nj": "E_std_nJ",
+    }
+    with Path(result.consolidated_csv).open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            summary.append({
+                "meas_type": row["meas_type"],
+                "count": int(row["count"]) if row["count"] else None,
+                **{
+                    target: float(row[source]) if row[source] else None
+                    for target, source in summary_columns.items()
+                },
+            })
+    windows = []
+    with Path(result.deep_dive_csv).open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            if row["profile_type"] != "event":
+                continue
+            is_outlier = row["is_outlier"].strip().lower()
+            if is_outlier not in {"true", "false"}:
+                raise ValueError(f"Invalid deep-dive is_outlier value: {row['is_outlier']!r}")
+            windows.append({
+                "window_index": len(windows) + 1,
+                "profile_type": "event",
+                "timestamp_s": float(row["timestamp_s"]),
+                "i_window_mean_ma": float(row["I_window_mean_mA"]),
+                "t_duration_us": float(row["t_duration_us"]),
+                "e_nj": float(row["E_nJ"]),
+                "is_outlier": is_outlier == "true",
+                "subwindow_stats_json": json.loads(row["subwindow_stats_json"] or "[]"),
+            })
+    return summary, windows
+
+
 def write_result_json(
     *,
     profile,
@@ -495,6 +541,7 @@ def write_result_json(
     campaign_id: str,
     supply_v: float | None,
     retain_capture: bool = False,
+    streaming_result: ProfileResult | None = None,
 ) -> Path:
     if config_path is None:
         raise RuntimeError("Missing result context config_path for result JSON generation")
@@ -502,7 +549,12 @@ def write_result_json(
     campaign_id = campaign_id or measured_at
     result_json_path = out_dir / f"{artifact_stem}_result.json"
     capture_policy = _capture_policy(config_path)
-    if retain_capture:
+    if streaming_result is not None:
+        capture_policy = {
+            **capture_policy, "retained": False,
+            "retention_status": "unavailable_from_streaming_result",
+        }
+    elif retain_capture:
         capture_policy = {**capture_policy, "retained": True}
     capture_path = _save_capture_npz(profile, out_dir, artifact_stem) if capture_policy["retained"] else None
     firmware = config_data.get("firmware", {})
@@ -515,7 +567,10 @@ def write_result_json(
     sdk_name = firmware.get("sisdk_name") or slcp_meta["sdk_name"]
     sdk_version = firmware.get("sisdk_version") or slcp_meta["sdk_version"]
     mode, partition = _config_mode_and_partition(config_path)
-    analyzer = result_paths["analyzer"] if result_paths["note_path"] is None else None
+    analyzer = (
+        result_paths["analyzer"]
+        if streaming_result is None and result_paths["note_path"] is None else None
+    )
     storage = _result_storage_metadata(
         test_name=test_name,
         config_name=config_name,
@@ -525,10 +580,18 @@ def write_result_json(
         slcp_meta=slcp_meta,
     )
 
-    avg_current_ma = float(sum(profile["current"]["samples"]) / len(profile["current"]["samples"]) * 1e3)
-    peak_current_ma = float(max(profile["current"]["samples"]) * 1e3)
-    rx_current_ma = _current_mean_ma_from_label(analyzer, "RX") if analyzer is not None else None
-    tx_current_ma = _current_mean_ma_from_label(analyzer, "TX") if analyzer is not None else None
+    if streaming_result is not None:
+        result_summary, window_rows = _read_streaming_reports(streaming_result)
+        avg_current_ma = peak_current_ma = None
+        subevent_stats = streaming_result.subevent_stats
+    else:
+        avg_current_ma = float(sum(profile["current"]["samples"]) / len(profile["current"]["samples"]) * 1e3)
+        peak_current_ma = float(max(profile["current"]["samples"]) * 1e3)
+        subevent_stats = analyzer.aggr_sub_event_stats if analyzer is not None else {}
+        result_summary = _build_result_summary(analyzer) if analyzer is not None else []
+        window_rows = _build_window_rows(analyzer) if analyzer is not None else []
+    rx_current_ma = _current_mean_ma_from_label(subevent_stats, "RX")
+    tx_current_ma = _current_mean_ma_from_label(subevent_stats, "TX")
 
     artifact_refs = [
         {
@@ -543,6 +606,7 @@ def write_result_json(
         ("deep_dive_csv", result_paths["deep_dive_csv"]),
         ("html_report", result_paths["html_report"]),
         ("analysis_note", result_paths["note_path"]),
+        ("analysis_png", streaming_result.outlier_plot if streaming_result is not None else None),
     ):
         if path is None:
             continue
@@ -617,15 +681,21 @@ def write_result_json(
             "tx_current_ma": tx_current_ma,
             "cpu_current_ma": None,
             "metric_status": {
-                "avg_current_ma": "measured_from_global_capture",
-                "peak_current_ma": "measured_from_capture_peak",
+                "avg_current_ma": (
+                    "unavailable_from_streaming_result" if streaming_result is not None
+                    else "measured_from_global_capture"
+                ),
+                "peak_current_ma": (
+                    "unavailable_from_streaming_result" if streaming_result is not None
+                    else "measured_from_capture_peak"
+                ),
                 "rx_current_ma": "derived_from_analyzer_label" if rx_current_ma is not None else "unavailable",
                 "tx_current_ma": "derived_from_analyzer_label" if tx_current_ma is not None else "unavailable",
                 "cpu_current_ma": "unavailable",
             },
         },
-        "result_summary": _build_result_summary(analyzer) if analyzer is not None else [],
-        "test_result_window": _build_window_rows(analyzer) if analyzer is not None else [],
+        "result_summary": result_summary,
+        "test_result_window": window_rows,
         "artifact_ref": artifact_refs,
     }
     result_json_path.write_text(json.dumps(_json_ready(record), indent=2) + "\n", encoding="utf-8")
@@ -667,6 +737,38 @@ class ResultGenerator:
         self.context.config_data = config_data
         self.context.supply_v = supply_v
 
+    def build_streaming_profile_config(
+        self, *, output_root: Path = Path("artifacts"),
+    ) -> StreamingProfileConfig:
+        from joulescope_interface import _artifact_out_dir, _artifact_stem
+
+        context = self.context
+        if not context.test_name or context.config_path is None:
+            raise RuntimeError("Set the result context before configuring a streaming profile")
+        stem = _artifact_stem(context.test_name, context.config_name)
+        return StreamingProfileConfig(
+            analysis=AnalysisConfig(
+                threshold_on=0.0005,
+                threshold_off=0.0005,
+                voltage_override=context.supply_v,
+                min_thd_duration_start_us=5,
+                min_thd_duration_end_us=250,
+                min_window_duration_us=500,
+                profile_name=stem,
+                unique_first_last_subwindows=True,
+            ),
+            output=OutputConfig(
+                directory=_artifact_out_dir(context.config_path, root=output_root),
+                consolidated_filename=f"{stem}_consolidated_report.csv",
+                deep_dive_filename=f"{stem}_deep_dive_report.csv",
+                html_filename=f"{stem}_report.html",
+                outlier_plot_filename=f"{stem}_profile.png",
+                show_reference_title=False,
+                include_outliers=False,
+                show_thresholds=False,
+            ),
+        )
+
     def write(
         self,
         *,
@@ -675,12 +777,13 @@ class ResultGenerator:
         artifact_stem: str,
         result_paths: dict,
         measured_at: str | None = None,
+        streaming_result: ProfileResult | None = None,
     ) -> Path:    
         effective_measured_at = measured_at or utc_now()
         status_path = _upload_status_path(out_dir, artifact_stem)
         status_path.parent.mkdir(parents=True, exist_ok=True)
         result_json_path = None
-        png_path = None
+        png_path = streaming_result.outlier_plot if streaming_result is not None else None
         phase = "result_json"
         _write_upload_status(status_path, status="running", phase=phase)
         try:
@@ -697,33 +800,36 @@ class ResultGenerator:
                 campaign_id=self.context.campaign_id,
                 supply_v=self.context.supply_v,
                 retain_capture=self.retain_captures_for_debug,
+                streaming_result=streaming_result,
             )
             log.info("Result JSON written: %s", result_json_path)
             _write_upload_status(
                 status_path,
                 status="running" if self.upload_results_to_database else "disabled",
-                phase="render_png" if self.upload_results_to_database else "complete",
+                phase="upload_json" if self.upload_results_to_database else "complete",
                 result_json_path=result_json_path,
+                png_path=png_path,
             )
 
-            capture_path = out_dir / f"{artifact_stem}_capture.npz"
-            if self.upload_results_to_database and capture_path.is_file():
-                phase = "render_png"
-                from utils.render_capture_image import render_capture_image
-
-                png_path = render_capture_image(
-                    capture_path,
-                    output_path=capture_path.with_suffix(".png"),
-                    result_json_path=result_json_path,
-                )
-                _write_upload_status(
-                    status_path,
-                    status="running",
-                    phase="upload_json",
-                    result_json_path=result_json_path,
-                    png_path=png_path,
-                )
-
+            # Validation supplies the PNG for streaming results through ProfileResult.
+            # Keep this capture-based fallback commented out for a future capture flow.
+            # capture_path = out_dir / f"{artifact_stem}_capture.npz"
+            # if streaming_result is None and self.upload_results_to_database and capture_path.is_file():
+            #     phase = "render_png"
+            #     from utils.render_capture_image import render_capture_image
+            #
+            #     png_path = render_capture_image(
+            #         capture_path,
+            #         output_path=capture_path.with_suffix(".png"),
+            #         result_json_path=result_json_path,
+            #     )
+            #     _write_upload_status(
+            #         status_path,
+            #         status="running",
+            #         phase="upload_json",
+            #         result_json_path=result_json_path,
+            #         png_path=png_path,
+            #     )
             if self.upload_results_to_database:
                 upload_metadata = _upload_metadata(
                     config_path=self.context.config_path,

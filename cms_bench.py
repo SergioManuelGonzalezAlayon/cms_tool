@@ -1148,6 +1148,17 @@ class CMSBench:
                     result_type=result_type,
                 )
             )
+        streaming_root = session.runtime_dir / "streaming_artifacts"
+        for path in sorted(streaming_root.rglob("*")):
+            if not path.is_file() or (artifact_since is not None and path.stat().st_mtime < artifact_since):
+                continue
+            result.artifacts.append(
+                Artifacts(
+                    name=path.relative_to(streaming_root).as_posix(),
+                    path=path,
+                    result_type=ResultType.CURRENT_MEASUREMENT,
+                )
+            )
         for path in _real_test_artifacts(session, since=artifact_since):
             relative_path = Path(_artifact_name(Path("artifacts"), path))
             retained_path = session.runtime_dir / "measurement_artifacts" / relative_path

@@ -1,5 +1,7 @@
 import json
-from pathlib import Path
+
+import numpy as np
+import pytest
 
 from utils.render_capture_image import (
     capture_npz_to_profile,
@@ -9,8 +11,21 @@ from utils.render_capture_image import (
 )
 
 
-def test_load_capture_npz_reads_expected_signals():
-    capture_path = Path("artifacts/ble/beacon/default/beacon_default_capture.npz")
+@pytest.fixture
+def capture_path(tmp_path):
+    capture_path = tmp_path / "capture.npz"
+    timestamps = np.array([0.0, 0.0005, 0.001, 0.0015])
+    np.savez(
+        capture_path,
+        current__samples=np.array([0.001, 0.002, 0.003, 0.004]),
+        current__timestamp=timestamps,
+        gpi_0__samples=np.array([0, 1, 1, 0]),
+        gpi_0__timestamp=timestamps,
+    )
+    return capture_path
+
+
+def test_load_capture_npz_reads_expected_signals(capture_path):
     signals = load_capture_npz(capture_path)
 
     assert "current" in signals
@@ -19,8 +34,7 @@ def test_load_capture_npz_reads_expected_signals():
     assert signals["current"].timestamp.size == signals["current"].samples.size
 
 
-def test_capture_npz_to_profile_restores_gpio_names():
-    capture_path = Path("artifacts/ble/beacon/default/beacon_default_capture.npz")
+def test_capture_npz_to_profile_restores_gpio_names(capture_path):
     profile = capture_npz_to_profile(capture_path)
 
     assert "current" in profile
@@ -29,8 +43,7 @@ def test_capture_npz_to_profile_restores_gpio_names():
     assert profile["current"]["timestamp"].size == profile["current"]["samples"].size
 
 
-def test_render_capture_image_writes_png(tmp_path):
-    capture_path = Path("artifacts/ble/beacon/default/beacon_default_capture.npz")
+def test_render_capture_image_writes_png(capture_path, tmp_path):
     output_path = tmp_path / "capture_preview.png"
 
     written_path = render_capture_image(capture_path, output_path=output_path)
@@ -57,8 +70,7 @@ def test_selected_plot_window_prefers_explicit_json_selection():
     assert selected_plot_window(result_json) == result_json["test_run"]["selected_plot_window"]
 
 
-def test_render_capture_image_can_slice_using_result_json(tmp_path):
-    capture_path = Path("artifacts/ble/beacon/default/beacon_default_capture.npz")
+def test_render_capture_image_can_slice_using_result_json(capture_path, tmp_path):
     output_path = tmp_path / "capture_window.png"
     result_json_path = tmp_path / "result.json"
     result_json_path.write_text(

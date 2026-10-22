@@ -375,12 +375,16 @@ def _artifact_component(value: str) -> str:
 def result_artifact_paths(job: Job) -> dict[str, Path]:
     """Return the deterministic result paths produced by one pytest job."""
 
+    artifact_root = (
+        Path(job.cms_fw_metadata).resolve().parent / "streaming_artifacts"
+        if job.cms_fw_metadata else REPO_ROOT / "artifacts"
+    )
     if job.mode == "full_sweep":
-        output_dir = REPO_ROOT / "artifacts" / job.suite / job.feature / "full_sweep" / job.partition
+        output_dir = artifact_root / job.suite / job.feature / "full_sweep" / job.partition
     elif job.mode == "default":
-        output_dir = REPO_ROOT / "artifacts" / job.suite / job.feature / "default"
+        output_dir = artifact_root / job.suite / job.feature / "default"
     else:
-        output_dir = REPO_ROOT / "artifacts" / job.suite / job.feature / "one_factor"
+        output_dir = artifact_root / job.suite / job.feature / "one_factor"
     artifact_stem = f"{_artifact_component(job.feature)}_{_artifact_component(Path(job.cfg_arg).stem)}"
     return {
         "result_json": output_dir / f"{artifact_stem}_result.json",

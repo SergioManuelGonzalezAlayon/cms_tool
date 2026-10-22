@@ -17,6 +17,7 @@ USB_RESET_TIMEOUT_S = 15.0
 _CMS_RUNTIME_CONFIG_PATH = None
 _CMS_FW_METADATA_PATH = None
 
+
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
 
@@ -96,6 +97,8 @@ class WakePinJoulescope(Joulescope):
         self.dut_wake_gpio = dut_wake_gpio
         self.dut_awake_settle_s = dut_awake_settle_s
         self.capture_sequence = 0
+        self.streaming_profile_config = None
+        self.streaming_result = None
 
     def open_devices(self):
         device_paths = super().open_devices()
@@ -114,6 +117,7 @@ class WakePinJoulescope(Joulescope):
         super().close_driver()
 
     def capture(self, seconds: float, on_progress=None):
+        self.streaming_result = None
         if not self.use_wake_pin:
             result = _capture_with_wpk_quieting(
                 lambda: super(WakePinJoulescope, self).capture(
@@ -143,6 +147,88 @@ class WakePinJoulescope(Joulescope):
             self.wakeDUT()
         self.capture_sequence += 1
         return self.capture_data
+
+    def startPowerProfilingSession(
+        self,
+        duration_s: float,
+        on_progress=None,
+    ):
+        """Run Validation's session using the fixture's open physical device."""
+        from pipeline.sequential import CaptureConfig
+        from pipeline.streaming import StreamingPowerProfileSession
+
+        self.streaming_result = None
+        profile_config = self.streaming_profile_config
+        if profile_config is None:
+            raise RuntimeError("Streaming profile context is not configured for this test")
+        analysis = profile_config.analysis
+        output = profile_config.output
+        device_path = self._get_open_device_path()
+        if not self.signals_full:
+            raise RuntimeError("signals_full not set; did you open devices first?")
+
+        # The session returns ProfileResult, leaving the batch artifact path
+        # without a full capture to process.
+        self.capture_data = None
+        capture = CaptureConfig(
+            duration=duration_s,
+            frequency=self.frequency,
+            signals=",".join(name for _, name in self.signals_full),
+            serial_number=device_path.rsplit("/", 1)[-1],
+            open_mode=self.open_mode,
+            vref=self.vref,
+            irange=self.irange,
+            verbose=self.verbose,
+        )
+        session = StreamingPowerProfileSession(
+            capture=capture,
+            analysis=analysis,
+            output=output,
+        )
+
+        def run_session():
+            try:
+                return session.run(on_progress=on_progress)
+            except BaseException:
+                log.exception(
+                    "Validation streaming session failed: capture=%s output=%s",
+                    capture,
+                    output,
+                )
+                raise
+
+        if self.use_wake_pin:
+            try:
+                self.sleepDUT()
+                sleep(self.dut_sleep_settle_ms / 1000.0)
+                result = _capture_with_wpk_quieting(run_session)
+            except BaseException:
+                try:
+                    self.wakeDUT()
+                except BaseException:
+                    log.exception("Failed to restore DUT wake state after capture failure")
+                raise
+            else:
+                self.wakeDUT()
+        else:
+            result = _capture_with_wpk_quieting(run_session)
+
+        self.streaming_result = result
+        self.capture_sequence += 1
+        log.info(
+            "Validation streaming artifacts: consolidated=%s deep_dive=%s html=%s image=%s",
+            result.consolidated_csv,
+            result.deep_dive_csv,
+            result.html_report,
+            result.outlier_plot,
+        )
+        log.info(
+            "Validation streaming statistics: events=%s intervals=%s subevents=%s",
+            result.event_stats,
+            result.interval_stats,
+            result.subevent_stats,
+        )
+        return result
 
     def wakeDUT(self):
         """Assert the DUT wake line."""
@@ -205,30 +291,30 @@ def _artifact_stem(test_name=None, config_name=None):
     return "result"
 
 
-def _artifact_out_dir(config_path: Path) -> Path:
+def _artifact_out_dir(config_path: Path, *, root: Path = Path("artifacts")) -> Path:
     configs_root = (Path("tests") / "configs").resolve()
     resolved = config_path.resolve()
     try:
         relative = resolved.relative_to(configs_root)
     except ValueError:
-        out_dir = Path("artifacts")
+        out_dir = root
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
 
     if len(relative.parts) < 3:
-        out_dir = Path("artifacts")
+        out_dir = root
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
 
     suite = relative.parts[0]
     feature = relative.parts[1]
     if relative.parts[2] == "default.json":
-        out_dir = Path("artifacts") / suite / feature / "default"
+        out_dir = root / suite / feature / "default"
     elif relative.parts[2] == "full_sweep":
         partition = relative.parts[3] if len(relative.parts) > 3 else "unpartitioned"
-        out_dir = Path("artifacts") / suite / feature / "full_sweep" / partition
+        out_dir = root / suite / feature / "full_sweep" / partition
     else:
-        out_dir = Path("artifacts") / suite / feature / "one_factor"
+        out_dir = root / suite / feature / "one_factor"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 

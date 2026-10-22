@@ -84,6 +84,34 @@ def test_result_tracking_reads_current_upload_status(tmp_path, monkeypatch):
     assert tracking["upload_error"] == "database unavailable"
 
 
+@pytest.mark.parametrize(("mode", "suffix"), [
+    ("default", "default"),
+    ("one_factor", "one_factor"),
+    ("full_sweep", "full_sweep/partition-01"),
+])
+def test_result_tracking_uses_streaming_runtime_directory(tmp_path, monkeypatch, mode, suffix):
+    monkeypatch.setattr(orchestrator, "REPO_ROOT", tmp_path / "repo")
+    job = replace(_job("default"), mode=mode, partition="partition-01")
+    local_paths = orchestrator.result_artifact_paths(job)
+    local_paths["result_json"].parent.mkdir(parents=True)
+    local_paths["result_json"].write_text("{}\n", encoding="utf-8")
+    runtime = tmp_path / "runtime/measurement-123"
+    job = replace(job, cms_fw_metadata=str(runtime / "cms_fw_metadata.json"))
+    paths = orchestrator.result_artifact_paths(job)
+    assert paths["result_json"].parent == runtime / "streaming_artifacts/ble/beacon" / suffix
+    assert orchestrator.result_tracking_for_job(job, 0)["result_json_exists"] is False
+    paths["result_json"].parent.mkdir(parents=True)
+    paths["result_json"].write_text("{}\n", encoding="utf-8")
+    paths["upload_status"].write_text(
+        json.dumps({"status": "disabled", "phase": "complete", "error": ""}), encoding="utf-8",
+    )
+    tracking = orchestrator.result_tracking_for_job(job, 0)
+    assert tracking["result_json_exists"] is True
+    assert tracking["upload_status_exists"] is True
+    assert tracking["upload_status"] == "disabled"
+    assert tracking["result_json_path"] == str(paths["result_json"])
+
+
 def test_main_writes_complete_plan_before_first_pytest_job(tmp_path, monkeypatch):
     jobs = [_job("first"), _job("second")]
     results_log = tmp_path / "orchestrator_results.jsonl"

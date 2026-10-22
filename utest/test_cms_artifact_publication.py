@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import sys
 
 import pytest
@@ -121,6 +122,61 @@ def test_daemon_publishes_only_selected_final_artifacts(tmp_path: Path) -> None:
     assert not any(name.endswith("events.jsonl") for name in published_names)
     assert not any(name.endswith("console.jsonl") for name in published_names)
     assert status.exists() and events.exists() and console_segment.exists()
+
+
+@pytest.mark.parametrize("state", [MeasurementState.PASSED, MeasurementState.FAILED])
+@pytest.mark.parametrize("debug", [False, True])
+def test_streaming_outputs_are_collected_from_runtime_and_published(
+    tmp_path: Path, monkeypatch, state, debug,
+) -> None:
+    daemon = CMSDaemon(DaemonConfig(
+        runtime_root=tmp_path / "runtime",
+        artifacts_root=tmp_path / "published",
+        bench_config=tmp_path / "bench.json",
+    ))
+    request = _request("streaming-measurement")
+    if debug:
+        daemon.debug_artifact_measurements.add(request.request_id)
+    runtime_dir = daemon.create_runtime_workspace(request.request_id)
+    session = daemon.build_session(request, runtime_dir)
+    output_dir = runtime_dir / "streaming_artifacts" / "ble" / "beacon" / "default"
+    output_dir.mkdir(parents=True)
+    suffixes = ("report.csv", "profile.png", "report.html") if state is MeasurementState.PASSED else ("report.csv",)
+    outputs = []
+    for suffix in suffixes:
+        path = output_dir / f"beacon_default_{suffix}"
+        path.write_bytes(b"simulated session output")
+        outputs.append(path)
+    stale = output_dir / "stale.png"
+    stale.write_bytes(b"previous output")
+    os.utime(stale, (1, 1))
+    monkeypatch.setattr("cms_bench._real_test_artifacts", lambda session, since=None: [])
+
+    result = CMSBench().collect_artifacts(
+        session,
+        MeasurementResult(
+            measurement_id=request.request_id, state=state, identity=request.identity,
+        ),
+        artifact_since=100,
+    )
+
+    assert {artifact.path for artifact in result.artifacts} == set(outputs)
+    for artifact in result.artifacts:
+        assert artifact.result_type is ResultType.CURRENT_MEASUREMENT
+        assert artifact.name == artifact.path.relative_to(runtime_dir / "streaming_artifacts").as_posix()
+    published = daemon.publish_results(result)
+    assert len(published.artifacts) == len(outputs)
+    assert published.state is state
+    for artifact in published.artifacts:
+        assert artifact.path.is_relative_to(runtime_dir)
+        assert artifact.url == f"/measurement/{request.request_id}/artifacts/{artifact.name}"
+        assert artifact.path.read_bytes() == b"simulated session output"
+        persisted = tmp_path / "published" / "measurements" / request.request_id / artifact.name
+        assert persisted.exists() is debug
+        if debug:
+            assert persisted.read_bytes() == b"simulated session output"
+    assert all(path.is_file() for path in outputs)
+    assert not (runtime_dir / "measurement_artifacts").exists()
 
 
 def test_final_child_output_is_flushed_before_publication(tmp_path: Path, monkeypatch) -> None:

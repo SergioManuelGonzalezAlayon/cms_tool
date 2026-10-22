@@ -919,11 +919,11 @@ def test_legacy_beacon(JoulescopeDev,
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTLegAdvConfig.max_interval) / 1000)
     log.info(
-        "Capturing Joulescope profile: %.3f s (%d non-connectable legacy advertising events)",
+        "Processing Joulescope profile: %.3f s (%d non-connectable legacy advertising events)",
         capture_s,
         n_events,
     )
-    JoulescopeDev.capture(capture_s)
+    JoulescopeDev.startPowerProfilingSession(capture_s)
 
 def test_beacon(JoulescopeDev,
                 DUT,
@@ -960,11 +960,11 @@ def test_beacon(JoulescopeDev,
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
     log.info(
-        "Capturing Joulescope profile: %.3f s (%d non-connectable extended advertising events)",
+        "Running Validation streaming session: %.3f s (%d non-connectable extended advertising events)",
         capture_s,
         n_events,
     )
-    JoulescopeDev.capture(capture_s)
+    JoulescopeDev.startPowerProfilingSession(capture_s)
 
 def test_legacy_conn_adv(JoulescopeDev,
                   DUT,
@@ -998,7 +998,7 @@ def test_legacy_conn_adv(JoulescopeDev,
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTLegAdvConfig.max_interval) / 1000)
-    JoulescopeDev.capture(capture_s)
+    JoulescopeDev.startPowerProfilingSession(capture_s)
 
 def test_conn_adv(JoulescopeDev,
                   DUT,
@@ -1036,11 +1036,11 @@ def test_conn_adv(JoulescopeDev,
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
     log.info(
-        "Capturing Joulescope profile: %.3f s (%d connectable extended advertising events)",
+        "Processing Joulescope profile: %.3f s (%d connectable extended advertising events)",
         capture_s,
         n_events,
     )
-    JoulescopeDev.capture(capture_s)
+    JoulescopeDev.startPowerProfilingSession(capture_s)
 
 def test_conn_central(JoulescopeDev,
                       DUT,
@@ -1059,8 +1059,8 @@ def test_conn_central(JoulescopeDev,
 
     n_events = 10
     capture_s = float(connection_ms_from_units(n_events * conn_params.max_interval) / 1000)
-    log.info(f"Capturing Conn Adv for {capture_s}s")
-    JoulescopeDev.capture(capture_s)
+    log.info(f"Processing connection profile for {capture_s}s")
+    JoulescopeDev.startPowerProfilingSession(capture_s)
 
 
 def test_conn_peripheral(JoulescopeDev,
@@ -1080,8 +1080,8 @@ def test_conn_peripheral(JoulescopeDev,
 
     n_events = 10
     capture_s = float(connection_ms_from_units(n_events * conn_params.max_interval) / 1000)
-    log.info(f"Capturing Conn Adv for {capture_s}s")
-    JoulescopeDev.capture(capture_s)
+    log.info(f"Processing connection profile for {capture_s}s")
+    JoulescopeDev.startPowerProfilingSession(capture_s)
 
 
 def test_scanner(JoulescopeDev,
@@ -1146,7 +1146,7 @@ def test_scanner(JoulescopeDev,
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * scan_config.interval) / 1000)
-    JoulescopeDev.capture(capture_s)
+    JoulescopeDev.startPowerProfilingSession(capture_s)
 
 def test_PAwR_per(JoulescopeDev,
                   DUT,
@@ -1220,7 +1220,7 @@ def test_PAwR_per(JoulescopeDev,
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
-    JoulescopeDev.capture(capture_s)
+    JoulescopeDev.startPowerProfilingSession(capture_s)
 
 
 def test_PAwR_obs(JoulescopeDev,
@@ -1294,4 +1294,4 @@ def test_PAwR_obs(JoulescopeDev,
 
     n_events = 10
     capture_s = float(advertising_ms_from_units(n_events * TesterAdvConfig.max_interval) / 1000)
-    JoulescopeDev.capture(capture_s)
+    JoulescopeDev.startPowerProfilingSession(capture_s)

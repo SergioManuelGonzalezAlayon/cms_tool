@@ -245,19 +245,49 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixt
         config_data=config_data,
         supply_v=supply_v,
     )
-    yield
-    capture_sequence_after = getattr(js, "capture_sequence", 0)
-    if capture_sequence_after <= capture_sequence_before:
-        return
-    write_joulescope_artifacts(
-        js,
-        test_name=test_name,
-        config_name=config_name,
-        config_path=config_path,
-        device_version=device_version,
-        voltage_override=supply_v,
-        result_generator=ResultGeneratorFixture,
+    metadata_path = request.config.getoption("--cms-fw-metadata")
+    output_root = (
+        Path(metadata_path).resolve().parent / "streaming_artifacts"
+        if metadata_path else Path("artifacts")
     )
+    js.streaming_profile_config = ResultGeneratorFixture.build_streaming_profile_config(
+        output_root=output_root,
+    )
+    profile_config = js.streaming_profile_config
+    js.streaming_result = None
+    try:
+        yield
+        capture_sequence_after = getattr(js, "capture_sequence", 0)
+        if capture_sequence_after <= capture_sequence_before:
+            return
+        streaming_result = js.streaming_result
+        if streaming_result is not None:
+            ResultGeneratorFixture.write(
+                profile=None,
+                out_dir=Path(profile_config.output.directory),
+                artifact_stem=profile_config.analysis.profile_name,
+                result_paths={
+                    "analyzer": None,
+                    "note_path": None,
+                    "consolidated_csv": streaming_result.consolidated_csv,
+                    "deep_dive_csv": streaming_result.deep_dive_csv,
+                    "html_report": streaming_result.html_report,
+                },
+                streaming_result=streaming_result,
+            )
+            return
+        write_joulescope_artifacts(
+            js,
+            test_name=test_name,
+            config_name=config_name,
+            config_path=config_path,
+            device_version=device_version,
+            voltage_override=supply_v,
+            result_generator=ResultGeneratorFixture,
+        )
+    finally:
+        js.streaming_profile_config = None
+        js.streaming_result = None
 
 
 def _flash(image: Path, probe_sn: str, *, commander: str | None = None):
