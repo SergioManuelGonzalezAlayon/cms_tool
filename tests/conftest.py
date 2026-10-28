@@ -12,6 +12,7 @@ from joulescope_interface import write_joulescope_artifacts
 from results_generator import ResultGenerator
 from serial import Serial, SerialException
 from utils.config_loader import effective_dev_config
+from utils.wpk import setDebugMode
 
 log = logging.getLogger(__name__)
 
@@ -750,6 +751,10 @@ def ProvisionFirmware(request: pytest.FixtureRequest) -> None:
         bootloader_required=bootloader_required_tester,
         flash_required=not tester_matches or not tester_bootloader_matches,
     )
+
+    # Setting the DUT's WPK Debug mode to MCU will avoid 
+    # crashes if the WPK was let previously in the OFF state.
+    setDebugMode(dev_cfg, "MCU")
 
     if bootloader_required_dut is not None and not dut_bootloader_matches:
         _flash(bootloader_image, dut_probe_sn, commander=commander)

@@ -67,9 +67,15 @@ def test_failed_startup_reuses_firmware_already_sent_for_same_measurement(
         ),
     )
     flash_calls = []
+    debug_mode_calls = []
 
     monkeypatch.setattr(conftest, "_test_config_path", lambda request: tmp_path / "config.json")
     monkeypatch.setattr(conftest, "_effective_dev_config", lambda request: dev_config)
+    monkeypatch.setattr(
+        conftest,
+        "setDebugMode",
+        lambda config, mode: debug_mode_calls.append((config, mode)),
+    )
     monkeypatch.setattr(conftest, "_resolve_commander", lambda dev_cfg: "commander")
     monkeypatch.setattr(conftest, "_wait_for_serial_port", lambda serial_port: None)
     monkeypatch.setattr(
@@ -117,6 +123,7 @@ def test_failed_startup_reuses_firmware_already_sent_for_same_measurement(
         (dut_image, "dut-probe"),
         (tester_image, "tester-probe"),
     ]
+    assert debug_mode_calls == [(dev_config, "MCU"), (dev_config, "MCU")]
 
 
 def test_sent_provision_state_reuse_requires_measurement_and_matching_firmware() -> None:
