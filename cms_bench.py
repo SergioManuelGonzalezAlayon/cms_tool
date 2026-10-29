@@ -26,6 +26,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
+from pyjoulescope_driver import Driver
+from utils.config_loader import validate_test_config_data
+
 from cms_protocol import (
     BenchCheckResult,
     BenchCheckStatus,
@@ -63,21 +66,18 @@ COMMANDER_PROBE_TIMEOUT_S = 15.0
 
 
 def _read_js_model() -> str:
-    """Read the connected Joulescope model from ``lsusb`` output."""
+    """Read the connected Joulescope model from the driver device paths."""
 
     try:
-        result = subprocess.run(
-            ["lsusb"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ValueError(f"unable to read Joulescope model from lsusb: {exc}") from exc
+        with Driver() as driver:
+            device_paths = driver.device_paths()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"unable to read Joulescope model from connected driver devices: {exc}"
+        ) from exc
 
-    for line in result.stdout.splitlines():
-        match = re.search(r"\b(JS\d{3})\b", line, flags=re.IGNORECASE)
+    for device_path in device_paths:
+        match = re.search(r"\b(js\d{3})\b", device_path, flags=re.IGNORECASE)
         if match is None:
             continue
 
@@ -88,7 +88,9 @@ def _read_js_model() -> str:
             )
         return model
 
-    raise ValueError("Joulescope model js220 or js320 was not found in lsusb output")
+    raise ValueError(
+        "Joulescope model js220 or js320 was not found in connected driver devices"
+    )
 
 
 def _event_stream_lock(root: Path) -> threading.RLock:
@@ -778,7 +780,8 @@ class CMSBench:
         if feature == "all" and config != "default":
             raise RuntimeError("differential --feature all only supports the default config")
         feature_filters = set() if feature == "all" else {feature}
-        exact_config = "" if config == "default" else config
+        custom_config = _is_mutable_custom_config_name(config)
+        exact_config = "default" if custom_config else "" if config == "default" else config
         jobs = build_jobs(
             [CONFIG_ROOT / "ble"],
             mode="all" if exact_config else "default",
@@ -790,18 +793,32 @@ class CMSBench:
             raise RuntimeError("differential selected zero jobs")
         plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
         custom_snapshot: dict[str, str] | None = None
-        if _is_mutable_custom_config_name(config):
-            source_config = jobs[0].config_path
+        if custom_config:
+            custom_data = request.selector.custom_config_data
+            if not isinstance(custom_data, dict):
+                raise RuntimeError(
+                    "CUSTOM tests require the local custom.json payload from the CMS Client"
+                )
+            validate_test_config_data(custom_data)
             snapshot_path = plan_path.with_name("custom_config_snapshot.json")
             snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_config, snapshot_path)
+            snapshot_path.write_text(
+                json.dumps(custom_data, indent=2) + "\n",
+                encoding="utf-8",
+            )
             snapshot_hash = _sha256_file(snapshot_path)
+            firmware_data = custom_data.get("firmware", {})
             jobs = [
                 replace(
                     job,
                     config_path=snapshot_path,
                     cfg_arg=str(snapshot_path),
                     config_hash=snapshot_hash,
+                    mode="one_factor",
+                    dut_slcp=str(firmware_data.get("dut_slcp") or job.dut_slcp),
+                    tester_slcp=str(firmware_data.get("tester_slcp") or job.tester_slcp),
+                    board=str(firmware_data.get("board") or job.board),
+                    supply_v=custom_data.get("hw", {}).get("supply_v", ""),
                 )
                 for job in jobs
             ]
@@ -1360,6 +1377,14 @@ def _prepare_pytest_runtime(
 
     active_root = active_root or session.runtime_dir
     build_root = active_root / "fw_build"
+    if (
+        _is_mutable_custom_config_name(session.request.selector.config)
+        and session.job_plan_path is None
+    ):
+        _write_custom_config_snapshot(
+            session.runtime_dir / "custom_config_snapshot.json",
+            session.request.selector.custom_config_data,
+        )
     config_data = _campaign_firmware_config(session)
     selected_config = (
         _write_selected_config_evidence(session)
@@ -1490,6 +1515,12 @@ def _prepare_pytest_runtime(
         metadata["vcom"] = session.manifest.vcom
     metadata_path = session.runtime_dir / "cms_fw_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    if _is_mutable_custom_config_name(session.request.selector.config) and session.job_plan_path is None:
+        session.job_plan_path = _write_custom_config_job_plan(
+            session,
+            metadata_path,
+            session.runtime_dir / "orchestrator_results.jsonl",
+        )
     prepared = {
         "build_root": build_root,
         "results_log": session.runtime_dir / "orchestrator_results.jsonl",
@@ -1537,6 +1568,54 @@ def _campaign_firmware_config(session: BenchSession) -> dict[str, Any]:
             "all-feature campaigns require identical DUT and tester firmware projects"
         )
     return configs[0][1]
+
+
+def _write_custom_config_snapshot(path: Path, config_data: Any) -> Path:
+    if not isinstance(config_data, dict):
+        raise RuntimeError("CUSTOM tests require the local custom.json payload from the CMS Client")
+    try:
+        validate_test_config_data(config_data)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"custom test config is invalid: {exc}") from exc
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config_data, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _write_custom_config_job_plan(
+    session: BenchSession,
+    metadata_path: Path,
+    results_log: Path,
+) -> Path:
+    from test_orchestrator import CONFIG_ROOT, build_job_plan, build_jobs
+
+    feature = session.request.selector.feature
+    jobs = build_jobs(
+        [CONFIG_ROOT / "ble"],
+        mode="default",
+        feature_filters={feature},
+        partition_filters=set(),
+        exact_config="default",
+        cms_metadata_path=str(metadata_path),
+    )
+    if len(jobs) != 1:
+        raise RuntimeError(f"CUSTOM config selected {len(jobs)} jobs; expected exactly one")
+    config_data = session.request.selector.custom_config_data or {}
+    snapshot_path = session.runtime_dir / "custom_config_snapshot.json"
+    job = replace(
+        jobs[0],
+        config_path=snapshot_path,
+        cfg_arg=str(snapshot_path.resolve()),
+        mode="one_factor",
+        supply_v=config_data.get("hw", {}).get("supply_v", ""),
+        config_hash=_sha256_text_file_lf_normalized(snapshot_path),
+    )
+    plan_path = session.runtime_dir / "orchestrator_plan.json"
+    plan_path.write_text(
+        json.dumps(build_job_plan([job], results_log), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return plan_path
 
 
 def _staged_xapi_path(session: BenchSession, active_root: Path | None = None) -> Path:
@@ -2127,6 +2206,17 @@ def _write_test_run_summary(
 
 
 def _load_requested_test_config(session: BenchSession) -> dict[str, Any]:
+    if _is_mutable_custom_config_name(session.request.selector.config):
+        config_data = session.request.selector.custom_config_data
+        if not isinstance(config_data, dict):
+            raise RuntimeError(
+                "CUSTOM tests require the local custom.json payload from the CMS Client"
+            )
+        try:
+            validate_test_config_data(config_data)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"custom test config is invalid: {exc}") from exc
+        return config_data
     config_path = _requested_test_config_path(session)
     if not config_path.exists():
         raise RuntimeError(f"test config does not exist: {config_path}")
@@ -2154,7 +2244,11 @@ def _write_selected_config_evidence(session: BenchSession) -> dict[str, Path]:
         "mode": session.request.selector.mode,
         "feature": session.request.selector.feature,
         "config": session.request.selector.config,
-        "selected_config": config_path.relative_to(config_dir).as_posix(),
+        "selected_config": (
+            "custom.json"
+            if _is_mutable_custom_config_name(session.request.selector.config)
+            else config_path.relative_to(config_dir).as_posix()
+        ),
         "requested_config_hash": session.request.selector.config_hash,
         "observed_config_hash": observed_hash,
         "source_path": str(config_path),
@@ -2180,10 +2274,14 @@ def _requested_test_config_dir(session: BenchSession) -> Path:
 
 
 def _requested_test_config_path(session: BenchSession) -> Path:
-    if _is_mutable_custom_config_name(session.request.selector.config) and session.job_plan_path is not None:
-        snapshot_path = session.job_plan_path.with_name("custom_config_snapshot.json")
+    if _is_mutable_custom_config_name(session.request.selector.config):
+        snapshot_path = (
+            session.job_plan_path.with_name("custom_config_snapshot.json")
+            if session.job_plan_path is not None
+            else session.runtime_dir / "custom_config_snapshot.json"
+        )
         if not snapshot_path.is_file():
-            raise RuntimeError("differential custom config snapshot is missing")
+            raise RuntimeError("submitted custom config snapshot is missing")
         return snapshot_path
     config_dir = _requested_test_config_dir(session)
     config_name = session.request.selector.config or "default"

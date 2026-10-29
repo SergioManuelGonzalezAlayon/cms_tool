@@ -607,8 +607,23 @@ def test_run_all_features_does_not_send_a_single_config_hash():
     assert captured["config_hash"] == ""
 
 
-def test_run_custom_config_does_not_send_a_config_hash():
+def test_run_custom_config_validates_local_file_without_computing_hash(
+    tmp_path, monkeypatch
+):
     captured = {}
+    config_path = tmp_path / "custom.json"
+    config_path.write_text(
+        json.dumps({"advertiser": {"interval": 100, "phy": "1m"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cms_client, "_local_test_config_path", lambda feature, config: config_path
+    )
+    monkeypatch.setattr(
+        cms_client,
+        "_sha256_text_file_lf_normalized",
+        lambda path: pytest.fail("CUSTOM should not compute a config hash"),
+    )
     client = CMSClient.__new__(CMSClient)
 
     def fake_request(method, path, payload):
@@ -621,6 +636,27 @@ def test_run_custom_config_does_not_send_a_config_hash():
 
     assert captured["config"] == "custom"
     assert captured["config_hash"] == ""
+
+
+def test_run_custom_config_rejects_invalid_ble_parameters_before_submission(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "custom.json"
+    config_path.write_text(
+        json.dumps({"advertiser": {"interval": 10, "phy": "1m"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cms_client, "_local_test_config_path", lambda feature, config: config_path
+    )
+    submitted = []
+    client = CMSClient.__new__(CMSClient)
+    client._request_json = lambda *args, **kwargs: submitted.append(args)
+
+    with pytest.raises(RuntimeError, match="invalid advertiser BLE parameters"):
+        client.run_test(MeasurementMode.DEFAULT, "beacon", config="custom")
+
+    assert submitted == []
 
 
 def test_run_test_rejects_unknown_or_unsafe_local_config():

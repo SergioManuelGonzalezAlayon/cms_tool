@@ -305,6 +305,7 @@ class SuiteSelector:
     config: str = "default"
     config_hash: str = ""
     variable_filters: tuple["VariableFilter", ...] = ()
+    custom_config_data: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -942,6 +943,8 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
         "upload_results_to_database": request.upload_results_to_database,
         "debug_artifact_streaming": request.debug_artifact_streaming,
     }
+    if request.selector.custom_config_data is not None:
+        payload["selector"]["custom_config_data"] = request.selector.custom_config_data
     if request.differential_firmware is not None:
         payload["differential_firmware"] = differential_firmware_to_dict(
             request.differential_firmware
@@ -951,6 +954,9 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
 
 def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
     selector = data.get("selector", {})
+    custom_config_data = selector.get("custom_config_data")
+    if custom_config_data is not None and not isinstance(custom_config_data, dict):
+        raise ValueError("selector.custom_config_data must be a JSON object")
     identity_data = data.get("identity")
     return MeasurementRequest(
         request_id=str(data.get("request_id", "")),
@@ -959,6 +965,7 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
             feature=str(selector.get("feature", "")),
             config=str(selector.get("config", "default")),
             config_hash=str(selector.get("config_hash", "")),
+            custom_config_data=custom_config_data,
             variable_filters=variable_filters_from_dicts(selector.get("variable_filters")),
         ),
         firmware=firmware_data_from_dict(data.get("firmware", data)),

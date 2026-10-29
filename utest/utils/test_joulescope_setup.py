@@ -7,6 +7,7 @@ import joulescope_interface
 
 def test_joulescope_usb_reset_is_noninteractive_and_bounded(monkeypatch) -> None:
     observed = {}
+    monkeypatch.setattr(joulescope_interface, "_platform_system", lambda: "Linux")
 
     def fake_run(command, **kwargs):
         observed["command"] = command
@@ -23,6 +24,8 @@ def test_joulescope_usb_reset_is_noninteractive_and_bounded(monkeypatch) -> None
 
 
 def test_joulescope_usb_reset_reports_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(joulescope_interface, "_platform_system", lambda: "Linux")
+
     def fake_run(command, **kwargs):
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 

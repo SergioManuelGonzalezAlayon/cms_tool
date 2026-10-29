@@ -75,6 +75,7 @@ from cms_protocol import (
     test_case_identity_from_dict,
     variable_filters_from_dicts,
 )
+from utils.config_loader import validate_test_config_data
 
 
 PUBLISHABLE_DIAGNOSTIC_NAMES = frozenset(
@@ -1699,6 +1700,7 @@ class CMSDaemon:
         feature: str,
         config: str = "default",
         config_hash: str = "",
+        custom_config_data: dict[str, Any] | None = None,
         run_name: str = "",
         upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
@@ -1720,6 +1722,7 @@ class CMSDaemon:
         request.selector.feature = feature
         request.selector.config = config
         request.selector.config_hash = config_hash
+        request.selector.custom_config_data = custom_config_data
         request.upload_results_to_database = _should_upload_results_to_database(request.mode)
         request.debug_artifact_streaming = debug_artifact_streaming
         request.identity = None
@@ -1736,12 +1739,33 @@ class CMSDaemon:
         feature: str,
         config: str = "default",
         config_hash: str = "",
+        custom_config_data: dict[str, Any] | None = None,
         variable_filters: tuple[VariableFilter, ...] = (),
         run_name: str = "",
         upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Start a test in the background using the current staged firmware."""
+
+        is_custom_config = config.strip().lower().replace("\\", "/") in {
+            "custom",
+            "custom.json",
+        }
+        if is_custom_config and not isinstance(custom_config_data, dict):
+            return _staged_test_failure(
+                "CUSTOM tests require the local custom.json payload from the CMS Client"
+            )
+        if is_custom_config and feature.strip().lower() == "all":
+            return _staged_test_failure("CUSTOM tests require one named BLE feature")
+        if not is_custom_config and custom_config_data is not None:
+            return _staged_test_failure(
+                "a custom config payload is only valid when config is custom"
+            )
+        if is_custom_config:
+            try:
+                validate_test_config_data(custom_config_data)
+            except (TypeError, ValueError) as exc:
+                return _staged_test_failure(f"custom test config is invalid: {exc}")
 
         measurement_mode = MeasurementMode(mode)
         differential_staging: StagedDifferentialFirmware | None = None
@@ -1770,8 +1794,9 @@ class CMSDaemon:
         request.mode = measurement_mode
         request.selector.mode = "ble"
         request.selector.feature = feature
-        request.selector.config = config
+        request.selector.config = "custom" if is_custom_config else config
         request.selector.config_hash = config_hash
+        request.selector.custom_config_data = custom_config_data
         request.selector.variable_filters = variable_filters
         request.upload_results_to_database = _should_upload_results_to_database(request.mode)
         request.debug_artifact_streaming = debug_artifact_streaming
@@ -2257,6 +2282,7 @@ class CMSDaemon:
                 feature=str(request.get("feature", "")),
                 config=str(request.get("config", "default")),
                 config_hash=str(request.get("config_hash", "")),
+                custom_config_data=request.get("custom_config_data"),
                 variable_filters=variable_filters_from_dicts(request.get("variable_filters")),
                 run_name=str(request.get("run_name", "")),
                 upload_results_to_database=bool(request.get("upload_results_to_database", True)),

@@ -79,6 +79,7 @@ from cms_variable_filters import (
     validate_variable_filters,
     variable_help_text,
 )
+from utils.config_loader import load_test_config, validate_test_config_data
 
 CMS_CLIENT_CONFIG = "cms_client_config.json"
 
@@ -635,31 +636,34 @@ class CMSClient:
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
 
-        config_hash = (
-            ""
-            if (
-                feature == "all"
-                or _is_mutable_custom_config_name(config)
-                or (mode is not MeasurementMode.DEFAULT and config == "default")
-            )
-            else _validate_local_test_config(feature, config)
-        )
+        config_hash = ""
+        custom_config_data = None
+        if feature != "all" and not (
+            mode is not MeasurementMode.DEFAULT and config == "default"
+        ):
+            if _is_mutable_custom_config_name(config):
+                _, custom_config_data = _load_validated_local_test_config(feature, config)
+            else:
+                config_hash = _validate_local_test_config(feature, config)
+        request = {
+            "mode": mode.value,
+            "feature": feature,
+            "config": config,
+            "config_hash": config_hash,
+            "variable_filters": [
+                {"name": item.name, "value": item.value}
+                for item in variable_filters
+            ],
+            "run_name": run_name,
+            "upload_results_to_database": upload_results_to_database,
+            "debug_artifact_streaming": debug_artifact_streaming,
+        }
+        if custom_config_data is not None:
+            request["custom_config_data"] = custom_config_data
         payload = self._request_json(
             "POST",
             "/test",
-            {
-                "mode": mode.value,
-                "feature": feature,
-                "config": config,
-                "config_hash": config_hash,
-                "variable_filters": [
-                    {"name": item.name, "value": item.value}
-                    for item in variable_filters
-                ],
-                "run_name": run_name,
-                "upload_results_to_database": upload_results_to_database,
-                "debug_artifact_streaming": debug_artifact_streaming,
-            },
+            request,
         )
         return measurement_result_from_dict(payload)
 
@@ -1289,7 +1293,8 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms HEALTH\n"
             "  cms BUILD --diff\n"
             "  cms SEND_FW --diff\n"
-            "  cms TEST --mode diff --feature beacon --verbose\n\n"
+        "  cms TEST --mode diff --feature beacon --verbose\n"
+        "  cms CUSTOM --feature beacon --set advertiser.interval=100\n\n"
             "  cms RECIPES prints copy/paste command recipes for the common workflows.\n\n"
             "  cms EXIT_CODES documents stable script outcomes.\n\n"
             "  cms TROUBLESHOOT prints operator diagnostics for common failures.\n\n"
@@ -1559,17 +1564,19 @@ def build_cli_parser() -> argparse.ArgumentParser:
     custom = subparsers.add_parser(
         "custom",
         aliases=["CUSTOM"],
-        help="update a feature's mutable custom.json configuration",
+        help="update and run a feature's mutable custom.json configuration",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
             "  cms CUSTOM --feature beacon --set advertiser.interval=100\n"
-            "  cms CUSTOM --feature beacon --set advertiser.phy=2m --set hw.supply_v=3.3\n\n"
+            "  cms CUSTOM --feature beacon --set advertiser.phy=2m --set hw.supply_v=3.3 --verbose\n\n"
             "Values are parsed as JSON when possible; unquoted text is stored as a string.\n"
-            "Only tests/configs/ble/<feature>/custom.json is modified."
+            "The local custom.json is validated, submitted to the selected Bench, and run.\n"
+            "Use cms TEST --mode default --feature beacon --config-name custom to rerun it without edits."
         ),
     )
     _add_color_argument(custom)
+    _add_bench_endpoint_arguments(custom)
     custom.add_argument("--feature", "-f", required=True, help="BLE feature whose custom.json is updated")
     custom.add_argument(
         "--set",
@@ -1577,6 +1584,41 @@ def build_cli_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="PATH=VALUE",
         help="replace an existing custom.json value using a dotted object path; repeat as needed",
+    )
+    custom.add_argument(
+        "--mode",
+        "-m",
+        choices=[
+            MeasurementMode.DEFAULT.value,
+            MeasurementMode.FULL_SWEEP.value,
+            MeasurementMode.DIFF.value,
+        ],
+        default=MeasurementMode.DEFAULT.value,
+        help="measurement mode for the custom config run (default: default)",
+    )
+    custom.add_argument("--run-name", default="", help="human-readable test run name")
+    custom.add_argument(
+        "--upload-results-to-database",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="upload completed results to the configured database (default: enabled)",
+    )
+    custom.add_argument("--out-dir", default="artifacts", help="local artifact root")
+    custom.add_argument(
+        "--debug",
+        action="store_true",
+        help="retrieve completed test result artifacts while the measurement is running",
+    )
+    custom.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show live stdout, stderr, and lifecycle events",
+    )
+    custom.add_argument(
+        "--poll-interval",
+        type=_non_negative_float,
+        default=1.0,
+        help="seconds between observation polls",
     )
     measurement = subparsers.add_parser(
         "measurement",
@@ -1809,7 +1851,7 @@ def _main(argv: list[str] | None = None) -> int:
     client_config = load_client_config(args.config)
     uses_resolved_endpoint = (
         args.command == "health"
-        or args.command in {"send_fw", "SEND_FW", "test", "TEST"}
+        or args.command in {"send_fw", "SEND_FW", "test", "TEST", "custom", "CUSTOM"}
         or args.command in {"build", "BUILD"}
     )
     if uses_resolved_endpoint:
@@ -1963,9 +2005,11 @@ def _main(argv: list[str] | None = None) -> int:
         return _run_test_feature(client, args, variable_filters, colors)
 
     if args.command in {"custom", "CUSTOM"}:
+        _print_explicit_endpoint_selection(args, client)
         path = update_custom_test_config(args.feature, args.set)
         print(path)
-        return CMSCLIExitCode.SUCCESS
+        args.config_name = "custom"
+        return _run_test_feature(client, args, (), colors)
 
     if args.command in {"cancel", "CANCEL"}:
         result = client.cancel_active_test()
@@ -2542,20 +2586,23 @@ def _sha256_text_file_lf_normalized(path: Path) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _validate_local_test_config(feature: str, config: str) -> str:
+def _validate_local_test_config(
+    feature: str, config: str, *, include_hash: bool = True
+) -> str:
+    config_path, _ = _load_validated_local_test_config(feature, config)
+    return _sha256_text_file_lf_normalized(config_path) if include_hash else ""
+
+
+def _load_validated_local_test_config(feature: str, config: str) -> tuple[Path, dict[str, Any]]:
     config_path = _local_test_config_path(feature, config)
     if not config_path.exists():
         raise RuntimeError(f"test config does not exist: {config_path}")
     try:
-        config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"test config is not valid JSON: {config_path}") from exc
-    if not isinstance(config_data, dict):
-        raise RuntimeError(f"test config must be a JSON object: {config_path}")
-    for section in ("firmware", "hw"):
-        if section in config_data and not isinstance(config_data[section], dict):
-            raise RuntimeError(f"test config section must be an object: {section}")
-    return _sha256_text_file_lf_normalized(config_path)
+        config_data = load_test_config(config_path)
+        validate_test_config_data(config_data)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"test config is invalid: {config_path}: {exc}") from exc
+    return config_path, config_data
 
 
 def _is_mutable_custom_config_name(config: str) -> bool:
@@ -2569,11 +2616,9 @@ def update_custom_test_config(feature: str, assignments: list[str]) -> Path:
     if not config_path.exists():
         raise RuntimeError(f"custom test config does not exist: {config_path}")
     try:
-        config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"custom test config is not valid JSON: {config_path}") from exc
-    if not isinstance(config_data, dict):
-        raise RuntimeError(f"custom test config must be a JSON object: {config_path}")
+        config_data = load_test_config(config_path)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError(f"custom test config is invalid: {config_path}: {exc}") from exc
 
     for assignment in assignments:
         path, separator, raw_value = assignment.partition("=")
@@ -2594,6 +2639,10 @@ def update_custom_test_config(feature: str, assignments: list[str]) -> Path:
             value = raw_value
         current[parts[-1]] = value
 
+    try:
+        validate_test_config_data(config_data)
+    except ValueError as exc:
+        raise RuntimeError(f"custom test config is invalid: {config_path}: {exc}") from exc
     config_path.write_text(json.dumps(config_data, indent=4) + "\n", encoding="utf-8")
     return config_path
 
@@ -2607,7 +2656,11 @@ def _local_test_config_path(feature: str, config: str) -> Path:
     config_dir = Path("tests") / "configs" / "ble" / feature_name
     if not config_dir.is_dir():
         raise RuntimeError(f"test feature config directory does not exist: {config_dir}")
-    config_name = (config or "default").strip().replace("\\", "/")
+    config_name = (
+        "custom.json"
+        if _is_mutable_custom_config_name(config)
+        else (config or "default").strip().replace("\\", "/")
+    )
     if not config_name.endswith(".json"):
         config_name = f"{config_name}.json"
     relative = Path(config_name)
@@ -2868,7 +2921,11 @@ def _print_test_preview(
         if all_features
         else _local_test_config_path(args.feature, args.config_name)
     )
-    config_hash = "" if all_features else _validate_local_test_config(args.feature, args.config_name)
+    config_hash = "" if all_features else _validate_local_test_config(
+        args.feature,
+        args.config_name,
+        include_hash=not _is_mutable_custom_config_name(args.config_name),
+    )
     parameters_path = None if all_features else _local_parameters_path(args.feature)
     if parameters_path is not None:
         validate_variable_filters(parameters_path, variable_filters)

@@ -150,3 +150,12 @@ def test_checked_in_pawr_defaults_pass_timing_validation() -> None:
         )
 
         assert config_manager.is_generated_pawr_config_valid(config)
+
+
+def test_generated_config_rejects_invalid_bgapi_parameters(tmp_path: Path) -> None:
+    output_path = tmp_path / "invalid.json"
+
+    assert not config_manager.write_generated_config(
+        {"advertiser": {"interval": 10}}, output_path
+    )
+    assert not output_path.exists()

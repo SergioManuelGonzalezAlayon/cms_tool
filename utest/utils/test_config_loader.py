@@ -1,7 +1,31 @@
 import json
 from pathlib import Path
 
-from utils.config_loader import effective_dev_config
+import pytest
+
+from utils.config_loader import (
+    effective_dev_config,
+    load_test_config,
+    validate_ble_test_config,
+)
+
+
+def test_load_test_config_rejects_non_object_and_non_object_sections(tmp_path: Path) -> None:
+    config_path = tmp_path / "invalid.json"
+    config_path.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        load_test_config(config_path)
+
+    config_path.write_text('{"advertiser": []}', encoding="utf-8")
+    with pytest.raises(ValueError, match="section must be an object: advertiser"):
+        load_test_config(config_path)
+
+
+def test_validate_ble_test_config_uses_bgapi_parameter_validation() -> None:
+    validate_ble_test_config({"advertiser": {"interval": 100, "phy": "1m"}})
+
+    with pytest.raises(ValueError, match="invalid advertiser BLE parameters"):
+        validate_ble_test_config({"advertiser": {"interval": 10, "phy": "1m"}})
 
 
 def test_effective_dev_config_accepts_pytest_string_paths(tmp_path: Path) -> None:

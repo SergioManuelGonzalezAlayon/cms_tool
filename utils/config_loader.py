@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -11,6 +12,7 @@ RUNTIME_CONFIG_NAME = "cms_bench_runtime.json"
 DEFAULT_CONFIG_ENV = "CURRENT_MEASUREMENT_DEV_CONFIG_FILE"
 BUILD_CONFIG_ENV = "CURRENT_MEASUREMENT_CMS_CLIENT_CONFIG_FILE"
 RUNTIME_CONFIG_ENV = "CURRENT_MEASUREMENT_CMS_BENCH_RUNTIME_FILE"
+PAWR_PHY_BYTE_TIME_MS = {"1m": 0.008, "2m": 0.004}
 
 
 def _read_json_file(path: Path) -> dict:
@@ -50,6 +52,107 @@ def _load_json(path: str | Path) -> dict:
         return json.loads(raw)
     except json.JSONDecodeError:
         return json.loads(re.sub(r",(\s*[}\]])", r"\1", raw))
+
+
+def load_test_config(path: str | Path) -> dict:
+    config = _load_json(path)
+    if not isinstance(config, dict):
+        raise ValueError(f"test config must be a JSON object: {path}")
+    for section in ("test", "advertiser", "scanner", "connection", "pawr", "firmware", "hw"):
+        if section in config and not isinstance(config[section], dict):
+            raise ValueError(f"test config section must be an object: {section}")
+    return config
+
+
+def validate_test_config_data(config: dict) -> None:
+    if not isinstance(config, dict):
+        raise ValueError("test config must be a JSON object")
+    for section in ("test", "advertiser", "scanner", "connection", "pawr", "firmware", "hw"):
+        if section in config and not isinstance(config[section], dict):
+            raise ValueError(f"test config section must be an object: {section}")
+    validate_ble_test_config(config)
+
+
+def pawr_phy_byte_time_ms(phy) -> float:
+    if isinstance(phy, int) and phy in {1, 2}:
+        return PAWR_PHY_BYTE_TIME_MS[f"{phy}m"]
+    if isinstance(phy, str):
+        normalized = phy.strip().lower().replace(" ", "")
+        if normalized in PAWR_PHY_BYTE_TIME_MS:
+            return PAWR_PHY_BYTE_TIME_MS[normalized]
+    raise ValueError(f"Unsupported PAWR PHY: {phy!r}")
+
+
+def is_pawr_config_valid(
+    response_slot_number, subevent_number, subevent_interval, pawr_interval,
+    response_slot_delay, response_slot_spacing, payload_size, phy, t_ifs=0.150,
+) -> bool:
+    overhead_bytes = 10  # Preamble, access address, LL header, and CRC.
+    spacing_ms = Decimal(response_slot_spacing) * Decimal("0.125")
+    subevent_ms = Decimal(subevent_interval) * Decimal("1.25")
+    interval_ms = Decimal(str(pawr_interval))
+    delay_ms = Decimal(response_slot_delay) * Decimal("1.25")
+    t_ifs_ms = Decimal(str(t_ifs))
+    byte_time_ms = Decimal(str(pawr_phy_byte_time_ms(phy)))
+
+    if Decimal(overhead_bytes + payload_size) * byte_time_ms + t_ifs_ms > spacing_ms:
+        return False
+
+    used_airtime_per_subevent = (
+        Decimal(response_slot_number) * (spacing_ms + t_ifs_ms) + delay_ms + t_ifs_ms
+    )
+    if used_airtime_per_subevent > subevent_ms:
+        return False
+
+    return Decimal(subevent_number) * subevent_ms <= interval_ms
+
+
+def is_generated_pawr_config_valid(config: dict) -> bool:
+    pawr = config.get("pawr")
+    if not pawr:
+        return True
+    advertiser = config.get("advertiser", {})
+    try:
+        return is_pawr_config_valid(
+            int(pawr["response_slots"]), int(pawr["num_subevents"]),
+            int(pawr["subevent_interval"]), int(pawr["interval"]),
+            int(pawr["response_slot_delay"]), int(pawr["response_slot_spacing"]),
+            max(int(advertiser.get("payload", 0)), int(pawr.get("rx_payload_length", 0))),
+            advertiser.get("secondary_phy", advertiser.get("phy", "1m")),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def validate_ble_test_config(config: dict) -> None:
+    from utils.bgapi_utils import (
+        AdvertiserConfig, ConnectionParameters, PAWRConfig, ScannerConfig,
+        normalize_advertiser_config, normalize_connection_parameters,
+        normalize_scanner_config,
+    )
+
+    if not isinstance(config, dict):
+        raise ValueError("test config must be a JSON object")
+    for name, config_type, normalize in (
+        ("advertiser", AdvertiserConfig, normalize_advertiser_config),
+        ("scanner", ScannerConfig, normalize_scanner_config),
+        ("connection", ConnectionParameters, normalize_connection_parameters),
+    ):
+        if name in config:
+            try:
+                normalize(config_type(**config[name]))
+            except (ArithmeticError, TypeError, ValueError) as exc:
+                raise ValueError(f"invalid {name} BLE parameters: {exc}") from exc
+    if "pawr" in config:
+        try:
+            pawr = PAWRConfig(**config["pawr"])
+            if any(type(value) is not int for value in vars(pawr).values()):
+                raise ValueError("PAwR parameters must be integers")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid PAwR parameters: {exc}") from exc
+        if not is_generated_pawr_config_valid(config):
+            raise ValueError("PAwR timing and payload parameters are incompatible")
+
 
 def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
     if not runtime_path and not metadata_path:

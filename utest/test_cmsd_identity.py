@@ -1,4 +1,6 @@
 from datetime import timezone
+import json
+from pathlib import Path
 
 from cms_protocol import (
     FirmwareData,
@@ -123,3 +125,42 @@ def test_staged_execution_preserves_variable_filters(monkeypatch):
     request = captured["kwargs"]["args"][0]
     assert result.state is MeasurementState.ACCEPTED
     assert request.selector.variable_filters == filters
+
+
+def test_custom_staged_execution_requires_client_config_payload():
+    result = CMSDaemon().start_staged_test(
+        mode=MeasurementMode.DEFAULT.value,
+        feature="beacon",
+        config="custom",
+    )
+
+    assert result.state is MeasurementState.FAILED
+    assert "local custom.json payload" in result.message
+
+
+def test_custom_staged_execution_carries_client_config_payload(monkeypatch):
+    captured = {}
+
+    class CapturingThread(_DormantThread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("cmsd.threading.Thread", CapturingThread)
+    daemon = CMSDaemon()
+    daemon.last_firmware_request = _staged_request()
+    config_data = json.loads(
+        Path("tests/configs/ble/beacon/custom.json").read_text(encoding="utf-8")
+    )
+
+    result = daemon.start_staged_test(
+        mode=MeasurementMode.DEFAULT.value,
+        feature="beacon",
+        config="CUSTOM.json",
+        custom_config_data=config_data,
+    )
+
+    request = captured["kwargs"]["args"][0]
+    assert result.state is MeasurementState.ACCEPTED
+    assert request.selector.config == "custom"
+    assert request.selector.custom_config_data == config_data

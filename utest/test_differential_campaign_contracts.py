@@ -96,12 +96,20 @@ def test_differential_custom_config_is_frozen_for_both_firmware_passes(tmp_path:
     request = _request()
     request.selector.feature = "beacon"
     request.selector.config = "custom"
+    request.selector.custom_config_data = json.loads(
+        '{"firmware":{"dut_slcp":"apps/ncp_ble_dut.slcp",'
+        '"tester_slcp":"apps/ncp_ble_tester.slcp"},"hw":{"supply_v":3.0}}'
+    )
     config_dir = tmp_path / "tests" / "configs" / "ble" / "beacon"
     config_dir.mkdir(parents=True)
     (config_dir / "parameters.json").write_text("{}\n", encoding="utf-8")
+    (config_dir / "default.json").write_text(
+        '{"firmware":{"dut_slcp":"apps/ncp_ble_dut_dcdc.slcp",'
+        '"tester_slcp":"apps/ncp_ble_tester.slcp"},"hw":{"supply_v":3.0}}\n',
+        encoding="utf-8",
+    )
     source_config = config_dir / "custom.json"
-    original_content = '{"firmware":{"dut_slcp":"apps/ncp_ble_dut_dcdc.slcp","tester_slcp":"apps/ncp_ble_tester.slcp"},"hw":{"supply_v":3.0}}\n'
-    source_config.write_text(original_content, encoding="utf-8")
+    source_config.write_text('{"firmware":{"dut_slcp":"bench-copy.slcp"}}\n', encoding="utf-8")
     runtime = tmp_path / "runtime"
     (runtime / "firmware").mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
@@ -115,7 +123,7 @@ def test_differential_custom_config_is_frozen_for_both_firmware_passes(tmp_path:
     source_config.write_text('{"firmware":{"dut_slcp":"changed.slcp"}}\n', encoding="utf-8")
     jobs = test_orchestrator.load_job_plan(plan_path)
 
-    assert snapshot_path.read_text(encoding="utf-8") == original_content
+    assert json.loads(snapshot_path.read_text(encoding="utf-8")) == request.selector.custom_config_data
     assert plan["custom_config_snapshot"] == {
         "path": str(snapshot_path),
         "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
@@ -123,6 +131,8 @@ def test_differential_custom_config_is_frozen_for_both_firmware_passes(tmp_path:
     assert jobs[0].config_path == snapshot_path
     assert jobs[0].cfg_arg == str(snapshot_path)
     assert jobs[0].config_hash == hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    assert jobs[0].dut_slcp == "apps/ncp_ble_dut.slcp"
+    assert plan["jobs"][0]["firmware_role"] == "no_dcdc"
 
 
 def test_daemon_lists_version1_and_version2_artifacts_without_cross_variant_loss(tmp_path: Path) -> None:
