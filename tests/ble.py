@@ -894,7 +894,7 @@ def test_legacy_beacon(JoulescopeDev,
     )
     TesterScanStart(
         discover_mode=Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
-        phy=_discovery_scan_phy_for_advertiser(DUTLegAdvConfig.phy),
+        phy=_discovery_scan_phy_for_advertiser(DUTLegAdvConfig.primary_phy),
     )
 
     dut_addr = get_device_addr(DUT)
