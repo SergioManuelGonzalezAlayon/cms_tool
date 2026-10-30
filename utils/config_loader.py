@@ -2,7 +2,7 @@ import json
 import os
 import re
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -71,6 +71,44 @@ def validate_test_config_data(config: dict) -> None:
         if section in config and not isinstance(config[section], dict):
             raise ValueError(f"test config section must be an object: {section}")
     validate_ble_test_config(config)
+
+
+def validate_test_config_set_data(configs) -> None:
+    """Validate a named batch of custom test configs before submission or execution."""
+    if not isinstance(configs, list) or not configs:
+        raise ValueError("custom config set must contain at least one config")
+
+    names = set()
+    errors = []
+    for index, item in enumerate(configs):
+        if not isinstance(item, dict):
+            errors.append(f"entry {index + 1} must be an object")
+            continue
+        name = item.get("name")
+        config = item.get("config")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"entry {index + 1} needs a name")
+            continue
+        relative_name = PurePosixPath(name.replace("\\", "/"))
+        if (
+            relative_name.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative_name.parts)
+            or relative_name.suffix.lower() != ".json"
+            or ":" in name
+        ):
+            errors.append(f"entry has an invalid name: {name!r}")
+            continue
+        normalized_name = relative_name.as_posix().casefold()
+        if normalized_name in names:
+            errors.append(f"duplicate config name: {name}")
+            continue
+        names.add(normalized_name)
+        try:
+            validate_test_config_data(config)
+        except (TypeError, ValueError) as exc:
+            errors.append(f"config is invalid ({name}): {exc}")
+    if errors:
+        raise ValueError("custom config set validation failed: " + "; ".join(errors))
 
 
 def pawr_phy_byte_time_ms(phy) -> float:

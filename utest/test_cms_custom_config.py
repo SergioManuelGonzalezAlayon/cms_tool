@@ -67,6 +67,76 @@ def test_client_rejects_invalid_local_custom_config_before_submission(tmp_path, 
         client.run_test(MeasurementMode.DEFAULT, "beacon", config="custom")
 
 
+def test_client_submits_validated_custom_config_set_in_sorted_order(tmp_path, monkeypatch):
+    config_root = tmp_path / "tests" / "configs" / "ble" / "beacon"
+    config_set_dir = config_root / "custom_set"
+    (config_set_dir / "nested").mkdir(parents=True)
+    config_data = _local_custom_config()
+    (config_set_dir / "z-last.json").write_text(
+        json.dumps(config_data), encoding="utf-8"
+    )
+    (config_set_dir / "nested" / "a-first.json").write_text(
+        json.dumps(config_data), encoding="utf-8"
+    )
+    untouched_configs = {
+        config_root / "custom.json": json.dumps(config_data, indent=2) + "\n",
+        config_root / "default.json": json.dumps(config_data, indent=2) + "\n",
+    }
+    for path, contents in untouched_configs.items():
+        path.write_text(contents, encoding="utf-8")
+    original_contents = {path: path.read_bytes() for path in untouched_configs}
+    monkeypatch.chdir(tmp_path)
+    config_set_data = cms_client._load_validated_local_custom_config_set(
+        "beacon", "custom_set"
+    )
+    client = CMSClient(config_path=tmp_path / "missing-client-config.json")
+    captured = {}
+
+    def capture_request(method, path, payload):
+        captured.update(method=method, path=path, payload=payload)
+        return {"measurement_id": "measurement-set", "state": "accepted"}
+
+    monkeypatch.setattr(client, "_request_json", capture_request)
+    client.run_test(
+        MeasurementMode.DEFAULT,
+        "beacon",
+        config="custom_set",
+        custom_config_set_data=config_set_data,
+    )
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/test"
+    assert captured["payload"]["config"] == "custom_set"
+    assert captured["payload"]["config_hash"] == ""
+    assert captured["payload"]["custom_config_set_data"] == [
+        {"name": "nested/a-first.json", "config": config_data},
+        {"name": "z-last.json", "config": config_data},
+    ]
+    assert {path: path.read_bytes() for path in untouched_configs} == original_contents
+
+
+def test_custom_config_set_rejects_entire_batch_before_endpoint_selection(tmp_path, monkeypatch):
+    config_set_dir = tmp_path / "tests" / "configs" / "ble" / "beacon" / "custom_set"
+    config_set_dir.mkdir(parents=True)
+    (config_set_dir / "valid.json").write_text(
+        json.dumps(_local_custom_config()), encoding="utf-8"
+    )
+    (config_set_dir / "invalid.json").write_text(
+        '{"advertiser":{"interval":1,"phy":"1m"}}', encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cms_client,
+        "resolve_client_endpoint",
+        lambda *_args, **_kwargs: pytest.fail("invalid config set reached endpoint selection"),
+    )
+
+    with pytest.raises(RuntimeError, match="custom config set validation failed"):
+        cms_client._main(
+            ["CUSTOM", "--feature", "beacon", "--config-set", "custom_set"]
+        )
+
+
 def test_custom_command_updates_config_then_runs_custom_test(tmp_path, monkeypatch):
     captured = {}
     fake_client = SimpleNamespace(base_url="http://bench")
@@ -119,6 +189,45 @@ def test_custom_command_updates_config_then_runs_custom_test(tmp_path, monkeypat
     assert captured["variable_filters"] == ()
 
 
+def test_custom_config_set_command_forwards_prevalidated_configs(tmp_path, monkeypatch):
+    config_set_dir = tmp_path / "tests" / "configs" / "ble" / "beacon" / "custom_set"
+    config_set_dir.mkdir(parents=True)
+    config_data = _local_custom_config()
+    (config_set_dir / "b.json").write_text(json.dumps(config_data), encoding="utf-8")
+    (config_set_dir / "a.json").write_text(json.dumps(config_data), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+    endpoint = SimpleNamespace(
+        base_url="http://bench",
+        api_token="token",
+        timeout_s=5.0,
+    )
+    fake_client = SimpleNamespace(base_url="http://bench")
+    monkeypatch.setattr(cms_client, "resolve_client_endpoint", lambda *_args, **_kwargs: endpoint)
+    monkeypatch.setattr(cms_client, "CMSClient", lambda **_kwargs: fake_client)
+    monkeypatch.setattr(cms_client, "_print_explicit_endpoint_selection", lambda *_args: None)
+
+    def run_custom_test(client, args, variable_filters, _colors):
+        captured.update(
+            client=client,
+            config_name=args.config_name,
+            config_set_data=args.custom_config_set_data,
+            variable_filters=variable_filters,
+        )
+        return cms_client.CMSCLIExitCode.SUCCESS
+
+    monkeypatch.setattr(cms_client, "_run_test_feature", run_custom_test)
+    result = cms_client._main(
+        ["CUSTOM", "--feature", "beacon", "--config-set", "custom_set"]
+    )
+
+    assert result == cms_client.CMSCLIExitCode.SUCCESS
+    assert captured["client"] is fake_client
+    assert captured["config_name"] == "custom_set"
+    assert [item["name"] for item in captured["config_set_data"]] == ["a.json", "b.json"]
+    assert captured["variable_filters"] == ()
+
+
 def test_custom_config_update_only_edits_local_custom_json(tmp_path, monkeypatch):
     config_dir = tmp_path / "tests" / "configs" / "ble" / "beacon"
     config_dir.mkdir(parents=True)
@@ -163,6 +272,31 @@ def test_measurement_request_round_trip_preserves_custom_config_data():
     restored = measurement_request_from_dict(measurement_request_to_dict(request))
 
     assert restored.selector.custom_config_data == config_data
+
+
+def test_measurement_request_round_trip_preserves_custom_config_set_data():
+    config_data = _local_custom_config()
+    config_set_data = [
+        {"name": "a.json", "config": config_data},
+        {"name": "nested/b.json", "config": config_data},
+    ]
+    request = MeasurementRequest(
+        request_id="measurement-set",
+        selector=SuiteSelector(
+            mode="ble",
+            feature="beacon",
+            config="custom_set",
+            custom_config_set_data=config_set_data,
+        ),
+        firmware=FirmwareData(
+            dut_img=FirmwareImage(name="dut.s37", url="dut.s37"),
+            tester_img=FirmwareImage(name="tester.s37", url="tester.s37"),
+        ),
+    )
+
+    restored = measurement_request_from_dict(measurement_request_to_dict(request))
+
+    assert restored.selector.custom_config_set_data == config_set_data
 
 
 def test_custom_job_plan_runs_the_transmitted_snapshot(tmp_path):

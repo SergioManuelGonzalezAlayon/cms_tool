@@ -75,7 +75,7 @@ from cms_protocol import (
     test_case_identity_from_dict,
     variable_filters_from_dicts,
 )
-from utils.config_loader import validate_test_config_data
+from utils.config_loader import validate_test_config_data, validate_test_config_set_data
 
 
 PUBLISHABLE_DIAGNOSTIC_NAMES = frozenset(
@@ -1701,12 +1701,29 @@ class CMSDaemon:
         config: str = "default",
         config_hash: str = "",
         custom_config_data: dict[str, Any] | None = None,
+        custom_config_set_data: list[dict[str, Any]] | None = None,
         run_name: str = "",
         upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Run a test using the most recently staged firmware request."""
 
+        is_custom_config_set = config.strip().lower().replace("\\", "/") == "custom_set"
+        if is_custom_config_set:
+            if feature.strip().lower() == "all":
+                return _staged_test_failure("CUSTOM config sets require one named BLE feature")
+            if custom_config_data is not None:
+                return _staged_test_failure(
+                    "CUSTOM config payloads cannot include both a file and a set"
+                )
+            try:
+                validate_test_config_set_data(custom_config_set_data)
+            except (TypeError, ValueError) as exc:
+                return _staged_test_failure(f"custom test config set is invalid: {exc}")
+        elif custom_config_set_data is not None:
+            return _staged_test_failure(
+                "a custom config set payload is only valid when config is custom_set"
+            )
         if self.last_firmware_request is None:
             return MeasurementResult(
                 measurement_id="",
@@ -1723,6 +1740,7 @@ class CMSDaemon:
         request.selector.config = config
         request.selector.config_hash = config_hash
         request.selector.custom_config_data = custom_config_data
+        request.selector.custom_config_set_data = custom_config_set_data
         request.upload_results_to_database = _should_upload_results_to_database(request.mode)
         request.debug_artifact_streaming = debug_artifact_streaming
         request.identity = None
@@ -1740,6 +1758,7 @@ class CMSDaemon:
         config: str = "default",
         config_hash: str = "",
         custom_config_data: dict[str, Any] | None = None,
+        custom_config_set_data: list[dict[str, Any]] | None = None,
         variable_filters: tuple[VariableFilter, ...] = (),
         run_name: str = "",
         upload_results_to_database: bool = True,
@@ -1751,21 +1770,39 @@ class CMSDaemon:
             "custom",
             "custom.json",
         }
+        is_custom_config_set = config.strip().lower().replace("\\", "/") == "custom_set"
         if is_custom_config and not isinstance(custom_config_data, dict):
             return _staged_test_failure(
                 "CUSTOM tests require the local custom.json payload from the CMS Client"
             )
+        if is_custom_config_set and not isinstance(custom_config_set_data, list):
+            return _staged_test_failure(
+                "CUSTOM config sets require the validated custom_set payload from the CMS Client"
+            )
         if is_custom_config and feature.strip().lower() == "all":
             return _staged_test_failure("CUSTOM tests require one named BLE feature")
-        if not is_custom_config and custom_config_data is not None:
+        if is_custom_config_set and feature.strip().lower() == "all":
+            return _staged_test_failure("CUSTOM config sets require one named BLE feature")
+        if is_custom_config and custom_config_set_data is not None:
+            return _staged_test_failure("CUSTOM config payloads cannot include both a file and a set")
+        if is_custom_config_set and custom_config_data is not None:
+            return _staged_test_failure("CUSTOM config payloads cannot include both a file and a set")
+        if not is_custom_config and not is_custom_config_set and (
+            custom_config_data is not None or custom_config_set_data is not None
+        ):
             return _staged_test_failure(
-                "a custom config payload is only valid when config is custom"
+                "a custom config payload is only valid for custom or custom_set"
             )
         if is_custom_config:
             try:
                 validate_test_config_data(custom_config_data)
             except (TypeError, ValueError) as exc:
                 return _staged_test_failure(f"custom test config is invalid: {exc}")
+        if is_custom_config_set:
+            try:
+                validate_test_config_set_data(custom_config_set_data)
+            except (TypeError, ValueError) as exc:
+                return _staged_test_failure(f"custom test config set is invalid: {exc}")
 
         measurement_mode = MeasurementMode(mode)
         differential_staging: StagedDifferentialFirmware | None = None
@@ -1794,9 +1831,12 @@ class CMSDaemon:
         request.mode = measurement_mode
         request.selector.mode = "ble"
         request.selector.feature = feature
-        request.selector.config = "custom" if is_custom_config else config
+        request.selector.config = "custom" if is_custom_config else (
+            "custom_set" if is_custom_config_set else config
+        )
         request.selector.config_hash = config_hash
         request.selector.custom_config_data = custom_config_data
+        request.selector.custom_config_set_data = custom_config_set_data
         request.selector.variable_filters = variable_filters
         request.upload_results_to_database = _should_upload_results_to_database(request.mode)
         request.debug_artifact_streaming = debug_artifact_streaming
@@ -2283,6 +2323,7 @@ class CMSDaemon:
                 config=str(request.get("config", "default")),
                 config_hash=str(request.get("config_hash", "")),
                 custom_config_data=request.get("custom_config_data"),
+                custom_config_set_data=request.get("custom_config_set_data"),
                 variable_filters=variable_filters_from_dicts(request.get("variable_filters")),
                 run_name=str(request.get("run_name", "")),
                 upload_results_to_database=bool(request.get("upload_results_to_database", True)),

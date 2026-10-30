@@ -8,6 +8,14 @@ from pathlib import Path
 import re
 import sys
 
+from utils.config_loader import (
+    PAWR_PHY_BYTE_TIME_MS,
+    is_generated_pawr_config_valid,
+    is_pawr_config_valid,
+    pawr_phy_byte_time_ms,
+    validate_ble_test_config,
+)
+
 
 UNIT_SCALE = {
     "V": Decimal("1"),
@@ -20,10 +28,6 @@ CONN_INTERVAL_UNIT_MS = Decimal("1.25")
 CONN_TIMEOUT_UNIT_MS = Decimal("10")
 CONN_TIMEOUT_MIN_UNITS = 0x000A
 CONN_TIMEOUT_MAX_UNITS = 0x0C80
-PAWR_PHY_BYTE_TIME_MS = {
-    "1m": 0.008,
-    "2m": 0.004,
-}
 ADVERTISING_PHY_PATH = "advertiser.phy"
 SCANNER_PHY_PATH = "scanner.phy"
 ADVERTISING_PHY_EXPANSIONS = {
@@ -162,19 +166,6 @@ def finalize_config(config: dict) -> None:
         connection["interval"],
         connection.get("latency", 0),
     )
-
-
-def pawr_phy_byte_time_ms(phy) -> float:
-    if isinstance(phy, int):
-        if phy == 1:
-            return PAWR_PHY_BYTE_TIME_MS["1m"]
-        if phy == 2:
-            return PAWR_PHY_BYTE_TIME_MS["2m"]
-    if isinstance(phy, str):
-        normalized = phy.strip().lower().replace(" ", "")
-        if normalized in PAWR_PHY_BYTE_TIME_MS:
-            return PAWR_PHY_BYTE_TIME_MS[normalized]
-    raise ValueError(f"Unsupported PAWR PHY: {phy!r}")
 
 
 def apply_value(config: dict, parameter: dict, raw_value) -> None:
@@ -320,78 +311,10 @@ def discover_parameter_files(root: Path) -> list[Path]:
 def selected_modes(mode: str) -> set[str]:
     return {"one_factor", "full_sweep"} if mode == "both" else {mode}
 
-def is_pawr_config_valid(response_slot_number,
-                         subevent_number,
-                         subevent_interval,
-                         pawr_interval,
-                         response_slot_delay,
-                         response_slot_spacing,
-                         payload_size,
-                         phy,
-                         t_ifs = 0.150):
-    overhead_bytes = (
-        1 + # Preamble
-        4 + # Access Address
-        2 + # LL header
-        3   # CRC
-    )
-
-    # Config files store PAwR timing values in BGAPI units, while packet
-    # airtime and T_IFS are measured in milliseconds.
-    response_slot_spacing_ms = Decimal(response_slot_spacing) * Decimal("0.125")
-    subevent_interval_ms = Decimal(subevent_interval) * Decimal("1.25")
-    pawr_interval_ms = Decimal(str(pawr_interval))
-    response_slot_delay_ms = Decimal(response_slot_delay) * Decimal("1.25")
-    t_ifs_ms = Decimal(str(t_ifs))
-    byte_time_ms = Decimal(str(pawr_phy_byte_time_ms(phy)))
-
-    used_airtime_per_payload = Decimal(overhead_bytes + payload_size) * byte_time_ms
-    if used_airtime_per_payload + t_ifs_ms > response_slot_spacing_ms:
-       return False
-
-    used_airtime_per_subevent_interval = (
-        Decimal(response_slot_number) * (response_slot_spacing_ms + t_ifs_ms)
-        + response_slot_delay_ms
-        + t_ifs_ms
-    )
-    if used_airtime_per_subevent_interval > subevent_interval_ms:
-        return False
-
-    used_airtime_per_pawr_interval = Decimal(subevent_number) * subevent_interval_ms
-    if used_airtime_per_pawr_interval > pawr_interval_ms:
-        return False
-    
-    return True
-
-
-def is_generated_pawr_config_valid(config: dict) -> bool:
-    pawr = config.get("pawr")
-    if not pawr:
-        return True
-
-    advertiser = config.get("advertiser", {})
-    try:
-        payload_size = max(
-            int(advertiser.get("payload", 0)),
-            int(pawr.get("rx_payload_length", 0)),
-        )
-        phy = advertiser.get("secondary_phy", advertiser.get("phy", "1m"))
-        return is_pawr_config_valid(
-            int(pawr["response_slots"]),
-            int(pawr["num_subevents"]),
-            int(pawr["subevent_interval"]),
-            int(pawr["interval"]),
-            int(pawr["response_slot_delay"]),
-            int(pawr["response_slot_spacing"]),
-            payload_size,
-            phy,
-        )
-    except (KeyError, TypeError, ValueError):
-        return False
-
-
 def write_generated_config(config: dict, output_path: Path) -> bool:
-    if not is_generated_pawr_config_valid(config):
+    try:
+        validate_ble_test_config(config)
+    except ValueError:
         return False
     output_path.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
     return True

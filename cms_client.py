@@ -79,7 +79,11 @@ from cms_variable_filters import (
     validate_variable_filters,
     variable_help_text,
 )
-from utils.config_loader import load_test_config, validate_test_config_data
+from utils.config_loader import (
+    load_test_config,
+    validate_test_config_data,
+    validate_test_config_set_data,
+)
 
 CMS_CLIENT_CONFIG = "cms_client_config.json"
 
@@ -633,12 +637,25 @@ class CMSClient:
         variable_filters: tuple[VariableFilter, ...] = (),
         upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
+        custom_config_set_data: list[dict[str, Any]] | None = None,
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
 
         config_hash = ""
         custom_config_data = None
-        if feature != "all" and not (
+        is_custom_config_set = _is_custom_config_set_name(config)
+        if is_custom_config_set:
+            if feature.strip().lower() == "all":
+                raise RuntimeError("CUSTOM config sets require one named BLE feature")
+            if custom_config_set_data is None:
+                raise RuntimeError("CUSTOM config set payload is required")
+            try:
+                validate_test_config_set_data(custom_config_set_data)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"custom test config set is invalid: {exc}") from exc
+        elif custom_config_set_data is not None:
+            raise RuntimeError("custom config set payload requires config custom_set")
+        if not is_custom_config_set and feature != "all" and not (
             mode is not MeasurementMode.DEFAULT and config == "default"
         ):
             if _is_mutable_custom_config_name(config):
@@ -660,6 +677,8 @@ class CMSClient:
         }
         if custom_config_data is not None:
             request["custom_config_data"] = custom_config_data
+        if custom_config_set_data is not None:
+            request["custom_config_set_data"] = custom_config_set_data
         payload = self._request_json(
             "POST",
             "/test",
@@ -1564,26 +1583,32 @@ def build_cli_parser() -> argparse.ArgumentParser:
     custom = subparsers.add_parser(
         "custom",
         aliases=["CUSTOM"],
-        help="update and run a feature's mutable custom.json configuration",
+        help="run a feature's custom.json or a validated set of custom configs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Example:\n"
             "  cms CUSTOM --feature beacon --set advertiser.interval=100\n"
+            "  cms CUSTOM --feature beacon --config-set custom_set\n"
             "  cms CUSTOM --feature beacon --set advertiser.phy=2m --set hw.supply_v=3.3 --verbose\n\n"
             "Values are parsed as JSON when possible; unquoted text is stored as a string.\n"
-            "The local custom.json is validated, submitted to the selected Bench, and run.\n"
+            "A config set validates every JSON before the set is submitted to the selected Bench.\n"
             "Use cms TEST --mode default --feature beacon --config-name custom to rerun it without edits."
         ),
     )
     _add_color_argument(custom)
     _add_bench_endpoint_arguments(custom)
-    custom.add_argument("--feature", "-f", required=True, help="BLE feature whose custom.json is updated")
-    custom.add_argument(
+    custom.add_argument("--feature", "-f", required=True, help="BLE feature whose custom config will run")
+    custom_source = custom.add_mutually_exclusive_group(required=True)
+    custom_source.add_argument(
         "--set",
         action="append",
-        required=True,
         metavar="PATH=VALUE",
         help="replace an existing custom.json value using a dotted object path; repeat as needed",
+    )
+    custom_source.add_argument(
+        "--config-set",
+        metavar="DIRECTORY",
+        help="run all JSON configs beneath tests/configs/ble/<feature>/<DIRECTORY>",
     )
     custom.add_argument(
         "--mode",
@@ -1848,6 +1873,11 @@ def main(argv: list[str] | None = None) -> int:
 def _main(argv: list[str] | None = None) -> int:
     args = build_cli_parser().parse_args(argv)
     colors = color_formatter(args.color)
+    if args.command in {"custom", "CUSTOM"} and args.config_set:
+        args.custom_config_set_data = _load_validated_local_custom_config_set(
+            args.feature,
+            args.config_set,
+        )
     client_config = load_client_config(args.config)
     uses_resolved_endpoint = (
         args.command == "health"
@@ -2006,9 +2036,16 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"custom", "CUSTOM"}:
         _print_explicit_endpoint_selection(args, client)
-        path = update_custom_test_config(args.feature, args.set)
-        print(path)
-        args.config_name = "custom"
+        if args.config_set:
+            print(
+                f"validated {len(args.custom_config_set_data)} configs from "
+                f"tests/configs/ble/{args.feature}/{args.config_set}"
+            )
+            args.config_name = "custom_set"
+        else:
+            path = update_custom_test_config(args.feature, args.set)
+            print(path)
+            args.config_name = "custom"
         return _run_test_feature(client, args, (), colors)
 
     if args.command in {"cancel", "CANCEL"}:
@@ -2609,6 +2646,10 @@ def _is_mutable_custom_config_name(config: str) -> bool:
     return config.strip().replace("\\", "/").lower() in {"custom", "custom.json"}
 
 
+def _is_custom_config_set_name(config: str) -> bool:
+    return config.strip().replace("\\", "/").lower() == "custom_set"
+
+
 def update_custom_test_config(feature: str, assignments: list[str]) -> Path:
     """Apply explicit dotted-path updates to one feature's mutable custom config."""
 
@@ -2672,6 +2713,81 @@ def _local_test_config_path(feature: str, config: str) -> Path:
     except ValueError as exc:
         raise RuntimeError("test config must stay beneath the selected feature directory") from exc
     return resolved
+
+
+def _local_test_config_set_dir(feature: str, config_set: str) -> Path:
+    feature_name = feature.strip()
+    if not feature_name:
+        raise RuntimeError("test feature is required")
+    if Path(feature_name).name != feature_name or feature_name in {".", ".."}:
+        raise RuntimeError("test feature must be a single feature name")
+    feature_dir = Path("tests") / "configs" / "ble" / feature_name
+    if not feature_dir.is_dir():
+        raise RuntimeError(f"test feature config directory does not exist: {feature_dir}")
+
+    set_name = config_set.strip().replace("\\", "/")
+    relative = Path(set_name)
+    if (
+        not set_name
+        or relative.is_absolute()
+        or len(relative.parts) != 1
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise RuntimeError("custom config set must be a single directory beneath the feature config directory")
+    resolved = (feature_dir / relative).resolve()
+    try:
+        resolved.relative_to(feature_dir.resolve())
+    except ValueError as exc:
+        raise RuntimeError("custom config set must stay beneath the feature config directory") from exc
+    if not resolved.is_dir():
+        raise RuntimeError(f"custom config set directory does not exist: {resolved}")
+    return resolved
+
+
+def _load_validated_local_custom_config_set(
+    feature: str,
+    config_set: str,
+) -> list[dict[str, Any]]:
+    config_dir = _local_test_config_set_dir(feature, config_set)
+    try:
+        config_paths = sorted(
+            (
+                path
+                for path in config_dir.rglob("*")
+                if path.is_file() and path.suffix.lower() == ".json"
+            ),
+            key=lambda path: (
+                path.relative_to(config_dir).as_posix().casefold(),
+                path.relative_to(config_dir).as_posix(),
+            ),
+        )
+    except OSError as exc:
+        raise RuntimeError(f"could not read custom config set directory: {config_dir}: {exc}") from exc
+    if not config_paths:
+        raise RuntimeError(f"custom config set contains no JSON configs: {config_dir}")
+
+    configs: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for path in config_paths:
+        name = path.relative_to(config_dir).as_posix()
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(config_dir)
+            config_data = load_test_config(resolved)
+        except (OSError, RuntimeError, ValueError) as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        configs.append({"name": name, "config": config_data})
+
+    if configs:
+        try:
+            validate_test_config_set_data(configs)
+        except ValueError as exc:
+            errors.append(str(exc))
+    if errors:
+        detail = "; ".join(errors)
+        raise RuntimeError(f"custom config set validation failed: {detail}")
+    return configs
 
 
 def _local_firmware_payloads(request: MeasurementRequest) -> dict[str, str]:
@@ -2803,6 +2919,7 @@ def _run_test_feature(
         variable_filters=variable_filters,
         upload_results_to_database=args.upload_results_to_database,
         debug_artifact_streaming=args.debug,
+        custom_config_set_data=getattr(args, "custom_config_set_data", None),
     )
     record_last_measurement(
         args.config,

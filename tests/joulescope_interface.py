@@ -1,6 +1,7 @@
 import pytest, logging
 from dataclasses import dataclass, asdict
 import json
+import platform
 import subprocess
 from instruments.joulescope.read_pyjoulescope_driver import Joulescope, get_profile
 from algorithms.single_pattern_analysis import SinglePatternCurrentProfileAnalyzer
@@ -464,6 +465,9 @@ def JoulescopeUsbReset(request: pytest.FixtureRequest):
 
 
 def _reset_joulescope_usb(usb_id: str) -> None:
+    if _platform_system() != "Linux":
+        return
+
     # Reset the JS USB to avoid the USB driver deaklocking the whole test run
     attempts = 3
     for attempt in range(1, attempts + 1):
@@ -507,6 +511,10 @@ def _reset_joulescope_usb(usb_id: str) -> None:
             if attempts == attempt:
                 raise
         sleep(0.5)
+
+
+def _platform_system() -> str:
+    return platform.system()
 
 @pytest.fixture(scope="session")
 def JoulescopeDev(JoulescopeUsbReset, request: pytest.FixtureRequest):

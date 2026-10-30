@@ -164,3 +164,49 @@ def test_custom_staged_execution_carries_client_config_payload(monkeypatch):
     assert result.state is MeasurementState.ACCEPTED
     assert request.selector.config == "custom"
     assert request.selector.custom_config_data == config_data
+
+
+def test_custom_config_set_staged_execution_validates_and_carries_batch(monkeypatch):
+    captured = {}
+
+    class CapturingThread(_DormantThread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr("cmsd.threading.Thread", CapturingThread)
+    daemon = CMSDaemon()
+    daemon.last_firmware_request = _staged_request()
+    config_data = json.loads(
+        Path("tests/configs/ble/beacon/custom.json").read_text(encoding="utf-8")
+    )
+    config_set_data = [
+        {"name": "first.json", "config": config_data},
+        {"name": "second.json", "config": config_data},
+    ]
+
+    result = daemon.start_staged_test(
+        mode=MeasurementMode.DEFAULT.value,
+        feature="beacon",
+        config="custom_set",
+        custom_config_set_data=config_set_data,
+    )
+
+    request = captured["kwargs"]["args"][0]
+    assert result.state is MeasurementState.ACCEPTED
+    assert request.selector.config == "custom_set"
+    assert request.selector.custom_config_set_data == config_set_data
+
+
+def test_custom_config_set_staged_execution_rejects_invalid_config_before_start():
+    result = CMSDaemon().start_staged_test(
+        mode=MeasurementMode.DEFAULT.value,
+        feature="beacon",
+        config="custom_set",
+        custom_config_set_data=[
+            {"name": "invalid.json", "config": {"advertiser": {"interval": 1}}}
+        ],
+    )
+
+    assert result.state is MeasurementState.FAILED
+    assert "custom test config set is invalid" in result.message

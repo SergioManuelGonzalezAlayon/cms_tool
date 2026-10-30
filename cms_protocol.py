@@ -306,6 +306,7 @@ class SuiteSelector:
     config_hash: str = ""
     variable_filters: tuple["VariableFilter", ...] = ()
     custom_config_data: dict[str, Any] | None = None
+    custom_config_set_data: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -945,6 +946,8 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
     }
     if request.selector.custom_config_data is not None:
         payload["selector"]["custom_config_data"] = request.selector.custom_config_data
+    if request.selector.custom_config_set_data is not None:
+        payload["selector"]["custom_config_set_data"] = request.selector.custom_config_set_data
     if request.differential_firmware is not None:
         payload["differential_firmware"] = differential_firmware_to_dict(
             request.differential_firmware
@@ -957,6 +960,21 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
     custom_config_data = selector.get("custom_config_data")
     if custom_config_data is not None and not isinstance(custom_config_data, dict):
         raise ValueError("selector.custom_config_data must be a JSON object")
+    custom_config_set_data = selector.get("custom_config_set_data")
+    if custom_config_set_data is not None:
+        if not isinstance(custom_config_set_data, list) or not custom_config_set_data:
+            raise ValueError("selector.custom_config_set_data must be a non-empty array")
+        for index, item in enumerate(custom_config_set_data):
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("name"), str)
+                or not item["name"].strip()
+                or not isinstance(item.get("config"), dict)
+            ):
+                raise ValueError(
+                    "selector.custom_config_set_data entries must contain a name and config object "
+                    f"(entry {index + 1})"
+                )
     identity_data = data.get("identity")
     return MeasurementRequest(
         request_id=str(data.get("request_id", "")),
@@ -966,6 +984,7 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
             config=str(selector.get("config", "default")),
             config_hash=str(selector.get("config_hash", "")),
             custom_config_data=custom_config_data,
+            custom_config_set_data=custom_config_set_data,
             variable_filters=variable_filters_from_dicts(selector.get("variable_filters")),
         ),
         firmware=firmware_data_from_dict(data.get("firmware", data)),
