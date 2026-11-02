@@ -429,15 +429,32 @@ def result_tracking_for_job(job: Job, started_at_ns: int) -> dict[str, object]:
     return tracking
 
 
-def aggregate_junit_reports(report_paths: list[Path], output_path: Path) -> Path:
-    """Combine per-job pytest reports into one campaign-level JUnit document."""
+def aggregate_junit_reports(
+    report_paths: list[Path],
+    output_path: Path,
+    *,
+    jobs_by_report: dict[Path, Job] | None = None,
+) -> Path:
+    """Combine job reports under feature suites in their planned order."""
 
-    aggregate = ET.Element("testsuites", {"name": "CMS Bench pytest tests"})
+    aggregate = ET.Element("testsuites", {"name": "CMS Bench campaign"})
     totals = {name: 0 for name in ("tests", "errors", "failures", "skipped")}
+    feature_suites: dict[str, ET.Element] = {}
+    feature_totals: dict[str, dict[str, int]] = {}
+    feature_times: dict[str, float] = {}
     total_time = 0.0
-    for report_path in sorted(report_paths):
+    for report_path in report_paths:
         if not report_path.is_file():
             continue
+        job = jobs_by_report.get(report_path) if jobs_by_report is not None else None
+        feature = (job.feature if job is not None else "").strip() or "unknown"
+        feature_suite = feature_suites.get(feature)
+        if feature_suite is None:
+            feature_suite = ET.SubElement(aggregate, "testsuite", {"name": feature})
+            feature_suites[feature] = feature_suite
+            feature_totals[feature] = {name: 0 for name in totals}
+            feature_times[feature] = 0.0
+
         report_root = ET.parse(report_path).getroot()
         suites = (
             [report_root]
@@ -445,11 +462,26 @@ def aggregate_junit_reports(report_paths: list[Path], output_path: Path) -> Path
             else list(report_root.findall("testsuite"))
         )
         for suite in suites:
-            suite.set("cms_report", report_path.name)
-            aggregate.append(suite)
             for name in totals:
-                totals[name] += int(suite.attrib.get(name, "0") or 0)
-            total_time += float(suite.attrib.get("time", "0") or 0.0)
+                count = int(suite.attrib.get(name, "0") or 0)
+                totals[name] += count
+                feature_totals[feature][name] += count
+            suite_time = float(suite.attrib.get("time", "0") or 0.0)
+            total_time += suite_time
+            feature_times[feature] += suite_time
+
+            for testcase in suite.findall(".//testcase"):
+                testcase.set("cms_report", report_path.name)
+                testcase.set(
+                    "cms_config",
+                    job.cfg_arg if job is not None else report_path.stem,
+                )
+                feature_suite.append(testcase)
+
+    for feature, feature_suite in feature_suites.items():
+        for name, value in feature_totals[feature].items():
+            feature_suite.set(name, str(value))
+        feature_suite.set("time", f"{feature_times[feature]:.6f}")
 
     for name, value in totals.items():
         aggregate.set(name, str(value))
@@ -942,6 +974,10 @@ def main(argv: list[str] | None = None) -> int:
         job.job_id: junit_path_for_job(results_log, job, ordinal)
         for ordinal, job in enumerate(jobs, start=1)
     }
+    jobs_by_junit_path = {
+        junit_paths[job.job_id]: job
+        for job in jobs
+    }
     aggregate_junit_path = Path(parsed.aggregate_junit) if parsed.aggregate_junit else None
     include_junit_logs = aggregate_junit_path is not None
 
@@ -1039,13 +1075,21 @@ def main(argv: list[str] | None = None) -> int:
             if parsed.max_fail and failures >= parsed.max_fail:
                 print(colors.color(f"Stopping early after {failures} failure(s).", "warning"))
                 if aggregate_junit_path is not None:
-                    aggregate_junit_reports(list(junit_paths.values()), aggregate_junit_path)
+                    aggregate_junit_reports(
+                        list(junit_paths.values()),
+                        aggregate_junit_path,
+                        jobs_by_report=jobs_by_junit_path,
+                    )
                 return 1
         else:
             print(colors.color(f"Passed {ordinal}/{total_jobs}: {job.cfg_arg}", "passed"))
 
     if aggregate_junit_path is not None:
-        aggregate_junit_reports(list(junit_paths.values()), aggregate_junit_path)
+        aggregate_junit_reports(
+            list(junit_paths.values()),
+            aggregate_junit_path,
+            jobs_by_report=jobs_by_junit_path,
+        )
     return 1 if failures else 0
 
 

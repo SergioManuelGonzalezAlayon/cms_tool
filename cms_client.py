@@ -115,7 +115,11 @@ def _junit_duration(value: str) -> float:
         return 0.0
 
 
-def _write_junit_html_report(xml_path: Path) -> Path:
+def _write_junit_html_report(
+    xml_path: Path,
+    *,
+    output_path: Path | None = None,
+) -> Path:
     """Render one JUnit XML report as a self-contained local HTML report."""
 
     root = ET.parse(xml_path).getroot()
@@ -154,7 +158,7 @@ def _write_junit_html_report(xml_path: Path) -> Path:
         ),
     }
     report_title = xml_path.stem
-    report_path = xml_path.with_suffix(".html")
+    report_path = output_path or xml_path.with_suffix(".html")
     page: list[str] = [
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
@@ -230,8 +234,46 @@ def _write_junit_html_report(xml_path: Path) -> Path:
         page.append("</details>")
 
     page.append("</section></body></html>")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text("".join(page), encoding="utf-8")
     return report_path
+
+
+def _write_measurement_test_results_report(
+    client: CMSClient,
+    measurement_id: str,
+) -> Path:
+    """Render the campaign JUnit artifact as HTML without retaining its XML copy."""
+
+    campaign_artifact = next(
+        (
+            artifact
+            for artifact in client.list_measurement_artifacts(measurement_id)
+            if Path(artifact.name.replace("\\", "/")).name.lower() == "campaign.xml"
+            and (
+                artifact.result_type is ResultType.PYTEST_JUNIT
+                or Path(artifact.name.replace("\\", "/")).suffix.lower() == ".xml"
+            )
+        ),
+        None,
+    )
+    if campaign_artifact is None:
+        raise RuntimeError(
+            f"campaign JUnit report is unavailable for measurement: {measurement_id}"
+        )
+
+    report_path = (
+        Path("artifacts")
+        / _friendly_measurement_directory_name(measurement_id)
+        / "campaign.html"
+    )
+    with tempfile.TemporaryDirectory(prefix="cms-result-") as temp_dir:
+        xml_path = client.download_artifact(
+            measurement_id,
+            campaign_artifact.name,
+            Path(temp_dir),
+        )
+        return _write_junit_html_report(xml_path, output_path=report_path)
 TERMINAL_MEASUREMENT_STATES = frozenset(
     {
         MeasurementState.PASSED,
@@ -1659,6 +1701,41 @@ def build_cli_parser() -> argparse.ArgumentParser:
     _add_color_argument(measurement)
     measurement.add_argument("measurement_id")
 
+    result = subparsers.add_parser(
+        "result",
+        aliases=["RESULT"],
+        help="show the concise result summary for a measurement",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  cms RESULT --summary\n"
+            "  cms RESULT --id <measurement_id> --summary\n"
+            "  cms RESULT --test-results\n"
+            "  cms RESULT --id <measurement_id> --summary --test-results\n\n"
+            "Defaults:\n"
+            "  --id omitted uses last_measurement.measurement_id from the client config.\n"
+            "  With no output option, RESULT prints the summary."
+        ),
+    )
+    _add_color_argument(result)
+    result.add_argument(
+        "--id",
+        dest="measurement_id",
+        default="",
+        metavar="MEASUREMENT_ID",
+        help="measurement to inspect; defaults to the last measurement saved in client config",
+    )
+    result.add_argument(
+        "--summary",
+        action="store_true",
+        help="print the concise test summary to stdout",
+    )
+    result.add_argument(
+        "--test-results",
+        action="store_true",
+        help="create an HTML report from the measurement campaign JUnit XML",
+    )
+
     watch = subparsers.add_parser(
         "watch",
         aliases=["WATCH"],
@@ -2001,6 +2078,22 @@ def _main(argv: list[str] | None = None) -> int:
         _print_measurement_result(client.get_measurement(args.measurement_id), colors=colors)
         return CMSCLIExitCode.SUCCESS
 
+    if args.command in {"result", "RESULT"}:
+        measurement_id = _resolve_result_measurement_id(
+            args.measurement_id,
+            config_path=args.config,
+        )
+        summary = client.get_measurement_summary(measurement_id)
+        if args.summary or not args.test_results:
+            _print_measurement_summary(summary, colors=colors)
+        if args.test_results:
+            report_path = _write_measurement_test_results_report(
+                client,
+                measurement_id,
+            )
+            print(f"test_results_html: {report_path}")
+        return _measurement_exit_code(summary.state)
+
     if args.command in {"watch", "WATCH"}:
         measurement_id = _resolve_watch_measurement_id(
             client,
@@ -2050,7 +2143,18 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"cancel", "CANCEL"}:
         result = client.cancel_active_test()
-        _print_measurement_result(result, colors=colors)
+        _print_measurement_result(result, colors=colors, show_progress=False)
+        if result.measurement_id:
+            summary = client.get_measurement_summary(result.measurement_id)
+            if summary.counts.total:
+                _print_measurement_summary(
+                    summary,
+                    colors=colors,
+                    show_header=False,
+                    show_failed_tests=False,
+                )
+            else:
+                print("tests: progress unavailable (test plan not available yet)")
         if result.state is MeasurementState.REJECTED:
             return CMSCLIExitCode.TEST_REJECTED
         return (
@@ -2839,9 +2943,11 @@ def _print_measurement_result(
     result: MeasurementResult,
     *,
     colors: ColorFormatter | None = None,
+    show_progress: bool = True,
 ) -> None:
     colors = colors or color_formatter("never")
-    print(f"{result.measurement_id}: {colors.state(result.state)} {result.progress_percent}%")
+    progress = f" {result.progress_percent}%" if show_progress else ""
+    print(f"{result.measurement_id}: {colors.state(result.state)}{progress}")
     if result.identity is not None:
         print(f"run_name: {result.identity.run_name}")
         print(f"created_at: {result.identity.created_at.isoformat()}")
@@ -3302,6 +3408,38 @@ def _resolve_watch_measurement_id(
     return measurement_id
 
 
+def _resolve_result_measurement_id(
+    requested_measurement_id: str,
+    *,
+    config_path: str | Path = CMS_CLIENT_CONFIG,
+) -> str:
+    """Resolve an explicit result ID or the last measurement saved by the client."""
+
+    measurement_id = requested_measurement_id.strip()
+    if measurement_id:
+        return measurement_id
+
+    config_file = Path(config_path)
+    if not config_file.is_file():
+        raise RuntimeError(
+            "cannot show the last result because the CMS client config does not exist; "
+            "submit a test first or pass --id <measurement_id>"
+        )
+    record = _read_json_file(config_file).get("last_measurement")
+    if not isinstance(record, dict) or not isinstance(record.get("measurement_id"), str):
+        raise RuntimeError(
+            "cannot show the last result because no submitted measurement is recorded; "
+            "submit a test first or pass --id <measurement_id>"
+        )
+    measurement_id = record["measurement_id"].strip()
+    if not measurement_id:
+        raise RuntimeError(
+            "cannot show the last result because the saved measurement has no ID; "
+            "pass --id <measurement_id>"
+        )
+    return measurement_id
+
+
 def _measurement_summary_key(summary: MeasurementSummary) -> tuple[Any, ...]:
     return (
         summary.state,
@@ -3315,10 +3453,13 @@ def _print_measurement_summary(
     summary: MeasurementSummary,
     *,
     colors: ColorFormatter | None = None,
+    show_header: bool = True,
+    show_failed_tests: bool = True,
 ) -> None:
     colors = colors or color_formatter("never")
     counts = summary.counts
-    print(f"{summary.measurement_id}: {colors.state(summary.state)}")
+    if show_header:
+        print(f"{summary.measurement_id}: {colors.state(summary.state)}")
     print(
         "tests: "
         f"total={counts.total} completed={counts.completed} "
@@ -3333,7 +3474,7 @@ def _print_measurement_summary(
             f"current: {current.ordinal}/{current.total_jobs} "
             f"{current.feature} {current.config}"
         )
-    if summary.failed_tests:
+    if show_failed_tests and summary.failed_tests:
         print("failed tests:")
         for failed in summary.failed_tests:
             print(
