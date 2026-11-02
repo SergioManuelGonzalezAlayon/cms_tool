@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import cms_client
+from cms_colors import color_formatter
 from cms_client import (
     MeasurementWatchState,
     _print_measurement_summary,
@@ -178,11 +179,24 @@ def test_concise_summary_shows_current_counts_and_failed_identities(capsys) -> N
     _print_measurement_summary(summary)
 
     output = capsys.readouterr().out
-    assert f"{MEASUREMENT_ID}: running" in output
-    assert "total=3 completed=1 passed=0 failed=1 skipped=0 remaining=2" in output
-    assert "current: 2/3 beacon beacon/current.json" in output
-    assert "failed tests:" in output
-    assert "1/3 beacon beacon/failing.json" in output
+    assert "MEASUREMENT RUNNING" in output
+    assert f"id: {MEASUREMENT_ID}" in output
+    assert "3 total | 1 completed | PASS 0 | FAIL 1 | SKIP 0 | 2 remaining" in output
+    assert "current: 2/3 beacon / beacon/current.json" in output
+    assert "failed tests" in output
+    assert "1/3 beacon / beacon/failing.json" in output
+
+
+def test_passed_measurement_summary_colors_pass_green(capsys) -> None:
+    summary = MeasurementSummary(
+        measurement_id=MEASUREMENT_ID,
+        state=MeasurementState.PASSED,
+        counts=Counts(total=1, completed=1, passed=1),
+    )
+
+    _print_measurement_summary(summary, colors=color_formatter("always"))
+
+    assert "\x1b[32mPASSED\x1b[0m" in capsys.readouterr().out
 
 
 def test_verbose_display_preserves_console_source_and_lifecycle(capsys) -> None:
@@ -226,7 +240,7 @@ def test_verbose_display_preserves_console_source_and_lifecycle(capsys) -> None:
     assert timestamp.isoformat() in output
 
 
-def test_remote_watch_requests_live_events_only_with_verbose(monkeypatch) -> None:
+def test_remote_watch_uses_renderer_for_concise_and_verbose_events(monkeypatch) -> None:
     callbacks = []
 
     def fake_watch_measurement(client, state, **kwargs):
@@ -238,8 +252,7 @@ def test_remote_watch_requests_live_events_only_with_verbose(monkeypatch) -> Non
     _watch_remote_measurement(object(), MEASUREMENT_ID, verbose=False)
     _watch_remote_measurement(object(), MEASUREMENT_ID, verbose=True)
 
-    assert callbacks[0] is None
-    assert callbacks[1] is not None
+    assert all(callable(callback) for callback in callbacks)
 
 
 def test_watch_command_discovers_active_measurement_before_attaching(monkeypatch) -> None:

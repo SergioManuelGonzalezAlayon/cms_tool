@@ -8,8 +8,10 @@ control to `cmsd.py` and `cms_bench.py`.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 from datetime import datetime
+import difflib
 import hashlib
 from html import escape as html_escape
 import json
@@ -33,6 +35,16 @@ from typing import Any, Callable
 from tqdm import tqdm
 
 from cms_colors import COLOR_CHOICES, ColorFormatter, color_formatter, state_role
+from cms_output import (
+    TestExecutionRenderer,
+    create_console,
+    print_bench_status,
+    print_health_report,
+    print_measurement_result,
+    print_measurement_summary,
+    print_saved_measurements,
+    print_test_catalog,
+)
 from cms_diff_comparison import (
     ComparisonStatus,
     DifferentialPairingError,
@@ -1333,8 +1345,32 @@ def _add_bench_endpoint_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bench-ip", default="", help="one-shot bench host name or IP address")
 
 
+class CMSCLIArgumentParser(argparse.ArgumentParser):
+    """Keep unknown-command errors concise while retaining argparse behavior."""
+
+    command_names: tuple[str, ...] = ()
+
+    def error(self, message: str) -> None:
+        prefix = "argument command: invalid choice: "
+        if message.startswith(prefix):
+            command_repr = message[len(prefix) :].partition(" (choose from ")[0]
+            try:
+                command = ast.literal_eval(command_repr)
+            except (SyntaxError, ValueError):
+                command = command_repr.strip("'\"")
+            if isinstance(command, str):
+                matches = difflib.get_close_matches(
+                    command.lower(), self.command_names, n=1, cutoff=0.6
+                )
+                error = f"unknown command {command!r}"
+                if matches:
+                    error += f". Did you mean {matches[0]!r}?"
+                self.exit(2, f"{self.prog}: error: {error}\n")
+        super().error(message)
+
+
 def build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = CMSCLIArgumentParser(
         prog="cms",
         description="CMS bench client",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1394,6 +1430,11 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     _add_color_argument(health)
     _add_bench_endpoint_arguments(health)
+    health.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show every health diagnostic and its details",
+    )
     status = subparsers.add_parser("status", help="show bench status")
     _add_color_argument(status)
     tests = subparsers.add_parser("tests", aliases=["TESTS"], help="list test modes and features")
@@ -1906,6 +1947,15 @@ def build_cli_parser() -> argparse.ArgumentParser:
     recipes.add_argument("--measurement-id", default="<measurement_id>", help="measurement ID used in WATCH and ARTIFACTS examples")
     recipes.add_argument("--cursor", type=_non_negative_int, default=0, help="cursor used in reconnect examples")
     recipes.add_argument("--out-dir", default="artifacts", help="artifact output directory used in examples")
+    command_names: list[str] = []
+    seen_parsers: set[int] = set()
+    for name, command_parser in subparsers.choices.items():
+        parser_id = id(command_parser)
+        if parser_id in seen_parsers:
+            continue
+        seen_parsers.add(parser_id)
+        command_names.append(name)
+    parser.command_names = tuple(command_names)
     return parser
 
 
@@ -1930,20 +1980,36 @@ def _measurement_exit_code(
     }.get(state, CMSCLIExitCode.CLIENT_ERROR)
 
 
+def _requested_color_mode(argv: list[str] | None) -> str:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    for index, argument in enumerate(arguments):
+        if argument.startswith("--color="):
+            return argument.split("=", 1)[1]
+        if argument == "--color" and index + 1 < len(arguments):
+            return arguments[index + 1]
+    return "auto"
+
+
+def _print_cli_error(error: object, color_mode: str = "auto") -> None:
+    colors = color_formatter(color_mode, stream=sys.stderr)
+    print(colors.color(str(error), "error"), file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
+    color_mode = _requested_color_mode(argv)
     try:
         return int(_main(argv))
     except CMSConnectionError as exc:
-        print(str(exc), file=sys.stderr)
+        _print_cli_error(exc, color_mode)
         return int(CMSCLIExitCode.CONNECTION_FAILURE)
     except CMSProtocolMismatchError as exc:
-        print(str(exc), file=sys.stderr)
+        _print_cli_error(exc, color_mode)
         return int(CMSCLIExitCode.PROTOCOL_MISMATCH)
     except CMSDaemonError as exc:
-        print(str(exc), file=sys.stderr)
+        _print_cli_error(exc, color_mode)
         return int(CMSCLIExitCode.CLIENT_ERROR)
     except (OSError, RuntimeError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
+        _print_cli_error(exc, color_mode)
         return int(CMSCLIExitCode.CLIENT_ERROR)
 
 
@@ -1980,30 +2046,9 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "health":
         report = client.get_health()
-        print(f"{colors.state(report.state)}: {report.summary}")
+        console = create_console(args.color)
+        print_health_report(report, verbose=args.verbose, console=console)
         _print_explicit_endpoint_selection(args, client)
-        print(f"bench_id: {report.identity.bench_id}")
-        if report.detected_identity is None:
-            print("detected_dut_identity: unavailable")
-        else:
-            detected = report.detected_identity
-            revision = f" Rev. {detected.radio_board_revision}" if detected.radio_board_revision else ""
-            vcom = "unknown" if detected.vcom_supported is None else str(detected.vcom_supported).lower()
-            print(
-                "detected_radio_board: "
-                f"{detected.radio_board_part_number}{revision} "
-                f"(serial {detected.radio_board_serial_number})"
-            )
-            print(
-                "detected_target_device: "
-                f"{detected.target_device} "
-                f"(canonical {detected.canonical_target_device})"
-            )
-            print(f"detected_dut_jlink_serial: {detected.dut_jlink_serial}")
-            print(f"detected_vcom_supported: {vcom}")
-        for check in report.checks:
-            detail = f" ({check.detail})" if check.detail else ""
-            print(f"{colors.state(check.status.value)} {check.name}: {check.summary}{detail}")
         return (
             CMSCLIExitCode.SUCCESS
             if report.state is not BenchState.ERROR
@@ -2012,11 +2057,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command == "status":
         status = client.get_status()
-        print(f"{colors.state(status.state)}: {status.identity.bench_id}")
-        if status.active_measurement_id:
-            print(f"active_measurement_id: {status.active_measurement_id}")
-        if status.detail:
-            print(status.detail)
+        print_bench_status(status, color_mode=args.color)
         return (
             CMSCLIExitCode.SUCCESS
             if status.state is not BenchState.ERROR
@@ -2025,11 +2066,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"tests", "TESTS"}:
         payload = client.list_tests()
-        modes = [mode for mode in payload.get("modes", []) if mode != MeasurementMode.DEBUG.value]
-        print("modes: " + ", ".join(modes))
-        for feature in payload.get("features", []):
-            configs = ", ".join(feature.get("configs", []))
-            print(f"{feature.get('feature', '')}: {configs}")
+        print_test_catalog(payload, color_mode=args.color)
         return CMSCLIExitCode.SUCCESS
 
     if args.command in {"exit_codes", "EXIT_CODES"}:
@@ -2170,7 +2207,7 @@ def _main(argv: list[str] | None = None) -> int:
         if args.list:
             if args.measurement_id or args.get or args.get_results or args.debug:
                 raise RuntimeError("ARTIFACTS --list cannot be combined with download options")
-            _print_saved_measurements(client.list_saved_measurements())
+            _print_saved_measurements(client.list_saved_measurements(), colors=colors)
             return CMSCLIExitCode.SUCCESS
 
         if args.get_results:
@@ -2233,19 +2270,18 @@ def _main(argv: list[str] | None = None) -> int:
         return CMSCLIExitCode.USAGE_ERROR
 
 
-def _print_saved_measurements(measurements: list[dict[str, Any]]) -> None:
+def _print_saved_measurements(
+    measurements: list[dict[str, Any]],
+    *,
+    colors: ColorFormatter | None = None,
+) -> None:
     """Print a compact operator-facing list of retained measurement IDs."""
 
-    if not measurements:
-        print("no recoverable measurements")
-        return
-    for item in measurements:
-        measurement_id = str(item.get("measurement_id", ""))
-        state = str(item.get("state", "unknown")) or "unknown"
-        manifest = "manifest" if bool(item.get("has_manifest", False)) else "files-only"
-        count = int(item.get("artifact_count", 0))
-        modified = str(item.get("last_modified_at", ""))
-        print(f"{measurement_id} state={state} artifacts={count} {manifest} modified={modified}")
+    colors = colors or color_formatter("never")
+    print_saved_measurements(
+        measurements,
+        color_mode="always" if colors.enabled else "never",
+    )
 
 
 def _request_from_send_fw_args(
@@ -2946,16 +2982,11 @@ def _print_measurement_result(
     show_progress: bool = True,
 ) -> None:
     colors = colors or color_formatter("never")
-    progress = f" {result.progress_percent}%" if show_progress else ""
-    print(f"{result.measurement_id}: {colors.state(result.state)}{progress}")
-    if result.identity is not None:
-        print(f"run_name: {result.identity.run_name}")
-        print(f"created_at: {result.identity.created_at.isoformat()}")
-    if result.message:
-        print(result.message)
-    for artifact in result.artifacts:
-        location = artifact.url or str(artifact.path or "")
-        print(f"artifact {artifact.name}: {location}")
+    print_measurement_result(
+        result,
+        show_progress=show_progress,
+        color_mode="always" if colors.enabled else "never",
+    )
 
 
 def _print_staged_firmware(payload: dict[str, Any]) -> None:
@@ -3075,7 +3106,7 @@ def _create_and_render_diff_comparison(
 
     plan_paths = [path for path in downloaded_paths if path.name == "paired_default_plan.json"]
     if len(plan_paths) != 1:
-        print("differential comparison data did not include one paired_default_plan.json", file=sys.stderr)
+        _print_cli_error("differential comparison data did not include one paired_default_plan.json")
         return CMSCLIExitCode.COMPARISON_DATA_FAILURE
     evidence_root = plan_paths[0].parent
     plan_path = evidence_root / "paired_default_plan.json"
@@ -3084,7 +3115,7 @@ def _create_and_render_diff_comparison(
     required = (plan_path, version1_root, version2_root)
     if not all(path.exists() for path in required):
         missing = ", ".join(str(path) for path in required if not path.exists())
-        print(f"differential comparison data is incomplete: missing {missing}", file=sys.stderr)
+        _print_cli_error(f"differential comparison data is incomplete: missing {missing}")
         return CMSCLIExitCode.COMPARISON_DATA_FAILURE
     try:
         pairing = pair_downloaded_differential_results(version1_root, version2_root, plan_path)
@@ -3095,7 +3126,7 @@ def _create_and_render_diff_comparison(
         saved_report = json.loads(report_path.read_text(encoding="utf-8"))
         print(render_diff_comparison_table(saved_report))
     except (DifferentialPairingError, ValueError, OSError) as exc:
-        print(f"differential comparison data is invalid: {exc}", file=sys.stderr)
+        _print_cli_error(f"differential comparison data is invalid: {exc}")
         return CMSCLIExitCode.COMPARISON_DATA_FAILURE
 
     if report["diagnostics"]:
@@ -3457,30 +3488,12 @@ def _print_measurement_summary(
     show_failed_tests: bool = True,
 ) -> None:
     colors = colors or color_formatter("never")
-    counts = summary.counts
-    if show_header:
-        print(f"{summary.measurement_id}: {colors.state(summary.state)}")
-    print(
-        "tests: "
-        f"total={counts.total} completed={counts.completed} "
-        f"passed={colors.color(counts.passed, 'passed')} "
-        f"failed={colors.color(counts.failed, 'failed')} "
-        f"skipped={colors.color(counts.skipped, 'skipped')} "
-        f"remaining={colors.color(counts.remaining, 'running')}"
+    print_measurement_summary(
+        summary,
+        show_header=show_header,
+        show_failed_tests=show_failed_tests,
+        color_mode="always" if colors.enabled else "never",
     )
-    if summary.current_test is not None:
-        current = summary.current_test
-        print(
-            f"current: {current.ordinal}/{current.total_jobs} "
-            f"{current.feature} {current.config}"
-        )
-    if show_failed_tests and summary.failed_tests:
-        print("failed tests:")
-        for failed in summary.failed_tests:
-            print(
-                f"  {failed.ordinal}/{failed.total_jobs} "
-                f"{failed.feature} {failed.config}"
-            )
 
 
 def _print_verbose_event_page(
@@ -3514,30 +3527,58 @@ def _watch_remote_measurement(
 ) -> MeasurementWatchState:
     colors = colors or color_formatter("never")
     state = MeasurementWatchState(measurement_id, cursor=after_cursor)
-    last_summary_key: tuple[Any, ...] | None = None
+    console = create_console("always" if colors.enabled else "never")
+    renderer = TestExecutionRenderer(
+        console,
+        verbose=verbose,
+        live_progress=bool(getattr(sys.stdout, "isatty", lambda: False)()),
+    )
+    started_at = time.monotonic()
 
     def render_summary(summary: MeasurementSummary) -> None:
-        nonlocal last_summary_key
-        summary_key = _measurement_summary_key(summary)
-        if summary_key != last_summary_key:
-            _print_measurement_summary(summary, colors=colors)
-            last_summary_key = summary_key
-
-    def render_truncation(oldest_retained_cursor: EventCursor) -> None:
-        print(
-            colors.color("warning:", "warning")
-            + " verbose console output was truncated; "
-            f"continuing from cursor {oldest_retained_cursor.value}"
+        renderer.render_summary(
+            summary,
+            elapsed_seconds=_measurement_elapsed_seconds(summary, started_at),
         )
 
-    return watch_measurement(
-        client,
-        state,
-        poll_interval_s=poll_interval_s,
-        on_summary=render_summary,
-        on_events=(lambda page: _print_verbose_event_page(page, colors=colors)) if verbose else None,
-        on_truncation=render_truncation,
+    def render_truncation(oldest_retained_cursor: EventCursor) -> None:
+        renderer.render_truncation(oldest_retained_cursor.value)
+
+    renderer.start()
+    try:
+        watched = watch_measurement(
+            client,
+            state,
+            poll_interval_s=poll_interval_s,
+            on_summary=render_summary,
+            on_events=renderer.render_events,
+            on_truncation=render_truncation,
+        )
+    finally:
+        renderer.stop()
+    final_summary = watched.summary
+    renderer.print_final_summary(
+        elapsed_seconds=(
+            _measurement_elapsed_seconds(final_summary, started_at)
+            if final_summary is not None
+            else time.monotonic() - started_at
+        )
     )
+    return watched
+
+
+def _measurement_elapsed_seconds(
+    summary: MeasurementSummary,
+    watch_started_at: float,
+) -> float:
+    created_at = summary.identity.created_at if summary.identity is not None else None
+    if created_at is None:
+        return time.monotonic() - watch_started_at
+    now = datetime.now(created_at.tzinfo) if created_at.tzinfo is not None else datetime.now()
+    try:
+        return max(0.0, (now - created_at).total_seconds())
+    except TypeError:
+        return time.monotonic() - watch_started_at
 
 
 if __name__ == "__main__":

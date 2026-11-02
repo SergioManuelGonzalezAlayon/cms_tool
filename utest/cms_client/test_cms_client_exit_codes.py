@@ -83,6 +83,19 @@ def test_main_classifies_client_failures_without_reporting_test_failure(
     assert str(error) in capsys.readouterr().err
 
 
+def test_main_colors_client_errors_red_when_requested(monkeypatch, capsys) -> None:
+    class Client:
+        def get_status(self):
+            raise CMSConnectionError("daemon unavailable")
+
+    monkeypatch.setattr(cms_client, "CMSClient", lambda **kwargs: Client())
+
+    exit_code = cms_client.main(["status", "--color", "always"])
+
+    assert exit_code == int(CMSCLIExitCode.CONNECTION_FAILURE)
+    assert "\x1b[31mdaemon unavailable\x1b[0m" in capsys.readouterr().err
+
+
 def test_request_json_classifies_connection_failure(monkeypatch) -> None:
     def unavailable(request, timeout):
         raise urllib.error.URLError("connection refused")

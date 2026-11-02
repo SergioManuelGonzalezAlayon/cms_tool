@@ -20,7 +20,7 @@ _ANSI = {
     "yellow": "\033[33m",
 }
 
-_ROLE_COLORS = {
+ROLE_STYLES = {
     "cancelled": "magenta",
     "error": "red",
     "failed": "red",
@@ -72,7 +72,7 @@ class ColorFormatter:
         value = str(text)
         if not self.enabled:
             return value
-        color = _ROLE_COLORS.get(role, role)
+        color = ROLE_STYLES.get(role, role)
         prefix = _ANSI.get(color)
         if prefix is None:
             return value

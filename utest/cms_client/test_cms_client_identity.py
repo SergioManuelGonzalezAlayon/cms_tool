@@ -155,10 +155,10 @@ def test_tests_command_hides_debug_mode(capsys, monkeypatch):
     exit_code = cms_client.main(["tests"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out == "modes: default, full_sweep, diff\n"
+    assert capsys.readouterr().out == "modes: default, full_sweep, diff\nno tests available\n"
 
 
-def test_health_command_prints_endpoint_and_detected_dut_identity(capsys, monkeypatch):
+def test_health_command_prints_concise_bench_and_hardware_summary(capsys, monkeypatch):
     report = BenchHealthReport(
         state=BenchState.IDLE,
         identity=BenchIdentity(bench_id="cms-bench-001"),
@@ -186,11 +186,10 @@ def test_health_command_prints_endpoint_and_detected_dut_identity(capsys, monkey
 
     output = capsys.readouterr().out
     assert "endpoint: http://cms-bench-001:8000" not in output
-    assert "bench_id: cms-bench-001" in output
-    assert "detected_radio_board: BRD4182A Rev. B06 (serial 212300218)" in output
-    assert "detected_target_device: EFR32MG22C224F512IM40-C" in output
-    assert "detected_dut_jlink_serial: 440365029" in output
-    assert "detected_vcom_supported: true" in output
+    assert "HEALTH PASS" in output
+    assert "bench: cms-bench-001 | state: idle" in output
+    assert "hardware: BRD4182A Rev. B06 / EFR32MG22C224F512IM40-C" in output
+    assert "checks: 0 total | PASS 0 | WARN 0 | FAIL 0" in output
 
 
 def test_client_config_loads_optional_named_bench_endpoints(tmp_path):
@@ -964,8 +963,8 @@ def test_measurement_display_includes_run_identity(capsys):
     )
 
     output = capsys.readouterr().out
-    assert "run_name: Nightly Beacon Run" in output
-    assert "created_at: 2026-08-18T09:30:00+00:00" in output
+    assert "run: Nightly Beacon Run" in output
+    assert "created: 2026-08-18T09:30:00+00:00" in output
 
 
 def test_measurement_display_can_force_or_disable_color(capsys):

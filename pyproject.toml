@@ -20,6 +20,7 @@ dependencies = [
   "pyjoulescope-driver",
   "pytest>=9",
   "power-profiling-tools-val",
+  "rich>=14.1.0",
   "fastapi>=0.115",
   "uvicorn>=0.30",
   "silabs-datalake-client",
