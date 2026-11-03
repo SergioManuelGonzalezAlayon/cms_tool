@@ -981,6 +981,7 @@ def test_legacy_conn_adv(JoulescopeDev,
     )
 
     dut_addr = get_device_addr(DUT)
+    timeout_s = float(advertising_ms_from_units(DUTLegAdvConfig.max_interval) / 1000)
     for attempt in range(MAX_TEST_RETRIES):
         log.info("Connectable advertiser detection attempt %d/%d", attempt + 1, MAX_TEST_RETRIES)
         try:
@@ -989,6 +990,8 @@ def test_legacy_conn_adv(JoulescopeDev,
                 "scanner",
                 "legacy_advertisement_report",
                 lambda evt: evt.address == dut_addr,
+                eventTimeout=timeout_s / 5,
+                maxTime=timeout_s*5
             )
             break
         except BGAPIEventTimeoutError:
