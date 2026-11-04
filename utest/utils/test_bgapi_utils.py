@@ -1,7 +1,11 @@
 import pytest
 from types import SimpleNamespace
+from time import sleep
+
+import utils.bgapi_utils as bgapi_utils
 
 from utils.bgapi_utils import (
+    PHY_ANY,
     PHY_1M,
     PHY_1M_AND_CODED,
     PHY_2M,
@@ -139,14 +143,21 @@ class _GattApi:
 class _ConnectionApi:
     def __init__(self, device):
         self._device = device
+        self.preferred_phy_calls = []
+        self.default_preferred_phy_calls = []
 
     def set_default_parameters(self, *_args):
         return _Response()
 
     def set_default_preferred_phy(self, *_args):
+        self.default_preferred_phy_calls.append(_args)
         return _Response()
 
     def open(self, *_args):
+        return _Response()
+
+    def set_preferred_phy(self, *args):
+        self.preferred_phy_calls.append(args)
         return _Response()
 
     def close(self, connection):
@@ -164,13 +175,44 @@ class _BtApi:
 class _Device:
     def __init__(self, address, event_batches):
         self.closed_connections = []
-        self._event_batches = list(event_batches)
+        self._events = iter(event for batch in event_batches for event in batch)
         self.bt = _BtApi(self, address)
 
-    def get_events(self, **_kwargs):
-        if not self._event_batches:
-            return iter(())
-        return iter(self._event_batches.pop(0))
+    def get_event(self, timeout):
+        event = next(self._events, None)
+        if event is None:
+            sleep(timeout)
+        return event
+
+
+def test_connect_devices_waits_for_parameters_then_phy_status(monkeypatch) -> None:
+    conn_timeout = 0.75
+    central = _Device("central", [[
+        _Event(address="peripheral", connection=7),
+        _Event(_msg_name="parameters", connection=7, interval=12, latency=0, timeout=100),
+        _Event(_msg_name="phy_status", connection=7, phy=PHY_2M),
+    ]])
+    peripheral = _Device("peripheral", [[_Event(address="central", connection=8)]])
+    params = ConnectionParameters(min_interval=12, max_interval=12, timeout=100, phy=PHY_2M)
+    waits = []
+    check_event = bgapi_utils.bgapi_check_event
+
+    def record_wait(*args, **kwargs):
+        waits.append((args[2], kwargs["maxTime"]))
+        return check_event(*args, **kwargs)
+
+    monkeypatch.setattr(bgapi_utils, "bgapi_check_event", record_wait)
+    handles = connect_devices(
+        central, peripheral, params, retry_sleep=0, max_retries=1,
+        connTimeout=conn_timeout, evtTimeout=0.01,
+    )
+
+    assert handles == (7, 8)
+    assert central.bt.connection.default_preferred_phy_calls == [(PHY_2M, PHY_ANY)]
+    assert peripheral.bt.connection.default_preferred_phy_calls == [(PHY_2M, PHY_ANY)]
+    assert central.bt.connection.preferred_phy_calls == [(7, PHY_2M, PHY_ANY)]
+    assert [name for name, _ in waits] == ["opened", "opened", "parameters", "phy_status"]
+    assert [timeout for _, timeout in waits] == [conn_timeout] * 4
 
 
 def test_connect_devices_closes_central_handle_when_peripheral_open_event_times_out() -> None:
