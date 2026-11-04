@@ -835,14 +835,15 @@ def ConnectBLEDevices(Config):
         params = normalize_connection_parameters(params)
         sync_connection_config_actuals(Config, params)
         timeout_s = float(connection_ms_from_units(params.max_interval) / 1000)
+        connTimeout = 7 * timeout_s
         central_conn, peripheral_conn = connect_devices(
             central,
             peripheral,
             params,
             retry_sleep=retry_sleep,
             max_retries=max_retries,
-            connTimeout=max(5 * timeout_s, 10),
-            evtTimeout=max(timeout_s / 5, 0.2),
+            connTimeout=connTimeout,
+            evtTimeout=timeout_s / 5,
             restart_advertising=restart_advertising,
         )
         

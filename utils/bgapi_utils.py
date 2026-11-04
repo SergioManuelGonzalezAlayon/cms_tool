@@ -4,7 +4,7 @@ import os
 import secrets
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from time import sleep
+from time import monotonic, sleep
 
 from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
@@ -444,16 +444,29 @@ def bgapi_check_event(dev,
     :event_class: BGAPI Class ID as a string
     :event_name: BGAPI Event ID as a string
     :condition: Condition to find the event
-    :eventTimeout: BGAPI Event timeout until other event is popped from the dev queue
-    :maxTime: Maximum time to wait for that BGAPI Event on the dev queue
+    :eventTimeout: Maximum time to wait for one event from the dev queue
+    :maxTime: Maximum total time to wait for the matching event
     """
     seen = []
 
-    # Avoid Decimal type error when calling this function by converting to float both timeouts
+    # Avoid Decimal type errors and use a monotonic deadline for the total wait.
     eventTimeout = float(eventTimeout)
     maxTime = float(maxTime)
+    if eventTimeout <= 0:
+        raise ValueError("eventTimeout must be greater than zero")
+    deadline = monotonic() + maxTime
 
-    for evt in dev.get_events(timeout=eventTimeout, max_time=maxTime):
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+
+        # Read one event at a time. This keeps events after the match in the
+        # device queue for the next wait instead of consuming a whole batch.
+        evt = dev.get_event(timeout=min(eventTimeout, remaining))
+        if evt is None:
+            continue
+
         seen.append(evt)
         if debug:
             log.info(f"> DEBUG BGAPI Evt > {evt}\n")
@@ -537,7 +550,8 @@ def connection_set_live_params(dev,
 
 def connection_set_preferred_phy(dev,
                                  conn_handle,
-                                 params: ConnectionParameters):
+                                 params: ConnectionParameters,
+                                 connTimeout=5.0):
     dev.bt.connection.set_preferred_phy(
         conn_handle,
         params.phy,
@@ -550,7 +564,7 @@ def connection_set_preferred_phy(dev,
                     "phy_status",
                     lambda evt: evt.connection == conn_handle and evt.phy == params.phy,
                     eventTimeout=1,
-                    maxTime=5,
+                    maxTime=connTimeout,
         )
 
 
@@ -578,13 +592,6 @@ def connect_devices(central,
 
     connection_config_params(central, parameters)
     connection_config_params(peripheral, parameters)
-
-    log.info( "connTimeout=%r (%s), evtTimeout=%r (%s)",
-              connTimeout,
-              type(connTimeout),
-              evtTimeout,
-              type(evtTimeout),
-    )
 
     for attempt in range(max_retries):
         central_conn = -1
@@ -628,7 +635,35 @@ def connect_devices(central,
             peripheral_conn = peripheral_event.connection
 
             if is_conn_handle_valid(central_conn) and is_conn_handle_valid(peripheral_conn):
-                connection_set_preferred_phy(central, central_conn, parameters)
+                log.info(
+                    "Waiting up to %.3f s (7 connection intervals) for connection.parameters",
+                    connTimeout,
+                )
+                connection_parameters_event = bgapi_check_event(
+                    central,
+                    "connection",
+                    "parameters",
+                    lambda evt: evt.connection == central_conn,
+                    eventTimeout=evtTimeout,
+                    maxTime=connTimeout,
+                )
+                log.info(
+                    "Connection parameters established: interval=%s latency=%s timeout=%s",
+                    connection_parameters_event.interval,
+                    connection_parameters_event.latency,
+                    connection_parameters_event.timeout,
+                )
+
+                log.info(
+                    "Waiting up to %.3f s (7 connection intervals) for connection.phy_status",
+                    connTimeout,
+                )
+                connection_set_preferred_phy(
+                    central,
+                    central_conn,
+                    parameters,
+                    connTimeout=connTimeout,
+                )
                 log.info("Devices connected")
                 return central_conn, peripheral_conn
 
