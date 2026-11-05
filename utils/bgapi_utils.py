@@ -47,7 +47,7 @@ class BGAPIEventTimeoutError(RuntimeError):
         self.seen_events = seen_events or []
 
         message = (
-            f"BGAPI event '{event_class}.{event_name}' not received.\n"
+            f"Matching BGAPI event '{event_class}.{event_name}' not found.\n"
             f"Waited max_time={max_time}s (poll timeout={event_timeout}s).\n"
             f"Seen events during wait: {self._format_seen()}"
         )
@@ -56,10 +56,16 @@ class BGAPIEventTimeoutError(RuntimeError):
     def _format_seen(self):
         if not self.seen_events:
             return "None"
-        return ", ".join(
-            f"{evt._class_name}.{evt._msg_name}"
-            for evt in self.seen_events
-        )
+        seen = []
+        for evt in self.seen_events:
+            event_name = f"{evt._class_name}.{evt._msg_name}"
+            if evt._class_name == "connection" and evt._msg_name == "phy_status":
+                event_name += (
+                    f"(connection={getattr(evt, 'connection', None)}, "
+                    f"phy={getattr(evt, 'phy', None)})"
+                )
+            seen.append(event_name)
+        return ", ".join(seen)
 
 
 class RetryableDeviceStartupError(RuntimeError):
@@ -552,10 +558,17 @@ def connection_set_preferred_phy(dev,
                                  conn_handle,
                                  params: ConnectionParameters,
                                  connTimeout=5.0):
-    dev.bt.connection.set_preferred_phy(
+    rsp = dev.bt.connection.set_preferred_phy(
         conn_handle,
         params.phy,
         PHY_ANY,
+    )
+    log.info(
+        "PHY preference request: connection=%s preferred_phy=%s accepted_phy=%s result=%s",
+        conn_handle,
+        params.phy,
+        PHY_ANY,
+        rsp.result,
     )
     if params.phy != connection_open_phy(params.phy):
         bgapi_check_event(
