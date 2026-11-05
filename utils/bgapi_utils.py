@@ -64,6 +64,16 @@ class BGAPIEventTimeoutError(RuntimeError):
                     f"(connection={getattr(evt, 'connection', None)}, "
                     f"phy={getattr(evt, 'phy', None)})"
                 )
+            elif evt._class_name == "connection" and evt._msg_name == "remote_used_features":
+                features = getattr(evt, "features", None)
+                if isinstance(features, (bytes, bytearray, memoryview)):
+                    features = bytes(features).hex()
+                else:
+                    features = repr(features)
+                event_name += (
+                    f"(connection={getattr(evt, 'connection', None)}, "
+                    f"features={features})"
+                )
             seen.append(event_name)
         return ", ".join(seen)
 
