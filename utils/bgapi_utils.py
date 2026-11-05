@@ -519,7 +519,7 @@ def connection_config_params(dev, params: ConnectionParameters):
         params.min_ce_lenght,
         params.max_ce_lenght)
     
-    dev.bt.connection.set_default_preferred_phy(connection_open_phy(params.phy), PHY_ANY)
+    dev.bt.connection.set_default_preferred_phy(params.phy, PHY_ANY)
     # ATT MTU must be at least 23. Treat rx_payload_length as payload sizing,
     # not a request to force an invalid MTU during default connection setup.
     if params.rx_payload_length >= 23:

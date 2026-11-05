@@ -144,11 +144,13 @@ class _ConnectionApi:
     def __init__(self, device):
         self._device = device
         self.preferred_phy_calls = []
+        self.default_preferred_phy_calls = []
 
     def set_default_parameters(self, *_args):
         return _Response()
 
     def set_default_preferred_phy(self, *_args):
+        self.default_preferred_phy_calls.append(_args)
         return _Response()
 
     def open(self, *_args):
@@ -206,6 +208,8 @@ def test_connect_devices_waits_for_parameters_then_phy_status(monkeypatch) -> No
     )
 
     assert handles == (7, 8)
+    assert central.bt.connection.default_preferred_phy_calls == [(PHY_2M, PHY_ANY)]
+    assert peripheral.bt.connection.default_preferred_phy_calls == [(PHY_2M, PHY_ANY)]
     assert central.bt.connection.preferred_phy_calls == [(7, PHY_2M, PHY_ANY)]
     assert [name for name, _ in waits] == ["opened", "opened", "parameters", "phy_status"]
     assert [timeout for _, timeout in waits] == [conn_timeout] * 4
