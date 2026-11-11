@@ -671,6 +671,76 @@ def test_build_jobs_filters_generated_configs_by_declared_variable_value(tmp_pat
     )
 
 
+def test_build_jobs_selects_all_and_only_configs_for_filter_config_path(
+    tmp_path, monkeypatch
+):
+    config_root = tmp_path / "configs"
+    feature_dir = config_root / "ble" / "conn_central"
+    sweep_dir = feature_dir / "full_sweep" / "dcdc"
+    sweep_dir.mkdir(parents=True)
+    (feature_dir / "parameters.json").write_text(
+        json.dumps(
+            {
+                "parameters": [
+                    {
+                        "name": "phy",
+                        "values": ["coded", "1m", "2m"],
+                        "filter_config_path": "connection.phy",
+                        "config_paths": [
+                            "advertiser.phy",
+                            "scanner.phy",
+                            "connection.phy",
+                        ],
+                        "config_path_values": {
+                            "advertiser.phy": {
+                                "coded": "coded",
+                                "1m": "1m",
+                                "2m": "1m",
+                            },
+                            "scanner.phy": {
+                                "coded": "coded",
+                                "1m": "1m",
+                                "2m": "1m",
+                            },
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    configs = {
+        "case_1m.json": "1m",
+        "case_2m_a.json": "2m",
+        "case_2m_b.json": "2m",
+    }
+    for name, connection_phy in configs.items():
+        (sweep_dir / name).write_text(
+            json.dumps(
+                {
+                    "advertiser": {"phy": "1m"},
+                    "scanner": {"phy": "1m"},
+                    "connection": {"phy": connection_phy},
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(orchestrator, "CONFIG_ROOT", config_root)
+
+    jobs = orchestrator.build_jobs(
+        [config_root],
+        mode="full_sweep",
+        feature_filters={"conn_central"},
+        partition_filters=set(),
+        variable_filters=orchestrator.parse_variable_filters(["phy=2m"]),
+    )
+
+    assert {job.cfg_arg for job in jobs} == {
+        "full_sweep/dcdc/case_2m_a.json",
+        "full_sweep/dcdc/case_2m_b.json",
+    }
+
+
 def test_build_jobs_variable_filters_use_declared_option_mappings(tmp_path, monkeypatch):
     config_root = tmp_path / "configs"
     feature_dir = config_root / "ble" / "beacon"

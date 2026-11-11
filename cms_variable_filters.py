@@ -136,6 +136,10 @@ def _config_matches_variable_filter(
 
 
 def _parameter_config_paths(parameter: dict[str, Any]) -> list[str]:
+    filter_path = str(parameter.get("filter_config_path", "")).strip()
+    if filter_path:
+        return [filter_path]
+
     paths = parameter.get("config_paths")
     if paths is None:
         path = str(parameter.get("config_path", "")).strip()

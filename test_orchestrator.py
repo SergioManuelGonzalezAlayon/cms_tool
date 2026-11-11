@@ -934,7 +934,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     pytest_args = [*cms_pytest_args(parsed), *pytest_args]
-
     if parsed.generate:
         run_config_manager(parsed.mode, targets)
 
@@ -1068,7 +1067,7 @@ def main(argv: list[str] | None = None) -> int:
             failures += 1
             print(
                 colors.color(
-                    f"Failed {ordinal}/{total_jobs}: {job.cfg_arg} returncode={returncode}",
+                    f"Failed {ordinal}/{total_jobs}: {job.cfg_arg}",
                     "failed",
                 )
             )

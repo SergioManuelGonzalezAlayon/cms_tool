@@ -96,6 +96,60 @@ def test_config_matching_uses_declared_config_paths(tmp_path: Path) -> None:
     )
 
 
+def test_config_matching_uses_filter_config_path_for_phy_selection(tmp_path: Path) -> None:
+    parameters_path = tmp_path / "parameters.json"
+    parameters_path.write_text(
+        json.dumps(
+            {
+                "parameters": [
+                    {
+                        "name": "phy",
+                        "values": ["coded", "1m", "2m"],
+                        "filter_config_path": "connection.phy",
+                        "config_paths": [
+                            "advertiser.phy",
+                            "scanner.phy",
+                            "connection.phy",
+                        ],
+                        "config_path_values": {
+                            "advertiser.phy": {
+                                "coded": "coded",
+                                "1m": "1m",
+                                "2m": "1m",
+                            },
+                            "scanner.phy": {
+                                "coded": "coded",
+                                "1m": "1m",
+                                "2m": "1m",
+                            },
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert config_matches_variable_filters(
+        parameters_path,
+        {
+            "advertiser": {"phy": "1m"},
+            "scanner": {"phy": "1m"},
+            "connection": {"phy": "2m"},
+        },
+        (VariableFilter("phy", "2m"),),
+    )
+    assert not config_matches_variable_filters(
+        parameters_path,
+        {
+            "advertiser": {"phy": "1m"},
+            "scanner": {"phy": "1m"},
+            "connection": {"phy": "1m"},
+        },
+        (VariableFilter("phy", "2m"),),
+    )
+
+
 def test_config_matching_uses_generator_runtime_values_for_ranges(tmp_path: Path) -> None:
     parameters_path = tmp_path / "parameters.json"
     parameters_path.write_text(
