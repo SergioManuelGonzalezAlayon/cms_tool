@@ -280,6 +280,8 @@ class FirmwareData:
     sisdk_name: str = ""
     sisdk_source: str = ""
     sisdk_version: str = ""
+    sisdk_artifactory_version: str = ""
+    sisdk_artifactory_build: str = ""
     sisdk_commit: str = ""
     sisdk_hash: str = ""
     role_images: tuple[FirmwareRoleImage, ...] = ()
@@ -821,6 +823,8 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
         "sisdk_name": firmware.sisdk_name,
         "sisdk_source": firmware.sisdk_source,
         "sisdk_version": firmware.sisdk_version,
+        "sisdk_artifactory_version": firmware.sisdk_artifactory_version,
+        "sisdk_artifactory_build": firmware.sisdk_artifactory_build,
         "sisdk_commit": firmware.sisdk_commit,
         "sisdk_hash": firmware.sisdk_hash,
     }
@@ -876,6 +880,8 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         sisdk_name=str(data.get("sisdk_name", "")),
         sisdk_source=str(data.get("sisdk_source", "")),
         sisdk_version=str(data.get("sisdk_version", "")),
+        sisdk_artifactory_version=str(data.get("sisdk_artifactory_version", "")),
+        sisdk_artifactory_build=str(data.get("sisdk_artifactory_build", "")),
         sisdk_commit=str(data.get("sisdk_commit", "")),
         sisdk_hash=str(data.get("sisdk_hash", "")),
         role_images=tuple(firmware_role_image_from_dict(item) for item in raw_role_images),

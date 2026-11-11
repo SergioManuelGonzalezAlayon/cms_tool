@@ -2,13 +2,18 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 import time
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import sys
+
+from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -23,11 +28,18 @@ from utils.svd import (
     svd_export_version_from_sisdk_version,
 )
 from utils.wpk import parse_board_vcom_gpio, vcom_gpio_header_path
+from apps.sisdk_manager import (
+    ArtifactoryError,
+    DEFAULT_OUTPUT_ROOT,
+    download_sdk,
+)
 
 
 APPS_DIR = REPO_ROOT / "apps"
 DEFAULT_BUILD_ROOT = REPO_ROOT / ".fw_build"
 DEFAULT_BOOTLOADER_SLCP = APPS_DIR / "bootloader-uart-bgapi.slcp"
+APP_CONFIG_DIR = APPS_DIR / "configs"
+SDK_BLUETOOTH_APP_ROOT = Path("bluetooth_le_app") / "example"
 BUILD_METADATA_FILENAME = "build_metadata.json"
 FW_DATA_FILENAME = "fw_data.json"
 DIFF_FW_DATA_FILENAME = "diff_fw_data.json"
@@ -50,6 +62,15 @@ FIRMWARE_ROLE_BY_PROJECT = {
     "ncp_ble_dut_dcdc": "dut_dcdc",
     "ncp_ble_tester": "tester",
 }
+APP_PROFILE_PROJECT_NAMES = {
+    "dut_no_dcdc": "ncp_ble_dut",
+    "dut_dcdc": "ncp_ble_dut_dcdc",
+    "tester": "ncp_ble_tester",
+}
+APP_PROFILE_BY_LEGACY_PROJECT = {
+    project_name: profile_name
+    for profile_name, project_name in APP_PROFILE_PROJECT_NAMES.items()
+}
 REQUIRED_DIFF_FIRMWARE_ROLES = frozenset(FIRMWARE_ROLE_BY_PROJECT.values())
 
 
@@ -62,6 +83,10 @@ class SDKSelection:
     sdk_hash: str = ""
     xapi_path: Path | None = None
     xapi_hash: str = ""
+    artifactory_version: str = ""
+    artifactory_build: str = ""
+    archive_path: Path | None = None
+    archive_sha256: str = ""
 
 
 _TOOL_OVERRIDES: dict[str, str] = {}
@@ -134,8 +159,24 @@ def read_client_config(path: Path | None = None) -> dict:
 def effective_build_config(config: dict, overrides: argparse.Namespace | None = None) -> dict:
     """Normalize persistent client configuration and optional CLI overrides."""
     target = config.get("target", {}) if isinstance(config.get("target"), dict) else {}
+    artifactory = (
+        config.get("artifactory", {})
+        if isinstance(config.get("artifactory"), dict)
+        else {}
+    )
     build = config.get("build", {}) if isinstance(config.get("build"), dict) else {}
+    artifactory = dict(artifactory)
     tools = dict(config.get("tools", {})) if isinstance(config.get("tools"), dict) else {}
+    use_artifactory = (
+        bool(getattr(overrides, "artifactory", False))
+        if overrides is not None
+        else False
+    )
+    if overrides is not None and use_artifactory:
+        if getattr(overrides, "sisdk_version", ""):
+            artifactory["version"] = str(overrides.sisdk_version)
+        if getattr(overrides, "build_number", ""):
+            artifactory["build"] = str(overrides.build_number)
 
     def override(name: str, fallback=None):
         value = getattr(overrides, name, None) if overrides is not None else None
@@ -149,20 +190,32 @@ def effective_build_config(config: dict, overrides: argparse.Namespace | None = 
     firmware = {
         "board": str(override("board", target.get("board", ""))),
         "brev": str(override("board_rev", target.get("board_rev", target.get("brev", "")))),
-        "device": str(override("device", target.get("device", ""))),
-        "sisdk": str(override("sisdk_version", target.get("sisdk", target.get("sisdk_version", "")))),
+        "device": str(override("target_device", target.get("device", ""))),
+        "sisdk": str(
+            artifactory.get("version", "")
+            if use_artifactory
+            else override("sisdk_version", target.get("sisdk", target.get("sisdk_version", "")))
+        ),
         "sisdk_package_path": str(
-            override("sdk_package_path", target.get("sisdk_package_path", target.get("sdk_package_path", "")))
+            ""
+            if use_artifactory
+            else override(
+                "sdk_package_path",
+                target.get("sisdk_package_path", target.get("sdk_package_path", "")),
+            )
         ),
         "adapter_board": str(target.get("adapter_board", target.get("wpk_board", "brd4002a"))),
         "svd_path": str(target.get("svd_path", "")),
         "svd_cache_dir": str(target.get("svd_cache_dir", "")),
         "build_root": str(override("build_root", build.get("root", config.get("build_root", DEFAULT_BUILD_ROOT)))),
-        "bootloader_slcp": str(
-            override("bootloader_slcp", build.get("bootloader_slcp", config.get("bootloader_slcp", DEFAULT_BOOTLOADER_SLCP)))
-        ),
     }
-    return {"target": dict(target), "build": dict(build), "tools": tools, "firmware": firmware}
+    return {
+        "target": dict(target),
+        "artifactory": artifactory,
+        "build": dict(build),
+        "tools": tools,
+        "firmware": firmware,
+    }
 
 
 def resolve_build_root(cli_value: str | None) -> Path:
@@ -275,6 +328,10 @@ def sdk_selection_provenance(selection: SDKSelection) -> dict[str, str]:
     return {
         "source": selection.source,
         "version": selection.version,
+        "artifactory_version": selection.artifactory_version,
+        "artifactory_build": selection.artifactory_build,
+        "archive_path": str(selection.archive_path or ""),
+        "archive_sha256": selection.archive_sha256,
         "package_path": str(selection.path),
         "commit": selection.commit,
         "hash": selection.sdk_hash,
@@ -347,21 +404,105 @@ def resolve_sdk_selection(
     return selection
 
 
+def resolve_artifactory_sdk_selection(version: str, build: str) -> SDKSelection:
+    """Download and prepare one configured Artifactory SDK build in the stable cache."""
+
+    version = version.strip()
+    build = build.strip()
+    if not version or not build:
+        raise RuntimeError("Artifactory SDK selection requires both version and build")
+    if not re.fullmatch(r"\d{4}\.\d+", version):
+        raise RuntimeError("artifactory.version must use the SiSDK release format YYYY.MM")
+    if not build.isdecimal():
+        raise RuntimeError("artifactory.build must be a numeric Artifactory build number")
+
+    try:
+        archive = download_sdk(version, DEFAULT_OUTPUT_ROOT, build)
+    except ArtifactoryError as error:
+        raise RuntimeError(f"Could not obtain SiSDK {version} build {build}: {error}") from error
+
+    package_path = archive.parent / "package"
+    if not package_path.exists():
+        staging_path = Path(
+            tempfile.mkdtemp(prefix=".package-", dir=str(archive.parent))
+        ).resolve()
+        try:
+            with zipfile.ZipFile(archive) as package:
+                extraction_root = staging_path.resolve()
+                for member in package.infolist():
+                    member_path = (extraction_root / member.filename).resolve()
+                    if not member_path.is_relative_to(extraction_root):
+                        raise RuntimeError(
+                            f"SiSDK archive contains a path outside its package: {member.filename}"
+                        )
+
+                members = package.infolist()
+                total_bytes = sum(member.file_size for member in members if not member.is_dir())
+                with tqdm(
+                    total=total_bytes,
+                    desc=f"Extracting SiSDK {version} build {build}",
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                ) as progress:
+                    for member in members:
+                        destination = staging_path / member.filename
+                        if member.is_dir():
+                            destination.mkdir(parents=True, exist_ok=True)
+                            continue
+
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        with package.open(member) as source, destination.open("wb") as output:
+                            while chunk := source.read(1024 * 1024):
+                                output.write(chunk)
+                                progress.update(len(chunk))
+
+            staged_version = _sisdk_version_from_properties(staging_path)
+            if staged_version != version and not staged_version.startswith(f"{version}."):
+                raise RuntimeError(
+                    "Downloaded SiSDK package version does not match the Artifactory release: "
+                    f"requested={version}, archive={staged_version}"
+                )
+            if not (staging_path / SL_BT_XAPI_PATH).is_file():
+                raise RuntimeError(
+                    f"Downloaded SiSDK '{version}' cannot find `sl_bt.xapi` under {staging_path}"
+                )
+            staging_path.replace(package_path)
+        finally:
+            if staging_path.exists():
+                shutil.rmtree(staging_path)
+
+    selection = inspect_sdk_selection(
+        package_path,
+        source="artifactory",
+        include_git_commit=False,
+    )
+    if selection.version != version and not selection.version.startswith(f"{version}."):
+        raise RuntimeError(
+            "Cached SiSDK package version does not match the Artifactory release: "
+            f"requested={version}, cache={selection.version}"
+        )
+    return SDKSelection(
+        path=selection.path,
+        version=selection.version,
+        source=selection.source,
+        commit=selection.commit,
+        sdk_hash=selection.sdk_hash,
+        xapi_path=selection.xapi_path,
+        xapi_hash=selection.xapi_hash,
+        artifactory_version=version,
+        artifactory_build=build,
+        archive_path=archive.resolve(),
+        archive_sha256=_sha256(archive),
+    )
+
+
 def trust_sisdk(sdk_path: Path) -> None:
     run(["slc", "signature", "trust", "-s", str(sdk_path)], cwd=REPO_ROOT)
 
 
-def resolve_bootloader_slcp(config: dict | None = None) -> Path:
-    if config is None:
-        effective_config = effective_build_config(read_client_config())
-    elif "firmware" in config:
-        effective_config = config
-    else:
-        effective_config = effective_build_config(config)
-    configured = effective_config.get("firmware", {}).get("bootloader_slcp")
-    path = Path(configured) if configured else DEFAULT_BOOTLOADER_SLCP
-    if not path.is_absolute():
-        path = (REPO_ROOT / path).resolve()
+def resolve_bootloader_slcp() -> Path:
+    path = DEFAULT_BOOTLOADER_SLCP
     if not path.exists():
         raise FileNotFoundError(f"Could not resolve bootloader SLCP: {path}")
     return path
@@ -389,7 +530,16 @@ def output_dir_for(slcp: Path, build_root: Path) -> Path:
     return build_root / slcp.stem
 
 
-def generate_slcp(slcp: Path, *, out_dir: Path, board: str, sdk_path: Path) -> None:
+def generate_slcp(
+    slcp: Path,
+    *,
+    out_dir: Path,
+    board: str,
+    sdk_path: Path,
+    project_name: str = "",
+    slc_options: list[str] | tuple[str, ...] = (),
+    configuration: dict | None = None,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         "slc",
@@ -399,12 +549,156 @@ def generate_slcp(slcp: Path, *, out_dir: Path, board: str, sdk_path: Path) -> N
         str(sdk_path),
         "-d",
         str(out_dir),
-        f"-name={slcp.stem}",
+        f"-name={project_name or slcp.stem}",
         "--with",
         board,
-        "--generator-timeout=60000",
     ]
+    cmd.extend(slc_options)
+    configuration = configuration or {}
+    if configuration:
+        configuration_overrides = ",".join(
+            f"{name}:{str(value).lower() if isinstance(value, bool) else value}"
+            for name, value in configuration.items()
+        )
+        cmd.append(f"--configuration={configuration_overrides}")
+    cmd.append("--generator-timeout=60000")
     run(cmd, cwd=REPO_ROOT)
+
+
+def sisdk_release_from_version(version: str) -> str:
+    match = re.fullmatch(r"(\d{4}\.\d+)(?:\.\d+)?", version.strip())
+    if not match:
+        raise RuntimeError(f"Cannot select an app config from SiSDK version: {version}")
+    return match.group(1)
+
+
+def load_app_configuration(version: str, board: str) -> tuple[dict, dict, Path]:
+    release = sisdk_release_from_version(version)
+    config_path = APP_CONFIG_DIR / f"sisdk{release}.json"
+    if not config_path.is_file():
+        raise RuntimeError(
+            f"No app configuration exists for SiSDK {release}: {config_path}. "
+            "Add the matching apps/configs/sisdk<version>.json before generating the project."
+        )
+    try:
+        app_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Invalid SiSDK app configuration JSON: {config_path}: {error}") from error
+    if not isinstance(app_config, dict):
+        raise RuntimeError(f"SiSDK app configuration must be an object: {config_path}")
+
+    application = app_config.get("application")
+    if not isinstance(application, str) or not application.strip() or Path(application).name != application:
+        raise RuntimeError(f"SiSDK app configuration has an invalid application name: {config_path}")
+
+    boards = app_config.get("boards")
+    if not isinstance(boards, dict):
+        raise RuntimeError(f"SiSDK app configuration must contain a boards object: {config_path}")
+    board_id = board.strip().lower().split("_", 1)[0]
+    board_config = boards.get(board_id)
+    if not isinstance(board_config, dict):
+        supported = ", ".join(sorted(str(item) for item in boards)) or "none"
+        raise RuntimeError(
+            f"Board {board!r} is not supported by SiSDK {release} app configuration. "
+            f"Supported boards: {supported}"
+        )
+    if not isinstance(board_config.get("prs_configuration"), str) or not board_config["prs_configuration"].strip():
+        raise RuntimeError(f"Board {board_id} has no prs_configuration in {config_path}")
+    profiles = board_config.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        raise RuntimeError(f"Board {board_id} has no device profiles in {config_path}")
+    unknown_profiles = sorted(set(profiles).difference(APP_PROFILE_PROJECT_NAMES))
+    if unknown_profiles:
+        raise RuntimeError(
+            f"SiSDK app configuration contains unsupported device profiles: {', '.join(unknown_profiles)}"
+        )
+    return app_config, board_config, config_path
+
+
+def resolve_sdk_app_slcp(sdk_path: Path, application: str) -> Path:
+    slcp = sdk_path / SDK_BLUETOOTH_APP_ROOT / application / f"{application}.slcp"
+    if not slcp.is_file():
+        raise FileNotFoundError(
+            f"SiSDK application {application!r} was not found at the expected path: {slcp}"
+        )
+    return slcp
+
+
+def select_app_build_targets(
+    targets: list[str],
+    *,
+    application: str,
+    profiles: dict,
+    requested_device: str = "",
+) -> tuple[list[str], bool]:
+    profile_names = list(profiles)
+    if requested_device and requested_device not in profiles:
+        raise RuntimeError(
+            f"Unknown --device profile {requested_device!r}. "
+            f"Choose one of: {', '.join(profile_names)}"
+        )
+
+    selected_profiles: list[str] = []
+    include_bootloader = not targets
+    if not targets:
+        selected_profiles = [requested_device] if requested_device else profile_names
+        return selected_profiles, include_bootloader
+
+    all_profiles_requested = False
+    for target in targets:
+        target_path = Path(target)
+        if not target_path.is_absolute():
+            target_path = REPO_ROOT / target_path
+        if target_path.is_dir() and target_path.resolve() == APPS_DIR.resolve():
+            all_profiles_requested = True
+            include_bootloader = True
+            continue
+
+        target_name = Path(target).stem.lower()
+        if target_name == "bootloader-uart-bgapi":
+            include_bootloader = True
+        elif target_name in profiles:
+            selected_profiles.append(target_name)
+        elif target_name in APP_PROFILE_BY_LEGACY_PROJECT:
+            selected_profiles.append(APP_PROFILE_BY_LEGACY_PROJECT[target_name])
+        elif target_name == application.lower():
+            all_profiles_requested = True
+        else:
+            raise RuntimeError(
+                f"Unsupported app build target {target!r}. Use {application}, a configured "
+                "device profile, or bootloader-uart-bgapi.slcp."
+            )
+
+    if all_profiles_requested:
+        selected_profiles.extend(profile_names)
+    if requested_device:
+        if selected_profiles and requested_device not in selected_profiles:
+            raise RuntimeError(
+                f"Target selection does not include --device profile {requested_device!r}"
+            )
+        selected_profiles = [requested_device]
+    selected_profiles = list(dict.fromkeys(selected_profiles))
+    if not selected_profiles and not include_bootloader:
+        raise RuntimeError("No app or bootloader build target was selected")
+    return selected_profiles, include_bootloader
+
+
+def merge_app_configuration(app_config: dict, profile_config: dict) -> dict:
+    common = app_config.get("configuration", {})
+    profile = profile_config.get("configuration", {})
+    if not isinstance(common, dict) or not isinstance(profile, dict):
+        raise RuntimeError("Application and device profile configuration values must be objects")
+    return {**common, **profile}
+
+
+def merge_slc_options(board_config: dict, profile_config: dict) -> list[str]:
+    options: list[str] = []
+    for scope, config in (("board", board_config), ("device profile", profile_config)):
+        values = config.get("slc_options", [])
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise RuntimeError(f"{scope} slc_options must be an array of strings")
+        options.extend(values)
+    return options
 
 
 def _is_noop_upgrade_result(result: subprocess.CompletedProcess) -> bool:
@@ -649,6 +943,8 @@ def write_build_metadata(
     runtime_xapi_path: Path | None,
     sdk_selection: SDKSelection | None = None,
     vcom_metadata: dict | None = None,
+    app_configuration: dict | None = None,
+    project_name: str = "",
 ) -> Path:
     artifacts = [
         {
@@ -662,7 +958,7 @@ def write_build_metadata(
     ]
     metadata = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "project_name": slcp.stem,
+        "project_name": project_name or slcp.stem,
         "slcp": _relative_to_repo(slcp),
         "generated_slcp": _relative_to_repo(out_dir / slcp.name),
         "firmware": {
@@ -675,6 +971,10 @@ def write_build_metadata(
         "sdk": {
             "source": sdk_selection.source if sdk_selection else "",
             "version": firmware_cfg["sisdk"],
+            "artifactory_version": sdk_selection.artifactory_version if sdk_selection else "",
+            "artifactory_build": sdk_selection.artifactory_build if sdk_selection else "",
+            "archive_path": str(sdk_selection.archive_path or "") if sdk_selection else "",
+            "archive_sha256": sdk_selection.archive_sha256 if sdk_selection else "",
             "package_path": str(sdk_path.resolve()),
             "commit": sdk_selection.commit if sdk_selection else "",
             "hash": sdk_selection.sdk_hash if sdk_selection else "",
@@ -695,6 +995,8 @@ def write_build_metadata(
     }
     if vcom_metadata is not None:
         metadata["vcom"] = vcom_metadata
+    if app_configuration is not None:
+        metadata["app_configuration"] = app_configuration
     metadata_path = out_dir / BUILD_METADATA_FILENAME
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return metadata_path
@@ -742,6 +1044,10 @@ def write_fw_data(
         "sdk": {
             "source": sdk_selection.source if sdk_selection else "",
             "version": firmware_cfg["sisdk"],
+            "artifactory_version": sdk_selection.artifactory_version if sdk_selection else "",
+            "artifactory_build": sdk_selection.artifactory_build if sdk_selection else "",
+            "archive_path": str(sdk_selection.archive_path or "") if sdk_selection else "",
+            "archive_sha256": sdk_selection.archive_sha256 if sdk_selection else "",
             "package_path": str(sdk_path.resolve()),
             "commit": sdk_selection.commit if sdk_selection else "",
             "hash": sdk_selection.sdk_hash if sdk_selection else "",
@@ -761,8 +1067,10 @@ def firmware_artifacts_from_summaries(summaries: list[dict]) -> list[dict[str, s
     artifacts: list[dict[str, str]] = []
     for summary in summaries:
         image_path = str(summary.get("image", ""))
-        project_name = Path(str(summary.get("slcp", ""))).stem.lower()
-        role = FIRMWARE_ROLE_BY_PROJECT.get(project_name)
+        project_name = str(
+            summary.get("project_name") or Path(str(summary.get("slcp", ""))).stem
+        ).lower()
+        role = str(summary.get("firmware_role", "")) or FIRMWARE_ROLE_BY_PROJECT.get(project_name, "")
         if not role or not image_path:
             continue
         image = Path(image_path)
@@ -951,33 +1259,131 @@ def process_slcp(
     }
 
 
+def process_sdk_app_profile(
+    slcp: Path,
+    *,
+    build_root: Path,
+    firmware_cfg: dict[str, str],
+    sdk_path: Path,
+    runtime_xapi_path: Path | None,
+    action: str,
+    sdk_selection: SDKSelection | None,
+    vcom_metadata: dict | None,
+    app_configuration: dict,
+    app_config_path: Path,
+    board_id: str,
+    prs_configuration: str,
+    profile_name: str,
+    profile_config: dict,
+) -> dict:
+    project_name = APP_PROFILE_PROJECT_NAMES[profile_name]
+    out_dir = build_root / project_name
+    started_at = time.perf_counter()
+    if action == "rebuild" and out_dir.exists():
+        shutil.rmtree(out_dir)
+
+    slc_options = merge_slc_options(
+        app_configuration["board_config"],
+        profile_config,
+    )
+    configuration = merge_app_configuration(
+        app_configuration["app_config"],
+        profile_config,
+    )
+    generate_slcp(
+        slcp,
+        out_dir=out_dir,
+        board=board_id,
+        sdk_path=sdk_path,
+        project_name=project_name,
+        slc_options=slc_options,
+        configuration=configuration,
+    )
+
+    if action == "upgrade":
+        upgrade_slcp(slcp, out_dir=out_dir)
+
+    image = build_slcp(out_dir=out_dir) if action in {"build", "rebuild"} else None
+    metadata_path = None
+    if image is not None:
+        metadata_path = write_build_metadata(
+            slcp=slcp,
+            out_dir=out_dir,
+            image=image,
+            firmware_cfg=firmware_cfg,
+            sdk_path=sdk_path,
+            runtime_xapi_path=runtime_xapi_path,
+            sdk_selection=sdk_selection,
+            vcom_metadata=vcom_metadata,
+            project_name=project_name,
+            app_configuration={
+                "application": app_configuration["app_config"]["application"],
+                "device_profile": profile_name,
+                "board": board_id,
+                "prs_configuration": prs_configuration,
+                "config_file": _relative_to_repo(app_config_path),
+                "slc_options": slc_options,
+                "configuration": configuration,
+                "configuration_conditions": app_configuration["app_config"].get(
+                    "configuration_conditions", {}
+                ),
+            },
+        )
+
+    return {
+        "slcp": str(slcp),
+        "project_name": project_name,
+        "firmware_role": profile_name,
+        "out_dir": str(out_dir),
+        "generated_slcp": str(out_dir / slcp.name),
+        "image": str(image) if image else "",
+        "metadata": str(metadata_path) if metadata_path else "",
+        "sdk_path": str(sdk_path),
+        "elapsed_s": round(time.perf_counter() - started_at, 2),
+        "action": action,
+    }
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Manage app generation, upgrade, and build for all .slcp files under apps.")
+    parser = argparse.ArgumentParser(
+        description="Generate and build the configured SiSDK application and device profiles."
+    )
     parser.add_argument(
         "action",
         nargs="?",
         choices=["clean", "generate", "upgrade", "build", "rebuild"],
         default="build",
-        help="Action to run for each app. Defaults to build.",
+        help="Action to run for each selected app. Defaults to build.",
     )
     parser.add_argument(
         "targets",
         nargs="*",
-        help="Optional .slcp files or directories. Defaults to all .slcp files under apps.",
+        help="Optional app, profile, or bootloader target. Defaults to all configured profiles and the bootloader.",
     )
     parser.add_argument("--config", default="", help="cms_client_config.json path")
     parser.add_argument("--sdk-package-path", default="", help="explicit unpacked SiSDK package path")
+    parser.add_argument(
+        "--artifactory",
+        action="store_true",
+        help="obtain the SDK specified by artifactory.version and artifactory.build",
+    )
     parser.add_argument(
         "--diff",
         action="store_true",
         help="build configured version1 and version2 SiSDK packages in isolated roots",
     )
     parser.add_argument("--sisdk-version", default="", help="override selected SiSDK version")
+    parser.add_argument(
+        "--build-number",
+        "-bn",
+        default="",
+        help="override Artifactory SDK build number",
+    )
     parser.add_argument("--build-root", default="", help="override firmware build root")
-    parser.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
     parser.add_argument("--board", default="", help="override target board")
     parser.add_argument("--board-rev", default="", help="override target board revision")
-    parser.add_argument("--device", default="", help="override target device")
+    parser.add_argument("--device", default="", help="select one configured device profile")
+    parser.add_argument("--target-device", default="", help="override target MCU part number metadata")
     for tool_name in TOOL_ENV_VARS:
         parser.add_argument(f"--{tool_name}", default="", help=f"override {tool_name} executable")
     return parser.parse_args(argv)
@@ -994,6 +1400,14 @@ def run_firmware_action(
     """Run one normal firmware action in the supplied, fully isolated build root."""
 
     total_start = time.perf_counter()
+    if sdk_selection is None and parsed.artifactory:
+        artifactory = effective_config.get("artifactory", {})
+        sdk_selection = resolve_artifactory_sdk_selection(
+            str(artifactory.get("version", "")),
+            str(artifactory.get("build", "")),
+        )
+        effective_config["firmware"]["sisdk"] = sdk_selection.version
+
     firmware_cfg = validate_firmware_config(effective_config)
     if sdk_selection is None:
         sdk_selection = resolve_sdk_selection(
@@ -1007,6 +1421,29 @@ def run_firmware_action(
             f"{sdk_selection.version} != {firmware_cfg['sisdk']}"
         )
     sdk_path = sdk_selection.path
+
+    app_config, board_config, app_config_path = load_app_configuration(
+        sdk_selection.version,
+        firmware_cfg["board"],
+    )
+    application = app_config["application"].strip()
+    profiles = board_config["profiles"]
+    selected_profiles, include_bootloader = select_app_build_targets(
+        parsed.targets,
+        application=application,
+        profiles=profiles,
+        requested_device=parsed.device,
+    )
+    sdk_app_slcp = resolve_sdk_app_slcp(sdk_path, application)
+    board_id = firmware_cfg["board"].strip().lower().split("_", 1)[0]
+    app_config_context = {
+        "app_config": app_config,
+        "board_config": board_config,
+    }
+
+    if required_firmware_roles and parsed.device:
+        raise RuntimeError("--diff requires all firmware profiles and cannot be combined with --device")
+
     trust_sisdk(sdk_path)
     runtime_xapi_path = None
     vcom_metadata = None
@@ -1018,15 +1455,11 @@ def run_firmware_action(
             build_root=build_root,
         )
 
-    slcps = discover_slcps(parsed.targets)
-    if not slcps:
-        print("No .slcp files found.")
-        return 1
-
     summaries: list[dict] = []
-    for slcp in slcps:
+    if include_bootloader:
+        bootloader_slcp = resolve_bootloader_slcp()
         summary = process_slcp(
-            slcp,
+            bootloader_slcp,
             build_root=build_root,
             firmware_cfg=firmware_cfg,
             sdk_path=sdk_path,
@@ -1036,6 +1469,30 @@ def run_firmware_action(
             vcom_metadata=vcom_metadata,
         )
         summaries.append(summary)
+
+    for profile_name in selected_profiles:
+        profile_config = profiles[profile_name]
+        if not isinstance(profile_config, dict):
+            raise RuntimeError(f"SiSDK app profile {profile_name!r} must be an object")
+        summary = process_sdk_app_profile(
+            sdk_app_slcp,
+            build_root=build_root,
+            firmware_cfg=firmware_cfg,
+            sdk_path=sdk_path,
+            runtime_xapi_path=runtime_xapi_path,
+            action=parsed.action,
+            sdk_selection=sdk_selection,
+            vcom_metadata=vcom_metadata,
+            app_configuration=app_config_context,
+            app_config_path=app_config_path,
+            board_id=board_id,
+            prs_configuration=board_config["prs_configuration"],
+            profile_name=profile_name,
+            profile_config=profile_config,
+        )
+        summaries.append(summary)
+
+    for summary in summaries:
         print(
             f"{Path(summary['slcp']).name}: "
             f"action={summary['action']} "
@@ -1064,7 +1521,7 @@ def run_firmware_action(
     print(
         "App manager: "
         f"action={parsed.action} "
-        f"apps={len(slcps)} "
+        f"apps={len(summaries)} "
         f"board={firmware_cfg['board']} "
         f"sisdk={firmware_cfg['sisdk']} "
         f"fw_data={fw_data_path or ''} "
@@ -1137,8 +1594,32 @@ def build_diff_variants(
 
 def main(argv: list[str] | None = None) -> int:
     parsed = parse_args(list(argv if argv is not None else sys.argv[1:]))
+    if parsed.build_number and not parsed.artifactory:
+        raise RuntimeError("--build-number can only be used with --artifactory")
+    if parsed.artifactory and parsed.sdk_package_path:
+        raise RuntimeError("--artifactory cannot be combined with --sdk-package-path")
+    if parsed.artifactory and parsed.diff:
+        raise RuntimeError("--artifactory cannot be combined with --diff")
+    if parsed.artifactory and parsed.action == "clean":
+        raise RuntimeError("clean does not use --artifactory")
     config_path = Path(parsed.config) if parsed.config else None
     client_config = read_client_config(config_path)
+    if parsed.artifactory:
+        artifactory = client_config.get("artifactory", {})
+        artifactory = artifactory if isinstance(artifactory, dict) else {}
+        version = str(parsed.sisdk_version or artifactory.get("version", "")).strip()
+        build_number = str(parsed.build_number or artifactory.get("build", "")).strip()
+        has_version = bool(version)
+        has_build = bool(build_number)
+        if not has_version or not has_build:
+            raise RuntimeError(
+                "cms_client_config.json must set artifactory.version and artifactory.build "
+                "when --artifactory is used, or supply --sisdk-version and --build-number overrides"
+            )
+        if not re.fullmatch(r"\d{4}\.\d+", version):
+            raise RuntimeError("artifactory.version must use the SiSDK release format YYYY.MM")
+        if not build_number.isdecimal():
+            raise RuntimeError("artifactory.build must be a numeric Artifactory build number")
     effective_config = effective_build_config(client_config, parsed)
     global _TOOL_OVERRIDES
     _TOOL_OVERRIDES = effective_config["tools"]

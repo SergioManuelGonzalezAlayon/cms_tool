@@ -105,4 +105,6 @@ def test_result_storage_metadata_uses_config_and_firmware_identity():
         "serial_number": "212300218",
         "test_name": "beacon",
         "config_name": "default",
+        "sisdk_artifactory_version": None,
+        "sisdk_artifactory_build": None,
     }

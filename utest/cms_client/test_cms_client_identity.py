@@ -502,7 +502,6 @@ def test_build_derives_sisdk_version_from_the_selected_package(tmp_path, monkeyp
         targets=[],
         sdk_package_path="",
         build_root="",
-        bootloader_slcp="",
     )
 
     assert _run_local_build(args, str(config_path)) == 0
@@ -536,7 +535,6 @@ def test_diff_build_passes_preflight_flag_without_rewriting_normal_sdk_config(tm
         targets=[],
         sdk_package_path="",
         build_root="",
-        bootloader_slcp="",
         diff=True,
     )
 
@@ -549,6 +547,62 @@ def test_build_parser_accepts_diff_preflight():
     args = build_cli_parser().parse_args(["BUILD", "--diff"])
 
     assert args.diff is True
+
+
+def test_build_parser_accepts_sdk_profile_and_artifactory_overrides():
+    args = build_cli_parser().parse_args(
+        [
+            "BUILD",
+            "--device",
+            "dut_dcdc",
+            "--sisdk-version",
+            "2026.12",
+            "-bn",
+            "1357",
+        ]
+    )
+
+    assert args.device == "dut_dcdc"
+    assert args.sisdk_version == "2026.12"
+    assert args.build_number == "1357"
+
+
+def test_artifactory_build_forwards_sdk_and_device_profile_overrides(tmp_path, monkeypatch):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "daemon": {"scheme": "http", "host": "127.0.0.1", "port": 8000},
+                "artifactory": {"version": "2025.12", "build": "1234"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(cms_client.subprocess, "run", fake_run)
+    args = argparse.Namespace(
+        action="build",
+        targets=[],
+        sdk_package_path="",
+        build_root="",
+        artifactory=True,
+        diff=False,
+        sisdk_version="2026.12",
+        build_number="1357",
+        device="dut_dcdc",
+    )
+
+    assert _run_local_build(args, str(config_path)) == 0
+    command = captured["command"]
+    assert "--artifactory" in command
+    assert command[command.index("--sisdk-version") + 1] == "2026.12"
+    assert command[command.index("--build-number") + 1] == "1357"
+    assert command[command.index("--device") + 1] == "dut_dcdc"
 
 
 def test_run_test_sends_requested_run_name_to_daemon():

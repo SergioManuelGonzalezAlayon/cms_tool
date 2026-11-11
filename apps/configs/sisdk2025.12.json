@@ -1,0 +1,74 @@
+{
+  "application": "bt_ncp",
+  "configuration": {
+    "SL_STACK_SIZE": "2752",
+    "SL_BT_CONFIG_USER_ADVERTISERS": "4",
+    "SL_BOARD_ENABLE_VCOM": "1",
+    "SL_UARTDRV_USART_VCOM_FLOW_CONTROL_TYPE": "uartdrvFlowControlHw",
+    "SL_PSA_KEY_USER_SLOT_COUNT": "0"
+  },
+  "configuration_conditions": {
+    "SL_PSA_KEY_USER_SLOT_COUNT": [
+      "psa_crypto"
+    ]
+  },
+  "boards": {
+    "brd4182a": {
+      "slc_options": [],
+      "prs_configuration": "brd4182a",
+      "profiles": {
+        "dut_no_dcdc": {
+          "slc_options": [
+            "--with",
+            "bluetooth_feature_pawr_advertiser,bluetooth_feature_pawr_sync,bluetooth_feature_sync_scanner,wake_lock"
+          ],
+          "configuration": {
+            "SL_DEVICE_INIT_DCDC_ENABLE": 0,
+            "RADIOPRS_RX_CHANNEL": 0,
+            "RADIOPRS_RX_SOURCESEL": "PRS_RACL_LNAEN",
+            "RADIOPRS_RX_PORT": "SL_GPIO_PORT_B",
+            "RADIOPRS_RX_PIN": 2,
+            "RADIOPRS_TX_CHANNEL": 1,
+            "RADIOPRS_TX_SOURCESEL": "PRS_RACL_PAEN",
+            "RADIOPRS_TX_PORT": "SL_GPIO_PORT_B",
+            "RADIOPRS_TX_PIN": 3,
+            "SL_WAKE_LOCK_INPUT_PORT": "SL_GPIO_PORT_B",
+            "SL_WAKE_LOCK_INPUT_PIN": 1,
+            "SL_WAKE_LOCK_ENABLE_REMOTE": 0,
+            "SL_WAKE_LOCK_INPUT_POLARITY_ACTIVE_HIGH": 0,
+            "UARTDRV_RESTRICT_ENERGY_MODE_TO_ALLOW_RECEPTION": 0
+          }
+        },
+        "dut_dcdc": {
+          "slc_options": [
+            "--with",
+            "bluetooth_feature_pawr_advertiser,bluetooth_feature_pawr_sync,bluetooth_feature_sync_scanner,sl_radioprs:RX:TX,wake_lock"
+          ],
+          "configuration": {
+            "SL_DEVICE_INIT_DCDC_ENABLE": 1,
+            "RADIOPRS_RX_CHANNEL": 0,
+            "RADIOPRS_RX_SOURCESEL": "PRS_RACL_LNAEN",
+            "RADIOPRS_RX_PORT": "SL_GPIO_PORT_B",
+            "RADIOPRS_RX_PIN": 2,
+            "RADIOPRS_TX_CHANNEL": 1,
+            "RADIOPRS_TX_SOURCESEL": "PRS_RACL_PAEN",
+            "RADIOPRS_TX_PORT": "SL_GPIO_PORT_B",
+            "RADIOPRS_TX_PIN": 3,
+            "SL_WAKE_LOCK_INPUT_PORT": "SL_GPIO_PORT_B",
+            "SL_WAKE_LOCK_INPUT_PIN": 1,
+            "SL_WAKE_LOCK_ENABLE_REMOTE": 0,
+            "SL_WAKE_LOCK_INPUT_POLARITY_ACTIVE_HIGH": 0,
+            "UARTDRV_RESTRICT_ENERGY_MODE_TO_ALLOW_RECEPTION": 0
+          }
+        },
+        "tester": {
+          "slc_options": [
+            "--with",
+            "bluetooth_feature_pawr_advertiser,bluetooth_feature_pawr_sync,bluetooth_feature_sync_scanner"
+          ],
+          "configuration": {}
+        }
+      }
+    }
+  }
+}

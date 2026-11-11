@@ -90,6 +90,8 @@ def test_effective_build_config_cli_overrides_client_config() -> None:
         "build",
         "--sdk-package-path", r"C:\sdk\cli",
         "--sisdk-version", "2026.1.0",
+        "--device", "dut_dcdc",
+        "--target-device", "EFR32MG22C224F512IM40",
         "--build-root", "cli-build",
         "--slc", "cli-slc",
     ])
@@ -106,7 +108,7 @@ def test_effective_build_config_cli_overrides_client_config() -> None:
                 "svd_path": r"C:\svd\device.svd",
                 "svd_cache_dir": r"C:\svd-cache",
             },
-            "build": {"root": "config-build", "bootloader_slcp": "apps/boot.slcp"},
+            "build": {"root": "config-build"},
             "tools": {"slc": "config-slc"},
         },
         overrides,
@@ -122,9 +124,30 @@ def test_effective_build_config_cli_overrides_client_config() -> None:
         "svd_path": r"C:\svd\device.svd",
         "svd_cache_dir": r"C:\svd-cache",
         "build_root": "cli-build",
-        "bootloader_slcp": "apps/boot.slcp",
     }
     assert result["tools"]["slc"] == "cli-slc"
+
+
+def test_effective_build_config_accepts_artifactory_release_and_build_overrides() -> None:
+    parsed = app_manager.parse_args(
+        [
+            "build",
+            "--artifactory",
+            "--sisdk-version",
+            "2026.12",
+            "-bn",
+            "1357",
+        ]
+    )
+
+    result = app_manager.effective_build_config(
+        {"target": {"board": "brd4182a", "device": "EFR32MG22C224F512IM40-C"},
+         "artifactory": {"version": "2025.12", "build": "1234"}},
+        parsed,
+    )
+
+    assert result["firmware"]["sisdk"] == "2026.12"
+    assert result["artifactory"] == {"version": "2026.12", "build": "1357"}
 
 
 def test_resolve_build_root_uses_cli_before_client_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -138,15 +161,122 @@ def test_resolve_build_root_uses_cli_before_client_config(monkeypatch: pytest.Mo
     assert app_manager.resolve_build_root(None) == Path("configured-build")
 
 
-def test_resolve_bootloader_slcp_accepts_raw_client_config(tmp_path: Path) -> None:
-    bootloader = tmp_path / "custom-bootloader.slcp"
-    bootloader.write_text("project", encoding="utf-8")
+def test_resolve_bootloader_slcp_uses_repository_bootloader() -> None:
+    assert app_manager.resolve_bootloader_slcp() == app_manager.DEFAULT_BOOTLOADER_SLCP
 
-    result = app_manager.resolve_bootloader_slcp(
-        {"build": {"bootloader_slcp": str(bootloader)}}
+
+def test_load_app_configuration_selects_release_and_board() -> None:
+    app_config, board_config, config_path = app_manager.load_app_configuration(
+        "2026.12.0",
+        "BRD4182A_B06",
     )
 
-    assert result == bootloader
+    assert config_path.name == "sisdk2026.12.json"
+    assert app_config["application"] == "bt_ncp"
+    assert board_config["prs_configuration"] == "brd4182a"
+    assert (
+        board_config["profiles"]["dut_dcdc"]["configuration"]
+        ["SL_IOSTREAM_EUSART_VCOM_RESTRICT_ENERGY_MODE_TO_ALLOW_RECEPTION"]
+        == 0
+    )
+    assert (
+        "UARTDRV_RESTRICT_ENERGY_MODE_TO_ALLOW_RECEPTION"
+        not in board_config["profiles"]["dut_dcdc"]["configuration"]
+    )
+
+
+def test_load_app_configuration_fails_when_release_file_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_manager, "APP_CONFIG_DIR", tmp_path)
+
+    with pytest.raises(RuntimeError, match="No app configuration exists for SiSDK 2026.12"):
+        app_manager.load_app_configuration("2026.12.0", "brd4182a")
+
+
+def test_select_app_build_targets_maps_legacy_role_targets_to_profiles() -> None:
+    profiles = {
+        "dut_no_dcdc": {},
+        "dut_dcdc": {},
+        "tester": {},
+    }
+
+    assert app_manager.select_app_build_targets(
+        ["apps/ncp_ble_dut_dcdc.slcp"],
+        application="bt_ncp",
+        profiles=profiles,
+    ) == (["dut_dcdc"], False)
+    assert app_manager.select_app_build_targets(
+        [],
+        application="bt_ncp",
+        profiles=profiles,
+        requested_device="tester",
+    ) == (["tester"], True)
+
+
+def test_run_firmware_action_uses_selected_release_config_and_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sdk_path = tmp_path / "sisdk"
+    sdk_slcp = sdk_path / "bluetooth_le_app" / "example" / "bt_ncp" / "bt_ncp.slcp"
+    sdk_slcp.parent.mkdir(parents=True)
+    sdk_slcp.write_text("project", encoding="utf-8")
+    selection = app_manager.SDKSelection(
+        path=sdk_path,
+        version="2026.12.0",
+        source="test",
+    )
+    captured_profiles = []
+    captured_bootloader = []
+
+    monkeypatch.setattr(app_manager, "trust_sisdk", lambda path: None)
+    monkeypatch.setattr(
+        app_manager,
+        "process_slcp",
+        lambda slcp, **kwargs: captured_bootloader.append(slcp)
+        or {
+            "slcp": str(slcp),
+            "out_dir": "",
+            "image": "",
+            "metadata": "",
+            "sdk_path": str(sdk_path),
+            "elapsed_s": 0,
+            "action": "generate",
+        },
+    )
+    monkeypatch.setattr(
+        app_manager,
+        "process_sdk_app_profile",
+        lambda slcp, **kwargs: captured_profiles.append((slcp, kwargs))
+        or {
+            "slcp": str(slcp),
+            "out_dir": "",
+            "image": "",
+            "metadata": "",
+            "sdk_path": str(sdk_path),
+            "elapsed_s": 0,
+            "action": "generate",
+        },
+    )
+
+    parsed = app_manager.parse_args(["generate", "--device", "dut_dcdc"])
+    config = {
+        "firmware": {
+            "board": "BRD4182A_B06",
+            "brev": "B06",
+            "device": "EFR32MG22C224F512IM40-C",
+            "sisdk": "2026.12.0",
+        }
+    }
+
+    assert app_manager.run_firmware_action(parsed, config, tmp_path / "build", sdk_selection=selection) == 0
+    assert captured_bootloader == [app_manager.DEFAULT_BOOTLOADER_SLCP]
+    assert len(captured_profiles) == 1
+    slcp, kwargs = captured_profiles[0]
+    assert slcp == sdk_slcp
+    assert kwargs["profile_name"] == "dut_dcdc"
+    assert kwargs["prs_configuration"] == "brd4182a"
+    assert kwargs["app_config_path"].name == "sisdk2026.12.json"
 
 
 def test_resolve_sdk_selection_prefers_cli_then_config(
@@ -238,6 +368,10 @@ def test_resolve_diff_sdk_selections_records_each_variant_provenance(
         "hash": "commit-version2",
         "xapi_path": str(version2 / app_manager.SL_BT_XAPI_PATH),
         "xapi_sha256": app_manager._sha256(version2 / app_manager.SL_BT_XAPI_PATH),
+        "artifactory_version": "",
+        "artifactory_build": "",
+        "archive_path": "",
+        "archive_sha256": "",
     }
     assert selections["version1"].version == "2025.12.3"
     assert selections["version1"].xapi_path == version1 / app_manager.SL_BT_XAPI_PATH
@@ -377,6 +511,32 @@ def test_generate_slcp_passes_explicit_sdk_path(monkeypatch: pytest.MonkeyPatch)
         "brd4182a_b06",
         "--generator-timeout=60000",
     ]]
+
+
+def test_generate_slcp_passes_profile_options_and_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[list[str]] = []
+    out_dir = Path("build/dut_dcdc")
+
+    def fake_run(cmd, **kwargs):
+        captured.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(app_manager, "run", fake_run)
+
+    app_manager.generate_slcp(
+        Path("sdk/bluetooth_le_app/example/bt_ncp/bt_ncp.slcp"),
+        out_dir=out_dir,
+        board="brd4182a",
+        sdk_path=Path(r"C:\sdk\2026.12.0"),
+        project_name="ncp_ble_dut_dcdc",
+        slc_options=["--with", "wake_lock,sl_radioprs:RX:TX"],
+        configuration={"SL_STACK_SIZE": "2752", "SL_DEVICE_INIT_DCDC_ENABLE": 1},
+    )
+
+    assert "-name=ncp_ble_dut_dcdc" in captured[0]
+    assert "--with" in captured[0]
+    assert "wake_lock,sl_radioprs:RX:TX" in captured[0]
+    assert "--configuration=SL_STACK_SIZE:2752,SL_DEVICE_INIT_DCDC_ENABLE:1" in captured[0]
 
 
 def test_copy_bgapi_xapi_stages_file_from_exact_sdk(tmp_path: Path) -> None:
@@ -658,6 +818,10 @@ def test_write_build_metadata_records_firmware_and_artifacts() -> None:
         "commit": "sdk-commit",
         "hash": "sdk-hash",
         "xapi_sha256": "xapi-hash",
+        "artifactory_version": "",
+        "artifactory_build": "",
+        "archive_path": "",
+        "archive_sha256": "",
     }
     assert {artifact["name"] for artifact in metadata["artifacts"]} == {"demo.s37", "demo.hex", "demo.map"}
 
@@ -784,6 +948,10 @@ def test_write_fw_data_records_firmware_identity_and_role_hashes() -> None:
         "commit": "sdk-commit",
         "hash": "sdk-hash",
         "xapi_sha256": app_manager._sha256(runtime_xapi),
+        "artifactory_version": "",
+        "artifactory_build": "",
+        "archive_path": "",
+        "archive_sha256": "",
     }
 
 
@@ -796,6 +964,31 @@ def test_validate_required_firmware_roles_rejects_missing_no_dcdc_role(tmp_path:
             [{"slcp": "apps/ncp_ble_dut_dcdc.slcp", "image": str(image)}],
             app_manager.REQUIRED_DIFF_FIRMWARE_ROLES,
         )
+
+
+def test_firmware_artifacts_map_sdk_profiles_to_firmware_roles(tmp_path: Path) -> None:
+    image = tmp_path / "ncp_ble_dut_dcdc.s37"
+    image.write_bytes(b"dut dcdc")
+
+    artifacts = app_manager.firmware_artifacts_from_summaries(
+        [
+            {
+                "slcp": "sdk/bluetooth_le_app/example/bt_ncp/bt_ncp.slcp",
+                "project_name": "ncp_ble_dut_dcdc",
+                "firmware_role": "dut_dcdc",
+                "image": str(image),
+            }
+        ]
+    )
+
+    assert artifacts == [
+        {
+            "role": "dut_dcdc",
+            "project_name": "ncp_ble_dut_dcdc",
+            "image": str(image),
+            "sha256": app_manager._sha256(image),
+        }
+    ]
 
 
 def test_validate_required_firmware_roles_rejects_bin_images(tmp_path: Path) -> None:

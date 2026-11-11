@@ -146,6 +146,8 @@ def Config(request: pytest.FixtureRequest) -> dict:
         "sisdk_name",
         "sisdk_source",
         "sisdk_version",
+        "sisdk_artifactory_version",
+        "sisdk_artifactory_build",
         "sisdk_commit",
         "sisdk_hash",
         "xapi_file_hash",

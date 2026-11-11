@@ -90,6 +90,8 @@ def _result_storage_metadata(
         "board": firmware.get("board"),
         "board_revision": board_revision,
         "serial_number": firmware.get("serial_number"),
+        "sisdk_artifactory_version": firmware.get("sisdk_artifactory_version"),
+        "sisdk_artifactory_build": firmware.get("sisdk_artifactory_build"),
         "test_name": test_name,
         "config_name": config_name,
     }
@@ -241,6 +243,7 @@ def _upload_metadata(
         return {
             "cms_bench_id": bench["bench_id"],
             "sisdk_version": firmware["sisdk_version"],
+            "sisdk_artifactory_build": firmware.get("sisdk_artifactory_build", ""),
             "part_number": firmware["part_number"],
             "board": firmware["board"],
             "board_revision": firmware["board_revision"],
@@ -265,11 +268,13 @@ def upload_result_json_to_database(
     application_variant: object,
     test_case: object,
     measured_at: str,
+    sisdk_artifactory_build: object = "",
 ):
     return upload_result_file_to_database(
         result_json_path,
         cms_bench_id=cms_bench_id,
         sisdk_version=sisdk_version,
+        sisdk_artifactory_build=sisdk_artifactory_build,
         part_number=part_number,
         board=board,
         board_revision=board_revision,
@@ -294,6 +299,7 @@ def upload_result_file_to_database(
     application_variant: object,
     test_case: object,
     measured_at: str,
+    sisdk_artifactory_build: object = "",
 ):
     from s3_upload import upload_file_to_data_lake
 
@@ -301,6 +307,7 @@ def upload_result_file_to_database(
         result_file_path,
         cms_bench_id=cms_bench_id,
         sisdk_version=sisdk_version,
+        sisdk_artifactory_build=sisdk_artifactory_build,
         part_number=part_number,
         board=board,
         board_revision=board_revision,
@@ -657,6 +664,8 @@ def write_result_json(
             "serial_number": storage["serial_number"],
             "dut_sdk_name": sdk_name,
             "dut_sdk_version": sdk_version,
+            "dut_sdk_artifactory_version": firmware.get("sisdk_artifactory_version"),
+            "dut_sdk_artifactory_build": firmware.get("sisdk_artifactory_build"),
             "dut_sdk_source": firmware.get("sisdk_source"),
             "dut_sdk_commit": firmware.get("sisdk_commit"),
             "dut_sdk_hash": firmware.get("sisdk_hash"),

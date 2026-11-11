@@ -64,18 +64,30 @@ def _record_upload_location(
     application_variant: object,
     test_case: object,
     measured_at: str,
+    sisdk_artifactory_build: object = "",
 ) -> tuple[str, str]:
     components = [
         "cms",
         _safe_component(cms_bench_id),
         _safe_component(sisdk_version),
-        _safe_component(part_number),
-        f"{_safe_component(board)}_{_safe_component(board_revision)}",
-        _safe_component(serial_number, allow_empty=True),
-        _safe_component(protocol),
-        _safe_component(application_variant),
-        _safe_component(test_case),
     ]
+    build_component = _safe_component(
+        sisdk_artifactory_build,
+        default="",
+        allow_empty=True,
+    )
+    if build_component:
+        components.append(build_component)
+    components.extend(
+        [
+            _safe_component(part_number),
+            f"{_safe_component(board)}_{_safe_component(board_revision)}",
+            _safe_component(serial_number, allow_empty=True),
+            _safe_component(protocol),
+            _safe_component(application_variant),
+            _safe_component(test_case),
+        ]
+    )
     return _upload_file_name(path, measured_at), "/".join(components)
 
 
@@ -92,6 +104,7 @@ def upload_file_to_data_lake(
     application_variant: object,
     test_case: object,
     measured_at: str,
+    sisdk_artifactory_build: object = "",
     tenant_key: str | None = None,
     tenant_key_file: str | Path | None = None,
 ):
@@ -102,6 +115,7 @@ def upload_file_to_data_lake(
         path,
         cms_bench_id=cms_bench_id,
         sisdk_version=sisdk_version,
+        sisdk_artifactory_build=sisdk_artifactory_build,
         part_number=part_number,
         board=board,
         board_revision=board_revision,
@@ -135,6 +149,7 @@ def upload_json_to_data_lake(
     application_variant: object,
     test_case: object,
     measured_at: str,
+    sisdk_artifactory_build: object = "",
     tenant_key: str | None = None,
     tenant_key_file: str | Path | None = None,
 ):
@@ -142,6 +157,7 @@ def upload_json_to_data_lake(
         local_json_path,
         cms_bench_id=cms_bench_id,
         sisdk_version=sisdk_version,
+        sisdk_artifactory_build=sisdk_artifactory_build,
         part_number=part_number,
         board=board,
         board_revision=board_revision,

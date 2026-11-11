@@ -606,6 +606,7 @@ they must not be copied into a separate client runtime configuration file.
 | `daemon` | Remote daemon connection settings |
 | `target` | Target identity and SiSDK selection |
 | `build` | Firmware build output and bootloader project settings |
+| `artifactory` | Exact SiSDK release and build used with `cms BUILD --artifactory` |
 | `tools` | Optional explicit paths to local firmware build tools |
 
 The target section supports:
@@ -617,6 +618,26 @@ The target section supports:
 | `target.device` | Target device or part-number identity |
 | `target.sisdk` | Selected SiSDK version |
 | `target.sisdk_package_path` | Optional explicit path to an unpacked SiSDK package; leave empty when using an installed-SDK resolver |
+
+The Artifactory section selects an exact downloaded SiSDK build:
+
+| Field | Purpose |
+| --- | --- |
+| `artifactory.version` | Artifactory release directory, such as `2026.12` |
+| `artifactory.build` | Numeric build directory for that release, such as `1357` |
+
+Set these values in `cms_client_config.json`, then run:
+
+```powershell
+uv run python .\cms_client.py build --artifactory
+```
+
+This downloads and prepares the configured archive under
+`.fw_build/sisdk/<version>/<build>/package`, then builds with that SDK. The
+Artifactory release (`2026.12`) can differ from the package version in the SDK's
+`.properties` file (for example, `2026.12.3`); the build records both. This mode
+ignores `target.sisdk_package_path` and cannot be combined with
+`--sdk-package-path` or `--diff`.
 
 The build section supports:
 
@@ -745,6 +766,7 @@ The current CLI commands are:
 | `cms EXIT_CODES` | Print stable CLI exit-code meanings |
 | `cms TROUBLESHOOT` | Print troubleshooting guidance |
 | `cms BUILD` | Build local firmware through `apps/app_manager.py` |
+| `cms BUILD --artifactory` | Build with `artifactory.version` and `artifactory.build` from client config |
 | `cms BUILD --diff` | Build isolated `version1` and `version2` firmware roots |
 | `cms SEND_FW` | Stage firmware and metadata on the daemon |
 | `cms SEND_FW --diff` | Stage the provenanced differential firmware pair |

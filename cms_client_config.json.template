@@ -22,8 +22,11 @@
     "commander": "C:\\path\\to\\commander.exe"
   },
   "build": {
-    "root": ".fw_build",
-    "bootloader_slcp": "apps/bootloader-uart-bgapi.slcp"
+    "root": ".fw_build"
+  },
+  "artifactory": {
+    "version": "2026.12",
+    "build": "1357"
   },
   "target": {
     "board": "replace-with-supported-board-id",

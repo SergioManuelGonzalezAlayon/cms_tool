@@ -15,6 +15,6 @@ def test_reference_client_config_loads_expected_endpoints_and_settings():
     assert config.benches["cms-bench-dummy-001"].base_url == "http://127.0.0.1:8001"
     assert config.benches["cms-bench-dummy-001"].api_token == "dummy-bench-token-not-for-use"
     assert config.tools["commander"] == "tools/commander"
-    assert config.build["bootloader_slcp"] == "apps/bootloader-uart-bgapi.slcp"
+    assert config.build["root"] == ".fw_build"
     assert config.target["board"] == "BRD4182A"
     assert config.diff["sisdk_version2_path"] == "sdk/child"

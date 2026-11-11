@@ -22,8 +22,7 @@
     "commander": "tools/commander"
   },
   "build": {
-    "root": ".fw_build",
-    "bootloader_slcp": "apps/bootloader-uart-bgapi.slcp"
+    "root": ".fw_build"
   },
   "target": {
     "board": "BRD4182A",

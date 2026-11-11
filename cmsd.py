@@ -3253,6 +3253,8 @@ def _staged_firmware_summary(
             "name": firmware.sisdk_name,
             "source": firmware.sisdk_source,
             "version": firmware.sisdk_version,
+            "artifactory_version": firmware.sisdk_artifactory_version,
+            "artifactory_build": firmware.sisdk_artifactory_build,
             "commit": firmware.sisdk_commit,
             "hash": firmware.sisdk_hash,
         },

@@ -366,6 +366,7 @@ class CMSClientConfig:
     api_token: str = ""
     timeout_s: float = 30.0
     target: dict[str, str] | None = None
+    artifactory: dict[str, str] | None = None
     build: dict[str, str] | None = None
     tools: dict[str, str] | None = None
     diff: dict[str, str] | None = None
@@ -1250,11 +1251,16 @@ def load_client_config(path: str | Path = CMS_CLIENT_CONFIG) -> CMSClientConfig:
             timeout_s=float(raw_endpoint.get("timeout_s", daemon.get("timeout_s", 30.0))),
         )
 
+    raw_artifactory = config.get("artifactory", {})
+    if not isinstance(raw_artifactory, dict):
+        raise ValueError("cms_client_config.json artifactory must be an object")
+
     return CMSClientConfig(
         base_url=base_url,
         api_token=str(daemon.get("api_token", config.get("api_token", "silabs-cms"))),
         timeout_s=float(daemon.get("timeout_s", config.get("timeout_s", 30.0))),
         target={str(key): str(value) for key, value in config.get("target", {}).items()},
+        artifactory={str(key): str(value) for key, value in raw_artifactory.items()},
         build={str(key): str(value) for key, value in config.get("build", {}).items()},
         tools={str(key): str(value) for key, value in config.get("tools", {}).items()},
         diff={str(key): str(value) for key, value in config.get("diff", {}).items()},
@@ -1502,11 +1508,18 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_color_argument(build)
-    build.add_argument("targets", nargs="*", help="optional .slcp targets or app directories")
+    build.add_argument("targets", nargs="*", help="optional SDK app, device profile, or bootloader target")
     build.add_argument("--action", default="build", choices=["generate", "upgrade", "build", "rebuild"])
     build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
+    build.add_argument("--sisdk-version", default="", help="override SiSDK release or installed package version")
+    build.add_argument("--build-number", "-bn", default="", help="override Artifactory build number")
+    build.add_argument("--device", default="", help="select one configured app profile")
+    build.add_argument(
+        "--artifactory",
+        action="store_true",
+        help="use artifactory.version and artifactory.build from cms_client_config.json",
+    )
     build.add_argument("--build-root", default="", help="override firmware build root")
-    build.add_argument("--bootloader-slcp", default="", help="override bootloader SLCP path")
     build.add_argument(
         "--diff",
         action="store_true",
@@ -2435,6 +2448,8 @@ def _request_from_send_fw_args(
             sisdk_name=sisdk_name,
             sisdk_source=sdk_source,
             sisdk_version=sdk_version,
+            sisdk_artifactory_version=str(sdk_cfg.get("artifactory_version", "")),
+            sisdk_artifactory_build=str(sdk_cfg.get("artifactory_build", "")),
             sisdk_commit=sdk_commit,
             sisdk_hash=sdk_hash,
             vcom=vcom_metadata,
@@ -2508,6 +2523,8 @@ def _request_from_diff_build_manifest(args: argparse.Namespace, build_root: Path
             xapi_file_hash=xapi_hash,
             sisdk_source=str(sdk.get("source", "")),
             sisdk_version=str(sdk.get("version", "")),
+            sisdk_artifactory_version=str(sdk.get("artifactory_version", "")),
+            sisdk_artifactory_build=str(sdk.get("artifactory_build", "")),
             sisdk_commit=str(sdk.get("commit", "")),
             sisdk_hash=str(sdk.get("hash", "")),
             role_images=tuple(item for item in all_role_images if item.role != "bootloader"),
@@ -2559,16 +2576,47 @@ def _sisdk_name_from_properties(sdk_package_path: Path) -> str:
 
 def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
     is_diff = bool(getattr(args, "diff", False))
-    if not is_diff:
+    use_artifactory = bool(getattr(args, "artifactory", False))
+    build_number_override = str(getattr(args, "build_number", "") or "")
+    if build_number_override and not use_artifactory:
+        raise RuntimeError("--build-number can only be used with --artifactory")
+    if use_artifactory:
+        if is_diff:
+            raise RuntimeError("cms BUILD --artifactory cannot be combined with --diff")
+        if args.sdk_package_path:
+            raise RuntimeError(
+                "cms BUILD --artifactory cannot be combined with --sdk-package-path; "
+                "the Artifactory selection supplies the SDK instead"
+            )
+        if args.action == "clean":
+            raise RuntimeError("cms BUILD clean does not use --artifactory")
+        artifactory = load_client_config(config_path).artifactory or {}
+        version = str(getattr(args, "sisdk_version", "") or artifactory.get("version", "")).strip()
+        build_number = build_number_override or artifactory.get("build", "").strip()
+        if not version or not build_number:
+            raise RuntimeError(
+                "cms BUILD --artifactory requires artifactory.version and "
+                "artifactory.build in cms_client_config.json"
+            )
+        if not re.fullmatch(r"\d{4}\.\d+", version):
+            raise RuntimeError("artifactory.version must use the SiSDK release format YYYY.MM")
+        if not build_number.isdecimal():
+            raise RuntimeError("artifactory.build must be a numeric Artifactory build number")
+        print(f"Using SiSDK from Artifactory: version={version} build={build_number}")
+    elif not is_diff:
         _sync_config_sisdk_version(config_path, args.sdk_package_path)
     cmd = [sys.executable, str(Path("apps") / "app_manager.py"), args.action, *args.targets]
     if is_diff:
         cmd.append("--diff")
+    if use_artifactory:
+        cmd.append("--artifactory")
     for option, value in (
         ("--config", config_path),
         ("--sdk-package-path", args.sdk_package_path),
+        ("--sisdk-version", getattr(args, "sisdk_version", "")),
+        ("--build-number", build_number_override),
+        ("--device", getattr(args, "device", "")),
         ("--build-root", args.build_root),
-        ("--bootloader-slcp", args.bootloader_slcp),
     ):
         if value:
             cmd.extend([option, value])
@@ -3014,9 +3062,20 @@ def _print_staged_firmware(payload: dict[str, Any]) -> None:
 def _print_staged_firmware_variant(label: str, stage: dict[str, Any]) -> None:
     sisdk = stage.get("sisdk", {})
     if isinstance(sisdk, dict):
+        sdk_details = [str(sisdk.get("version", "")).strip()]
+        artifactory_version = str(sisdk.get("artifactory_version", "")).strip()
+        artifactory_build = str(sisdk.get("artifactory_build", "")).strip()
+        if artifactory_version or artifactory_build:
+            sdk_details.append(
+                "Artifactory "
+                f"version={artifactory_version or 'unknown'} "
+                f"build={artifactory_build or 'unknown'}"
+            )
+        commit = str(sisdk.get("commit", "")).strip()
+        if commit:
+            sdk_details.append(commit)
         print(
-            f"  {label} SiSDK: {sisdk.get('version', '')} "
-            f"{sisdk.get('commit', '')}".rstrip()
+            f"  {label} SiSDK: {'; '.join(part for part in sdk_details if part)}"
         )
     firmware = stage.get("firmware", [])
     if isinstance(firmware, list):

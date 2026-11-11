@@ -264,6 +264,12 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
             "sisdk_name": fw_metadata.get("sisdk_name") or sdk.get("name"),
             "sisdk_source": fw_metadata.get("sisdk_source") or sdk.get("source"),
             "sisdk_version": fw_metadata.get("sisdk_version") or sdk.get("version"),
+            "sisdk_artifactory_version": (
+                fw_metadata.get("sisdk_artifactory_version") or sdk.get("artifactory_version")
+            ),
+            "sisdk_artifactory_build": (
+                fw_metadata.get("sisdk_artifactory_build") or sdk.get("artifactory_build")
+            ),
             "sisdk_commit": fw_metadata.get("sisdk_commit") or sdk.get("commit"),
             "sisdk_hash": fw_metadata.get("sisdk_hash") or sdk.get("hash"),
             "xapi_file_hash": fw_metadata.get("xapi_file_hash") or sdk.get("xapi_sha256"),
