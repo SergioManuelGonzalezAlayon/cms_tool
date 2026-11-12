@@ -741,6 +741,22 @@ def test_build_jobs_selects_all_and_only_configs_for_filter_config_path(
     }
 
 
+def test_conn_central_full_sweep_phy_2m_selects_exactly_2500_configs():
+    jobs = orchestrator.build_jobs(
+        [orchestrator.CONFIG_ROOT],
+        mode="full_sweep",
+        feature_filters={"conn_central"},
+        partition_filters=set(),
+        variable_filters=orchestrator.parse_variable_filters(["phy=2m"]),
+    )
+
+    assert len(jobs) == 2500
+    assert all(
+        orchestrator.load_json(job.config_path)["connection"]["phy"] == "2m"
+        for job in jobs
+    )
+
+
 def test_build_jobs_variable_filters_use_declared_option_mappings(tmp_path, monkeypatch):
     config_root = tmp_path / "configs"
     feature_dir = config_root / "ble" / "beacon"

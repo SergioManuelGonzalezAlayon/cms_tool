@@ -617,6 +617,35 @@ def test_bench_accepts_variable_filters_that_select_jobs(tmp_path, monkeypatch):
     cms_bench._validate_variable_filtered_campaign(session)
 
 
+def test_bench_rejects_variable_filters_when_any_selected_job_violates_filter(
+    tmp_path, monkeypatch
+):
+    import test_orchestrator
+
+    config_root = _write_variable_filter_fixture(tmp_path, config_value="fast")
+    slow_config = config_root / "full_sweep" / "partition" / "case_slow.json"
+    slow_config.write_text('{"radio":{"rate":"slow"}}\n', encoding="utf-8")
+    monkeypatch.setattr(test_orchestrator, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(test_orchestrator, "CONFIG_ROOT", tmp_path / "tests" / "configs")
+    monkeypatch.chdir(tmp_path)
+    mixed_jobs = test_orchestrator.build_jobs(
+        [config_root],
+        mode="full_sweep",
+        feature_filters={"beacon"},
+        partition_filters=set(),
+    )
+    assert len(mixed_jobs) == 2
+    monkeypatch.setattr(test_orchestrator, "build_jobs", lambda *args, **kwargs: mixed_jobs)
+    session = _session(
+        tmp_path,
+        mode="full_sweep",
+        variable_filters=(VariableFilter("rate", "fast"),),
+    )
+
+    with pytest.raises(RuntimeError, match="configs that violate the requested filters"):
+        cms_bench._validate_variable_filtered_campaign(session)
+
+
 def _option_value(command: list[str], option: str) -> str:
     return command[command.index(option) + 1]
 

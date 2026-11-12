@@ -2091,7 +2091,12 @@ def _validate_variable_filtered_campaign(session: BenchSession) -> None:
     config_dir = Path("tests") / "configs" / session.request.selector.mode / feature
     orchestrator_mode = _orchestrator_mode(session)
     try:
-        from test_orchestrator import build_jobs, validate_variable_filters_for_targets
+        from test_orchestrator import (
+            build_jobs,
+            config_matches_variable_filters,
+            load_json,
+            validate_variable_filters_for_targets,
+        )
 
         validate_variable_filters_for_targets(
             [config_dir],
@@ -2114,6 +2119,25 @@ def _validate_variable_filtered_campaign(session: BenchSession) -> None:
         )
         raise RuntimeError(
             f"variable filters selected zero configs before execution: {filters_text}"
+        )
+    mismatched_configs = [
+        job.cfg_arg
+        for job in jobs
+        if not config_matches_variable_filters(
+            config_dir / "parameters.json",
+            load_json(job.config_path),
+            variable_filters,
+        )
+    ]
+    if mismatched_configs:
+        filters_text = ", ".join(
+            f"{variable_filter.name}={variable_filter.value}"
+            for variable_filter in variable_filters
+        )
+        examples = ", ".join(mismatched_configs[:5])
+        raise RuntimeError(
+            f"variable filters selected {len(mismatched_configs)} configs that violate "
+            f"the requested filters ({filters_text}); examples: {examples}"
         )
 
 
