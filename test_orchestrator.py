@@ -36,6 +36,7 @@ CONFIG_ROOT = REPO_ROOT / "tests" / "configs"
 RESULTS_DIR = REPO_ROOT / "artifacts" / "orchestrator"
 DEFAULT_RESULTS_LOG = RESULTS_DIR / "results.jsonl"
 TEST_RETRY_COUNT = 3
+CANCELLATION_EXIT_CODE = 130
 
 
 @dataclass(frozen=True)
@@ -866,6 +867,11 @@ def parse_args_with_pytest(argv: list[str]) -> tuple[argparse.Namespace, list[st
         help="Execute the exact ordered jobs recorded in this previously frozen plan.",
     )
     parser.add_argument(
+        "--cancel-request-file",
+        default="",
+        help="Stop after the active pytest job when this file exists.",
+    )
+    parser.add_argument(
         "--variant",
         default="",
         help="Named firmware variant for a paired CMS campaign.",
@@ -980,6 +986,19 @@ def main(argv: list[str] | None = None) -> int:
     aggregate_junit_path = Path(parsed.aggregate_junit) if parsed.aggregate_junit else None
     include_junit_logs = aggregate_junit_path is not None
 
+    def cancellation_requested() -> bool:
+        return bool(parsed.cancel_request_file and Path(parsed.cancel_request_file).is_file())
+
+    def exit_for_cancellation() -> int:
+        print(colors.color("Cancellation requested; no more pytest jobs will be scheduled.", "warning"))
+        if aggregate_junit_path is not None:
+            aggregate_junit_reports(
+                list(junit_paths.values()),
+                aggregate_junit_path,
+                jobs_by_report=jobs_by_junit_path,
+            )
+        return CANCELLATION_EXIT_CODE
+
     if parsed.resume:
         done = completed_job_ids(results_log)
         jobs = [job for job in jobs if job.job_id not in done]
@@ -993,6 +1012,8 @@ def main(argv: list[str] | None = None) -> int:
 
     failures = 0
     for job in jobs:
+        if cancellation_requested():
+            return exit_for_cancellation()
         ordinal, total_jobs = planned_positions[job.job_id]
         junit_path = junit_paths[job.job_id]
         print(
@@ -1016,6 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
         while (
             returncode == RETRYABLE_STARTUP_EXIT_CODE
             and retry_count < TEST_RETRY_COUNT
+            and not cancellation_requested()
         ):
             retry_count += 1
             append_result(
@@ -1082,6 +1104,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         else:
             print(colors.color(f"Passed {ordinal}/{total_jobs}: {job.cfg_arg}", "passed"))
+
+        if cancellation_requested():
+            return exit_for_cancellation()
 
     if aggregate_junit_path is not None:
         aggregate_junit_reports(

@@ -12,7 +12,8 @@ def test_reference_bench_runtime_config_loads_joulescope_model_and_mappings():
     assert identity.bench_id == "cms-bench-dummy-001"
     assert identity.hostname == "cms-bench-dummy-host"
     assert identity.profile == "bench-lite"
-    assert resources.joulescope_serial == "DUMMY-JOULESCOPE-USB-ID"
+    assert resources.joulescope_id == "DUMMY-JOULESCOPE-USB-ID"
+    assert resources.joulescope_serial == ""
     assert resources.joulescope_model == "js320"
     assert resources.joulescope_wake_gpio == 4
     assert resources.dut_probe_sn == "DUMMY-DUT-PROBE"

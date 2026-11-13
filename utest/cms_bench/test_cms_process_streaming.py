@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import signal
+import os
 import sys
 import threading
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 import cms_bench
+import cms_system
 from cms_bench import BenchSession, MeasurementEventStream, MeasurementRuntimePaths
 from cms_protocol import (
     FirmwareData,
@@ -29,6 +31,14 @@ def _fake_command(*actions: str) -> list[str]:
     for action in actions:
         command.extend(["--action", action])
     return command
+
+
+def _terminate_test_child(process: subprocess.Popen[str]) -> None:
+    """Stop the test child on Windows, where CMS Bench's Linux helper is unavailable."""
+
+    if process.poll() is None:
+        process.terminate()
+    process.wait(timeout=5.0)
 
 
 def _run_fake(tmp_path: Path, *actions: str) -> subprocess.CompletedProcess:
@@ -99,6 +109,7 @@ def test_managed_process_drains_stdout_and_stderr(tmp_path: Path) -> None:
     assert events[0]["state"] == "process_started"
     assert events[-1]["state"] == "process_completed"
     assert events[-1]["returncode"] == 0
+    assert events[0]["process_group_id"] == events[0]["pid"]
     assert [event["cursor"] for event in events] == list(range(1, len(events) + 1))
     console_events = [event for event in events if event["type"] == "console"]
     assert {event["source"] for event in console_events} == {"stdout", "stderr"}
@@ -165,7 +176,13 @@ def test_interleaved_event_stream_writers_share_one_cursor_sequence(tmp_path: Pa
     assert [event["cursor"] for event in MeasurementEventStream("measurement-123", paths).read_events()] == [1, 2, 3]
 
 
-def test_managed_process_times_out_and_preserves_live_diagnostics(tmp_path: Path) -> None:
+def test_managed_process_times_out_and_preserves_live_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name == "nt":
+        monkeypatch.setattr(cms_bench, "terminate_process_group", _terminate_test_child)
+
     event_stream = MeasurementEventStream(
         "measurement-123",
         MeasurementRuntimePaths.from_root(tmp_path),
@@ -187,7 +204,13 @@ def test_managed_process_times_out_and_preserves_live_diagnostics(tmp_path: Path
     assert any(event.get("state") == "process_timed_out" for event in event_stream.read_events())
 
 
-def test_managed_process_cancellation_stops_child_and_drains_output(tmp_path: Path) -> None:
+def test_managed_process_cancellation_stops_child_and_drains_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name == "nt":
+        monkeypatch.setattr(cms_bench, "terminate_process_group", _terminate_test_child)
+
     event_stream = MeasurementEventStream(
         "measurement-123",
         MeasurementRuntimePaths.from_root(tmp_path),
@@ -223,6 +246,61 @@ def test_managed_process_cancellation_stops_child_and_drains_output(tmp_path: Pa
     assert stdout_path.read_text(encoding="utf-8") == "before-cancel\n"
     states = [event.get("state") for event in event_stream.read_events()]
     assert "process_cancellation_requested" in states
+    assert states[-1] == "process_cancelled"
+
+
+def test_managed_process_cancellation_waits_for_child_cleanup(tmp_path: Path) -> None:
+    event_stream = MeasurementEventStream(
+        "measurement-123",
+        MeasurementRuntimePaths.from_root(tmp_path),
+    )
+    cancel_event = threading.Event()
+    cancel_request_file = tmp_path / cms_bench.CANCEL_REQUEST_FILENAME
+    cleanup_marker = tmp_path / "cleanup.marker"
+    command = [
+        *_fake_command("stdout:ready"),
+        "--wait-for-file",
+        str(cancel_request_file),
+        "--wait-for-file-timeout",
+        "2",
+        "--cleanup-marker",
+        str(cleanup_marker),
+    ]
+    outcomes: list[subprocess.CompletedProcess] = []
+    worker = threading.Thread(
+        target=lambda: outcomes.append(
+            cms_bench._run_managed_process(
+                command,
+                cwd=Path("."),
+                stdout_path=tmp_path / "stdout.log",
+                stderr_path=tmp_path / "stderr.log",
+                event_stream=event_stream,
+                cancel_event=cancel_event,
+                cancel_request_file=cancel_request_file,
+            )
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    stdout_path = tmp_path / "stdout.log"
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if stdout_path.exists() and "ready" in stdout_path.read_text(encoding="utf-8"):
+            break
+        time.sleep(0.01)
+    assert "ready" in stdout_path.read_text(encoding="utf-8")
+
+    cancel_event.set()
+    worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert outcomes[0].returncode == 0
+    assert cancel_request_file.is_file()
+    assert cleanup_marker.read_text(encoding="utf-8") == "cleanup\n"
+    states = [event.get("state") for event in event_stream.read_events()]
+    assert "process_cancellation_requested" in states
+    assert "process_cancellation_drain_timed_out" not in states
     assert states[-1] == "process_cancelled"
 
 
@@ -285,20 +363,43 @@ def test_linux_process_tree_termination_escalates_process_group(monkeypatch) -> 
                 raise subprocess.TimeoutExpired("fake", timeout)
             return -9
 
-    monkeypatch.setattr(cms_bench.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(cms_bench.signal, "SIGKILL", sigkill, raising=False)
+    monkeypatch.setattr(cms_system.signal, "SIGKILL", sigkill, raising=False)
     monkeypatch.setattr(
-        cms_bench.os,
+        cms_system.os,
         "killpg",
         lambda pid, sent_signal: sent_signals.append((pid, sent_signal)),
         raising=False,
     )
 
-    cms_bench._terminate_process_tree(FakeProcess())
+    cms_system.terminate_process_group(FakeProcess())
 
     assert sent_signals == [
         (1234, signal.SIGTERM),
         (1234, sigkill),
+    ]
+
+
+def test_linux_process_tree_kills_group_when_leader_exits_first(monkeypatch) -> None:
+    sent_signals = []
+
+    class ExitedLeader:
+        pid = 2345
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(
+        cms_system.os,
+        "killpg",
+        lambda pid, sent_signal: sent_signals.append((pid, sent_signal)),
+        raising=False,
+    )
+
+    cms_system.terminate_process_group(ExitedLeader())
+
+    assert sent_signals == [
+        (2345, signal.SIGTERM),
+        (2345, getattr(signal, "SIGKILL", 9)),
     ]
 
 
@@ -365,6 +466,7 @@ def test_orchestrator_starts_python_unbuffered_and_uses_runtime_logs(
         log_max_bytes,
         timeout_s,
         cancel_event,
+        cancel_request_file,
     ):
         observed.update(
             command=command,
@@ -381,6 +483,7 @@ def test_orchestrator_starts_python_unbuffered_and_uses_runtime_logs(
             log_max_bytes=log_max_bytes,
             timeout_s=timeout_s,
             cancel_event=cancel_event,
+            cancel_request_file=cancel_request_file,
         )
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
@@ -407,4 +510,8 @@ def test_orchestrator_starts_python_unbuffered_and_uses_runtime_logs(
     assert observed["log_max_bytes"] == session.max_console_log_bytes
     assert observed["timeout_s"] == session.execution_timeout_s
     assert observed["cancel_event"] is session.cancel_event
+    assert observed["cancel_request_file"] == session.cancellation_request_file
+    assert isinstance(command, list)
+    cancel_flag_index = command.index("--cancel-request-file")
+    assert command[cancel_flag_index + 1] == str(session.cancellation_request_file)
     assert completed.returncode == 0

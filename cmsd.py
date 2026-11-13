@@ -34,6 +34,7 @@ from cms_bench import (
     DEFAULT_CONSOLE_EVENT_MAX_BYTES,
     DEFAULT_CONSOLE_LOG_MAX_BYTES,
     DEFAULT_EXECUTION_TIMEOUT_S,
+    CANCEL_REQUEST_FILENAME,
     BenchSession,
     CMSBench,
     CMS_BENCH_CONFIG,
@@ -75,6 +76,7 @@ from cms_protocol import (
     test_case_identity_from_dict,
     variable_filters_from_dicts,
 )
+from cms_system import cleanup_measurement_process_groups
 from utils.config_loader import validate_test_config_data, validate_test_config_set_data
 
 
@@ -907,7 +909,7 @@ class CMSDaemon:
             self.reconstruct_interrupted_runtime_workspaces()
 
             identity, resources = load_bench_runtime_config(self.config.bench_config)
-            if resources.joulescope_serial:
+            if resources.joulescope_id or resources.joulescope_serial:
                 if resources.joulescope_model not in {"js220", "js320"}:
                     if resources.joulescope_model:
                         raise ValueError(
@@ -1010,6 +1012,51 @@ class CMSDaemon:
             detected_identity=bench_report.detected_identity,
             commander_probe=bench_report.commander_probe,
         )
+
+    def _measurement_readiness_failure(self) -> str:
+        """Return a bounded health failure before accepting measurement work."""
+
+        if self.startup_error:
+            return self.startup_error
+        # The daemon calls initialize() before serving client requests. Keep
+        # direct, uninitialized CMSDaemon use available to existing local
+        # callers, while failing closed after an actual startup failure.
+        if not self.initialized:
+            return ""
+
+        if self.bench is None:
+            self._bench_health()
+        if self.bench is None:
+            return "bench is unavailable"
+
+        joulescope_check = self.bench.check_joulescope_communication()
+        if joulescope_check.status is not BenchCheckStatus.PASS:
+            detail = joulescope_check.summary
+            if joulescope_check.detail:
+                detail += f" ({joulescope_check.detail})"
+            resources = getattr(self.bench, "resources", None)
+            model = str(getattr(resources, "joulescope_model", "")).strip().upper()
+            device = model or "Joulescope"
+            return (
+                f"{device} is not ready. Check the CMS Bench configuration and "
+                f"the connected device: {detail}"
+            )
+
+        report = self.get_health()
+        failed_checks = [
+            check
+            for check in report.checks
+            if check.status is BenchCheckStatus.FAIL
+        ]
+        if failed_checks:
+            return "; ".join(
+                f"{check.name}: {check.summary}"
+                + (f" ({check.detail})" if check.detail else "")
+                for check in failed_checks
+            )
+        if report.state is not BenchState.IDLE:
+            return f"bench is not idle (state={report.state.value}): {report.summary}"
+        return ""
 
     def get_status(self) -> dict[str, Any]:
         """Return daemon state, bench state, and staged file paths."""
@@ -1850,6 +1897,18 @@ class CMSDaemon:
             )
         identity = self._assign_execution_identity(request, run_name)
 
+        readiness_error = self._measurement_readiness_failure()
+        if readiness_error:
+            return MeasurementResult(
+                measurement_id=request.request_id,
+                state=MeasurementState.FAILED,
+                finished_at=datetime.utcnow(),
+                progress_percent=100,
+                current_step=MeasurementState.FAILED.value,
+                message=f"bench readiness check failed: {readiness_error}",
+                identity=identity,
+            )
+
         started = MeasurementResult(
             measurement_id=request.request_id,
             state=MeasurementState.ACCEPTED,
@@ -1874,6 +1933,7 @@ class CMSDaemon:
                 ),
                 "differential_staging": differential_staging,
                 "identity_assigned": True,
+                "hardware_readiness_verified": True,
             },
             daemon=True,
         )
@@ -1896,6 +1956,9 @@ class CMSDaemon:
             max_console_log_bytes=self.config.max_console_log_bytes,
             max_console_event_bytes=self.config.max_console_event_bytes,
             execution_timeout_s=self.config.execution_timeout_s,
+            cancellation_request_file=(
+                expected_runtime_dir / CANCEL_REQUEST_FILENAME
+            ),
             cancel_event=self.cancellation_events.setdefault(
                 request.request_id,
                 threading.Event(),
@@ -1993,11 +2056,80 @@ class CMSDaemon:
         cancel_event = self.cancellation_events.get(measurement_id)
         if self.active_measurement_id != measurement_id or cancel_event is None:
             return result
+        cancellation_file = (
+            self._runtime_workspace_path(measurement_id) / CANCEL_REQUEST_FILENAME
+        )
+        try:
+            cancellation_file.parent.mkdir(parents=True, exist_ok=True)
+            cancellation_file.touch(exist_ok=True)
+        except OSError as exc:
+            # The worker will see the event and fall back to its owned process
+            # group if it cannot publish the graceful stop request either.
+            result.message = f"cancellation request could not be persisted: {exc}"
+            self.measurements[measurement_id] = result
+            self.cancelled_measurements.add(measurement_id)
+            cancel_event.set()
+            return result
         cancel_event.set()
         result.message = "cancellation requested"
         self.measurements[measurement_id] = result
         self.cancelled_measurements.add(measurement_id)
         return result
+
+    def _verify_measurement_process_groups(
+        self,
+        measurement_id: str,
+        runtime_dir: Path,
+        *,
+        release_bench: bool = True,
+    ) -> None:
+        """Clean and verify this measurement's process groups before bench release."""
+
+        event_stream: MeasurementEventStream | None = None
+        try:
+            event_stream = MeasurementEventStream(
+                measurement_id,
+                MeasurementRuntimePaths.from_root(runtime_dir),
+                max_console_bytes=self.config.max_console_event_bytes,
+            )
+            process_group_ids, terminated_pids = cleanup_measurement_process_groups(
+                runtime_dir
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            detail = f"measurement process cleanup failed: {exc}"
+            if self.bench is not None:
+                self.bench.cleanup_error = detail
+                self.bench.state = BenchState.ERROR
+            if event_stream is not None:
+                try:
+                    event_stream.append_lifecycle(
+                        "process_group_cleanup_failed",
+                        error=detail,
+                    )
+                except OSError:
+                    pass
+            raise RuntimeError(detail) from exc
+
+        if event_stream is not None:
+            try:
+                event_stream.append_lifecycle(
+                    "process_groups_verified",
+                    process_group_ids=list(process_group_ids),
+                    terminated_pids={
+                        str(group_id): list(pids)
+                        for group_id, pids in terminated_pids.items()
+                    },
+                )
+            except OSError:
+                pass
+
+        if (
+            release_bench
+            and self.bench is not None
+            and self.bench.state in {BenchState.BUSY, BenchState.TESTING}
+        ):
+            self.bench.cleanup_error = ""
+            self.bench.state = BenchState.IDLE
 
     def execute_measurement(
         self,
@@ -2005,6 +2137,7 @@ class CMSDaemon:
         staged_runtime_dir: Path | None = None,
         differential_staging: StagedDifferentialFirmware | None = None,
         identity_assigned: bool = False,
+        hardware_readiness_verified: bool = False,
     ) -> MeasurementResult:
         """Run one V1 synchronous measurement path."""
 
@@ -2025,6 +2158,41 @@ class CMSDaemon:
             self._assign_execution_identity(request, requested_run_name)
         else:
             self._assign_execution_identity(request)
+        if self.bench is not None and (
+            self.bench.state is BenchState.ERROR or self.bench.cleanup_error
+        ):
+            error_detail = self.bench.cleanup_error or self.bench.startup_error
+            message = "bench is in ERROR state; measurement execution is blocked"
+            if error_detail:
+                message += f": {error_detail}"
+            return self.publish_results(
+                MeasurementResult(
+                    measurement_id=request.request_id,
+                    state=MeasurementState.FAILED,
+                    started_at=datetime.utcnow(),
+                    finished_at=datetime.utcnow(),
+                    progress_percent=100,
+                    current_step=MeasurementState.FAILED.value,
+                    message=message,
+                    identity=request.identity,
+                )
+            )
+        if not hardware_readiness_verified:
+            readiness_error = self._measurement_readiness_failure()
+            if readiness_error:
+                now = datetime.utcnow()
+                return self.publish_results(
+                    MeasurementResult(
+                        measurement_id=request.request_id,
+                        state=MeasurementState.FAILED,
+                        started_at=now,
+                        finished_at=now,
+                        progress_percent=100,
+                        current_step=MeasurementState.FAILED.value,
+                        message=f"bench readiness check failed: {readiness_error}",
+                        identity=request.identity,
+                    )
+                )
         self.measurement_accept(request)
         runtime_dir = self.create_runtime_workspace(request.request_id)
         if differential_staging is not None:
@@ -2033,6 +2201,7 @@ class CMSDaemon:
                 runtime_dir,
                 differential_staging,
             )
+        result: MeasurementResult | None = None
         try:
             self._update_measurement(
                 request.request_id,
@@ -2092,6 +2261,35 @@ class CMSDaemon:
                 message=str(exc),
                 identity=request.identity,
             )
+        finally:
+            if self.bench is not None and self.bench.state is BenchState.TESTING:
+                try:
+                    self._verify_measurement_process_groups(
+                        request.request_id,
+                        runtime_dir,
+                    )
+                except RuntimeError as cleanup_exc:
+                    if result is None:
+                        result = MeasurementResult(
+                            measurement_id=request.request_id,
+                            state=MeasurementState.FAILED,
+                            started_at=datetime.utcnow(),
+                            finished_at=datetime.utcnow(),
+                            progress_percent=100,
+                            current_step=MeasurementState.FAILED.value,
+                            message=str(cleanup_exc),
+                            identity=request.identity,
+                        )
+                    else:
+                        result.state = MeasurementState.FAILED
+                        result.finished_at = datetime.utcnow()
+                        result.progress_percent = 100
+                        result.current_step = MeasurementState.FAILED.value
+                        result.message = "; ".join(
+                            part for part in (result.message, str(cleanup_exc)) if part
+                        )
+        if result is None:
+            raise RuntimeError("measurement execution ended without a result")
         return self.publish_results(result)
 
     def _execute_differential_measurement(
@@ -2145,6 +2343,11 @@ class CMSDaemon:
                 session.console_relay = top_level_events
                 self.bench.report_differential_firmware_selection(session)
                 pass_result = self.bench.measurement_run(session, active_root=campaign.active_root)
+                self._verify_measurement_process_groups(
+                    request.request_id,
+                    session.runtime_dir,
+                    release_bench=False,
+                )
                 pass_results.append(pass_result)
                 pass_record = _differential_pass_record(variant, pass_result, session.runtime_dir)
                 pass_records.append(pass_record)
@@ -2232,6 +2435,20 @@ class CMSDaemon:
                 identity=request.identity,
                 artifacts=artifacts,
             )
+        if self.bench is not None and self.bench.state is BenchState.TESTING:
+            try:
+                self._verify_measurement_process_groups(
+                    request.request_id,
+                    runtime_dir,
+                )
+            except RuntimeError as cleanup_exc:
+                result.state = MeasurementState.FAILED
+                result.finished_at = datetime.utcnow()
+                result.progress_percent = 100
+                result.current_step = MeasurementState.FAILED.value
+                result.message = "; ".join(
+                    part for part in (result.message, str(cleanup_exc)) if part
+                )
         published = self.publish_results(result)
         self._release_consumed_differential_stage(staging)
         return published

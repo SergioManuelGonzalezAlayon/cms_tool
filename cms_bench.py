@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import platform
-import signal
 import shutil
 import hashlib
 import re
@@ -51,6 +50,7 @@ from cms_protocol import (
     measurement_identity_to_dict,
     variable_filters_to_dicts,
 )
+from cms_system import terminate_process_group
 
 CMS_BENCH_CONFIG = "cms_bench_runtime.json"
 DEFAULT_CONSOLE_LOG_MAX_BYTES = 2 * 1024 * 1024
@@ -60,9 +60,12 @@ DEFAULT_EXECUTION_TIMEOUT_S: float | None = None
 _EVENT_STREAM_LOCKS: dict[str, threading.RLock] = {}
 _EVENT_STREAM_CURSORS: dict[str, EventCursor] = {}
 _EVENT_STREAM_LOCKS_GUARD = threading.Lock()
-PROCESS_TERMINATE_GRACE_S = 5.0
+CANCEL_REQUEST_FILENAME = "cancel_requested"
+CANCELLATION_DRAIN_TIMEOUT_S = 300.0
 MAX_CONSOLE_EVENT_SEGMENT_BYTES = 64 * 1024
 COMMANDER_PROBE_TIMEOUT_S = 15.0
+JOULESCOPE_PROBE_TIMEOUT_S = 5.0
+JOULESCOPE_PROBE_CLEANUP_TIMEOUT_S = 1.0
 
 
 def _read_js_model() -> str:
@@ -134,6 +137,8 @@ class BenchResources:
     xapi_path: str = ""
     group_id: int | None = None
     group_name: str = ""
+    # USB reset identifier from joulescope.id (for example VID:PID).
+    joulescope_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,9 +384,12 @@ class BenchSession:
     console_relay: MeasurementEventStream | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     persistent_artifacts_dir: Path | None = None
+    cancellation_request_file: Path | None = None
     event_stream: MeasurementEventStream = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.cancellation_request_file is None:
+            self.cancellation_request_file = self.runtime_dir / CANCEL_REQUEST_FILENAME
         self.event_stream = MeasurementEventStream(
             self.measurement_id,
             self.runtime_paths,
@@ -467,10 +475,12 @@ class CMSBench:
         self.state = BenchState.OFFLINE
         self.initialized = False
         self.startup_error = ""
+        self.cleanup_error = ""
 
         self.dut_serial: str | None = None
         self.tester_serial: str | None = None
         self.js_interface: Any = None
+        self._last_joulescope_check: BenchCheckResult | None = None
 
     def initialize(self) -> None:
         """Load and validate persistent bench configuration."""
@@ -488,9 +498,9 @@ class CMSBench:
 
             self.dut_serial = self.resources.dut_probe_sn
             self.tester_serial = self.resources.tester_probe_sn
-            self.js_interface = self.resources.joulescope_serial
+            self.js_interface = self.resources.joulescope_id or self.resources.joulescope_serial
             self.initialized = True
-            self.state = BenchState.IDLE
+            self.state = BenchState.ERROR if self.cleanup_error else BenchState.IDLE
             self.startup_error = ""
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             self.initialized = False
@@ -524,6 +534,15 @@ class CMSBench:
                     name="bench_startup",
                     status=BenchCheckStatus.PASS if self.initialized else BenchCheckStatus.FAIL,
                     summary="bench initialized" if self.initialized else "bench not initialized",
+                )
+            )
+        if self.cleanup_error:
+            checks.append(
+                BenchCheckResult(
+                    name="process_cleanup",
+                    status=BenchCheckStatus.FAIL,
+                    summary="measurement process cleanup failed",
+                    detail=self.cleanup_error,
                 )
             )
 
@@ -592,12 +611,7 @@ class CMSBench:
                     resources.tester_serial_port,
                     "tester serial mapping configured",
                 ),
-                _optional_presence_check(
-                    "joulescope",
-                    resources.joulescope_serial,
-                    "Joulescope mapping configured",
-                    "Joulescope mapping is not configured",
-                ),
+                self._joulescope_health_check(resources),
                 _tool_check("commander", resources.commander_path),
                 _optional_tool_check(
                     "xapi",
@@ -629,6 +643,44 @@ class CMSBench:
             checks=checks,
             detected_identity=detected_identity,
             commander_probe=commander_probe,
+        )
+
+    def check_joulescope_communication(self) -> BenchCheckResult:
+        """Run and retain one bounded communication probe for pre-run readiness."""
+
+        if self.state in {BenchState.BUSY, BenchState.TESTING}:
+            return BenchCheckResult(
+                name="joulescope",
+                status=BenchCheckStatus.WARN,
+                summary="Joulescope communication check deferred while measurement is active",
+            )
+        resources = self.resources or BenchResources()
+        self._last_joulescope_check = _joulescope_communication_check(resources)
+        return self._last_joulescope_check
+
+    def _joulescope_health_check(self, resources: BenchResources) -> BenchCheckResult:
+        if self.state in {BenchState.BUSY, BenchState.TESTING}:
+            return BenchCheckResult(
+                name="joulescope",
+                status=BenchCheckStatus.WARN,
+                summary="Joulescope communication check deferred while measurement is active",
+            )
+        if self._last_joulescope_check is not None:
+            return self._last_joulescope_check
+        if not (
+            str(resources.joulescope_id).strip()
+            or str(resources.joulescope_serial).strip()
+        ):
+            return _optional_presence_check(
+                "joulescope",
+                resources.joulescope_id,
+                "Joulescope mapping configured",
+                "Joulescope mapping is not configured",
+            )
+        return BenchCheckResult(
+            name="joulescope",
+            status=BenchCheckStatus.WARN,
+            summary="Joulescope communication has not yet been checked",
         )
 
     def inspect(self, measurement_id: str) -> None:
@@ -962,6 +1014,9 @@ class CMSBench:
             variant=variant,
             job_plan_path=campaign.staged_runtime_dir / "firmware" / "paired_default_plan.json",
             cancel_event=cancel_event,
+            cancellation_request_file=(
+                campaign.execution_runtime_dir / CANCEL_REQUEST_FILENAME
+            ),
         )
 
     def record_differential_job(
@@ -1062,7 +1117,7 @@ class CMSBench:
         *,
         active_root: Path | None = None,
     ) -> MeasurementResult:
-        """Run the requested measurement flow and return structured results."""
+        """Run the measurement; CMSD releases the bench after process cleanup."""
         started_at = datetime.utcnow()
         self.state = BenchState.TESTING
         phase = "validation"
@@ -1142,8 +1197,6 @@ class CMSBench:
             except OSError as artifact_exc:
                 result.message = f"{result.message}; failed to collect diagnostics: {artifact_exc}"
                 return result
-        finally:
-            self.state = BenchState.IDLE
 
     def collect_artifacts(
         self,
@@ -1203,6 +1256,8 @@ class CMSBench:
         if js is not None:
             resources.joulescope_serial = str(js)
             self.js_interface = js
+        else:
+            self.js_interface = resources.joulescope_id or resources.joulescope_serial
         self.resources = resources
         self.identity = BenchIdentity(
             bench_id=platform.node(),
@@ -1277,9 +1332,8 @@ def load_bench_runtime_config(path: str | Path = CMS_BENCH_CONFIG) -> tuple[Benc
         tester_probe_sn=str(tester.get("probe_sn", "")),
         dut_serial_port=str(dut.get("serial_port", "")),
         tester_serial_port=str(tester.get("serial_port", "")),
-        joulescope_serial=str(
-            joulescope.get("serial_number", joulescope.get("serial_port", joulescope.get("id", "")))
-        ),
+        joulescope_serial=str(joulescope.get("serial_number", joulescope.get("serial_port", ""))),
+        joulescope_id=str(joulescope.get("id", "")),
         joulescope_model=str(joulescope.get("model", "")).strip().lower(),
         joulescope_wake_gpio=_optional_int(joulescope.get("wake_gpio")),
         board=identity.board,
@@ -1306,9 +1360,8 @@ def resolve_cms_resources_from_dev_config(dev_config: dict[str, Any]) -> BenchRe
         tester_probe_sn=str(dev_config.get("tester", {}).get("probe_sn", "")),
         dut_serial_port=str(dev_config.get("dut", {}).get("serial_port", "")),
         tester_serial_port=str(dev_config.get("tester", {}).get("serial_port", "")),
-        joulescope_serial=str(
-            joulescope.get("serial_number", joulescope.get("serial_port", joulescope.get("id", "")))
-        ),
+        joulescope_serial=str(joulescope.get("serial_number", joulescope.get("serial_port", ""))),
+        joulescope_id=str(joulescope.get("id", "")),
         joulescope_model=str(joulescope.get("model", "")).strip().lower(),
         joulescope_wake_gpio=_optional_int(joulescope.get("wake_gpio")),
         board=str(firmware.get("board", "")),
@@ -1696,6 +1749,7 @@ def _run_managed_process(
     log_max_bytes: int = DEFAULT_CONSOLE_LOG_MAX_BYTES,
     timeout_s: float | None = DEFAULT_EXECUTION_TIMEOUT_S,
     cancel_event: threading.Event | None = None,
+    cancel_request_file: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a child while keeping RAM logs authoritative and mirroring debug logs."""
 
@@ -1730,7 +1784,7 @@ def _run_managed_process(
         errors="replace",
         bufsize=1,
         env=child_environment,
-        start_new_session=platform.system() == "Linux",
+        start_new_session=True,
     )
     if process.stdout is None or process.stderr is None:
         raise RuntimeError("managed child process did not expose stdout and stderr pipes")
@@ -1739,12 +1793,14 @@ def _run_managed_process(
         event_stream.append_lifecycle(
             "process_started",
             pid=process.pid,
+            process_group_id=process.pid,
             command=command,
         )
         event_stream.replace_status(
             {
                 "state": "running",
                 "pid": process.pid,
+                "process_group_id": process.pid,
                 "command": command,
             }
         )
@@ -1802,31 +1858,88 @@ def _run_managed_process(
 
     timed_out = False
     cancelled = False
+    cancellation_drain_timed_out = False
+    cancellation_deadline: float | None = None
     deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     while True:
-        if cancel_event is not None and cancel_event.is_set():
+        if cancel_event is not None and cancel_event.is_set() and not cancelled:
             cancelled = True
+            graceful_cancellation = cancel_request_file is not None
+            if graceful_cancellation:
+                try:
+                    cancel_request_file.parent.mkdir(parents=True, exist_ok=True)
+                    cancel_request_file.touch(exist_ok=True)
+                except OSError as exc:
+                    graceful_cancellation = False
+                    if event_stream is not None:
+                        event_stream.append_lifecycle(
+                            "process_cancellation_signal_failed",
+                            pid=process.pid,
+                            error=str(exc),
+                        )
+
             if event_stream is not None:
                 event_stream.append_lifecycle(
                     "process_cancellation_requested",
                     pid=process.pid,
+                    graceful=graceful_cancellation,
+                    drain_timeout_s=(
+                        CANCELLATION_DRAIN_TIMEOUT_S if graceful_cancellation else 0.0
+                    ),
                 )
                 event_stream.replace_status(
                     {
                         "state": "process_cancellation_requested",
                         "pid": process.pid,
+                        "graceful": graceful_cancellation,
+                        "drain_timeout_s": (
+                            CANCELLATION_DRAIN_TIMEOUT_S
+                            if graceful_cancellation
+                            else 0.0
+                        ),
                     }
                 )
-            _terminate_process_tree(process)
-            returncode = process.returncode if process.returncode is not None else -1
-            break
+            if graceful_cancellation:
+                cancellation_deadline = (
+                    time.monotonic() + CANCELLATION_DRAIN_TIMEOUT_S
+                )
+            else:
+                terminate_process_group(process)
+                returncode = process.returncode if process.returncode is not None else -1
+                break
+
+        if cancellation_deadline is not None:
+            cancellation_remaining_s = cancellation_deadline - time.monotonic()
+            if cancellation_remaining_s <= 0:
+                cancellation_drain_timed_out = True
+                if event_stream is not None:
+                    event_stream.append_lifecycle(
+                        "process_cancellation_drain_timed_out",
+                        pid=process.pid,
+                        timeout_s=CANCELLATION_DRAIN_TIMEOUT_S,
+                    )
+                    event_stream.replace_status(
+                        {
+                            "state": "process_cancellation_drain_timed_out",
+                            "pid": process.pid,
+                            "timeout_s": CANCELLATION_DRAIN_TIMEOUT_S,
+                        }
+                    )
+                terminate_process_group(process)
+                returncode = process.returncode if process.returncode is not None else -1
+                break
+        else:
+            cancellation_remaining_s = None
 
         remaining_s = None if deadline is None else deadline - time.monotonic()
         if remaining_s is not None and remaining_s <= 0:
             timed_out = True
             break
         try:
-            returncode = process.wait(timeout=0.1 if remaining_s is None else min(0.1, remaining_s))
+            wait_timeout_s = 0.1 if remaining_s is None else min(0.1, remaining_s)
+            if cancellation_remaining_s is not None:
+                wait_timeout_s = min(wait_timeout_s, cancellation_remaining_s)
+            returncode = process.wait(timeout=wait_timeout_s)
             break
         except subprocess.TimeoutExpired:
             continue
@@ -1845,7 +1958,7 @@ def _run_managed_process(
                     "timeout_s": timeout_s,
                 }
             )
-        _terminate_process_tree(process)
+        terminate_process_group(process)
         returncode = process.returncode if process.returncode is not None else -1
     stdout_thread.join()
     stderr_thread.join()
@@ -1857,12 +1970,14 @@ def _run_managed_process(
             "process_cancelled",
             returncode=returncode,
             output_error=bool(drain_errors),
+            drain_timed_out=cancellation_drain_timed_out,
         )
         event_stream.replace_status(
             {
                 "state": "process_cancelled",
                 "returncode": returncode,
                 "output_error": bool(drain_errors),
+                "drain_timed_out": cancellation_drain_timed_out,
             }
         )
     elif event_stream is not None and not timed_out:
@@ -1890,36 +2005,6 @@ def _run_managed_process(
         stdout=stdout_path.read_text(encoding="utf-8"),
         stderr=stderr_path.read_text(encoding="utf-8"),
     )
-
-
-def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
-    """Stop a managed child and its Linux process group within a fixed grace period."""
-
-    linux_process_group = platform.system() == "Linux"
-    try:
-        if linux_process_group:
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-    except ProcessLookupError:
-        process.wait()
-        return
-
-    try:
-        process.wait(timeout=PROCESS_TERMINATE_GRACE_S)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-
-    try:
-        if linux_process_group:
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
-    except ProcessLookupError:
-        process.wait()
-        return
-    process.wait()
 
 
 def _drain_process_stream(
@@ -2028,6 +2113,10 @@ def _run_test_orchestrator(
         "--log-file-mode",
         "w",
     ]
+    if session.cancellation_request_file is not None:
+        cmd.extend(
+            ["--cancel-request-file", str(session.cancellation_request_file)]
+        )
     if feature != "all":
         cmd.extend(["--feature", feature])
     if session.request.selector.config != "default":
@@ -2076,6 +2165,7 @@ def _run_test_orchestrator(
         log_max_bytes=session.max_console_log_bytes,
         timeout_s=session.execution_timeout_s,
         cancel_event=session.cancel_event,
+        cancel_request_file=session.cancellation_request_file,
     )
 
 
@@ -2705,6 +2795,136 @@ def _optional_presence_check(
     if str(value).strip():
         return BenchCheckResult(name=name, status=BenchCheckStatus.PASS, summary=ok_summary)
     return BenchCheckResult(name=name, status=BenchCheckStatus.WARN, summary=missing_summary)
+
+
+def _joulescope_communication_check(resources: BenchResources) -> BenchCheckResult:
+    """Check the configured USB ID and probe communication when a serial is mapped."""
+
+    serial = str(resources.joulescope_serial).strip()
+    usb_id = str(resources.joulescope_id).strip()
+    if not serial and not usb_id:
+        return _optional_presence_check(
+            "joulescope",
+            "",
+            "Joulescope mapping configured",
+            "Joulescope mapping is not configured",
+        )
+
+    model = str(resources.joulescope_model).strip().lower()
+    if model not in {"js220", "js320"}:
+        return BenchCheckResult(
+            name="joulescope",
+            status=BenchCheckStatus.FAIL,
+            summary="Joulescope model is not configured for communication check",
+            detail=f"configured model={model or '<empty>'}",
+        )
+
+    driver = None
+    opened_path: str | None = None
+    firmware_version: Any = None
+    error = ""
+    cleanup_errors: list[str] = []
+    deadline = time.monotonic() + JOULESCOPE_PROBE_TIMEOUT_S
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Joulescope communication probe timed out after "
+                f"{JOULESCOPE_PROBE_TIMEOUT_S:g} seconds"
+            )
+        return remaining
+
+    try:
+        if usb_id:
+            lsusb_result = subprocess.run(
+                ["lsusb", "-d", usb_id],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=remaining_timeout(),
+            )
+            lsusb_output = lsusb_result.stdout or ""
+            id_listed = any(
+                re.search(rf"\bID\s+{re.escape(usb_id)}\b", line, re.IGNORECASE)
+                for line in lsusb_output.splitlines()
+            )
+            if lsusb_result.returncode != 0 or not id_listed:
+                detail = "\n".join(
+                    part
+                    for part in (lsusb_result.stdout, lsusb_result.stderr)
+                    if part
+                ).strip()
+                raise RuntimeError(
+                    f"configured Joulescope USB device {usb_id!r} is not listed by lsusb"
+                    + (f": {detail}" if detail else "")
+                )
+            if not serial:
+                return BenchCheckResult(
+                    name="joulescope",
+                    status=BenchCheckStatus.PASS,
+                    summary=f"{model.upper()} USB device detected by lsusb",
+                    detail=lsusb_output.strip(),
+                )
+
+        driver = Driver()
+        device_paths = driver.device_paths(timeout=remaining_timeout())
+        matching_paths = [
+            path
+            for path in device_paths
+            if f"/{model}/" in path.lower()
+            and path.lower().endswith("/" + serial.lower())
+        ]
+        if len(matching_paths) != 1:
+            raise RuntimeError(
+                f"configured Joulescope serial {serial!r} matched "
+                f"{len(matching_paths)} connected devices"
+            )
+
+        opened_path = matching_paths[0]
+        driver.open(
+            opened_path,
+            mode="restore",
+            timeout=remaining_timeout(),
+        )
+        firmware_version = driver.query(
+            f"{opened_path}/c/fw/version",
+            timeout=remaining_timeout(),
+        )
+        if firmware_version is None:
+            raise RuntimeError("Joulescope firmware version query returned no value")
+    except Exception as exc:
+        error = str(exc) or type(exc).__name__
+    finally:
+        if driver is not None:
+            if opened_path is not None:
+                try:
+                    driver.close(
+                        opened_path,
+                        timeout=JOULESCOPE_PROBE_CLEANUP_TIMEOUT_S,
+                    )
+                except Exception as exc:
+                    cleanup_errors.append(f"device close failed: {exc}")
+            try:
+                driver.finalize(timeout=JOULESCOPE_PROBE_CLEANUP_TIMEOUT_S)
+            except Exception as exc:
+                cleanup_errors.append(f"driver finalize failed: {exc}")
+
+    details = [part for part in (error, "; ".join(cleanup_errors)) if part]
+    if details:
+        return BenchCheckResult(
+            name="joulescope",
+            status=BenchCheckStatus.FAIL,
+            summary="Joulescope communication check failed",
+            detail="; ".join(details),
+        )
+
+    return BenchCheckResult(
+        name="joulescope",
+        status=BenchCheckStatus.PASS,
+        summary=f"{model.upper()} communication verified",
+        detail=f"firmware_version={firmware_version}",
+    )
 
 
 def _tool_check(name: str, value: str) -> BenchCheckResult:

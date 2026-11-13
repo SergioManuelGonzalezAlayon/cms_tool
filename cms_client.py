@@ -3127,7 +3127,10 @@ def _run_test_feature(
         variable_filters=variable_filters,
         endpoint=getattr(client, "base_url", ""),
     )
-    if not result.measurement_id:
+    if not result.measurement_id or result.state in {
+        MeasurementState.FAILED,
+        MeasurementState.REJECTED,
+    }:
         _print_measurement_result(result, colors=colors)
         return _measurement_exit_code(result.state)
     _record_last_measurement(args, result.measurement_id, variable_filters)

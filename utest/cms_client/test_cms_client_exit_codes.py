@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from argparse import Namespace
 import urllib.error
 
 import pytest
@@ -14,7 +15,7 @@ from cms_client import (
     CMSProtocolMismatchError,
     _measurement_exit_code,
 )
-from cms_protocol import MeasurementState
+from cms_protocol import MeasurementResult, MeasurementState
 
 
 def _client() -> CMSClient:
@@ -54,6 +55,57 @@ def test_cli_exit_code_values_are_stable() -> None:
 )
 def test_terminal_measurement_states_map_to_distinct_exit_codes(state, expected) -> None:
     assert _measurement_exit_code(state) is expected
+
+
+def test_run_test_prints_terminal_submission_failure_without_polling(
+    monkeypatch,
+):
+    result = MeasurementResult(
+        measurement_id="measurement-123",
+        state=MeasurementState.FAILED,
+        message="JS320 is not ready. Check the CMS Bench configuration and the connected device.",
+    )
+
+    class Client:
+        base_url = "http://cms-bench:8000"
+
+        def run_test(self, *args, **kwargs):
+            return result
+
+    printed = []
+    monkeypatch.setattr(cms_client, "record_last_measurement", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cms_client,
+        "_print_measurement_result",
+        lambda value, **kwargs: printed.append(value),
+    )
+    monkeypatch.setattr(
+        cms_client,
+        "_watch_remote_measurement",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("failed submission must not be polled")
+        ),
+    )
+    args = Namespace(
+        mode="default",
+        feature="beacon",
+        config_name="default",
+        run_name="",
+        upload_results_to_database=True,
+        debug=False,
+        custom_config_set_data=None,
+        config="cms_client_config.json",
+    )
+
+    exit_code = cms_client._run_test_feature(
+        Client(),
+        args,
+        (),
+        cms_client.color_formatter("never"),
+    )
+
+    assert exit_code is CMSCLIExitCode.TEST_FAILED
+    assert printed == [result]
 
 
 @pytest.mark.parametrize(

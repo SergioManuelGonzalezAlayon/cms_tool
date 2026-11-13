@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from utils.wpk import (
     _resolve_jlink_library_path,
     parse_board_vcom_gpio,
     parse_vcom_gpio_header,
+    setDebugMode,
 )
 
 
@@ -54,6 +56,150 @@ def test_jlink_device_candidates_try_debugger_name_before_package_suffix() -> No
         "EFR32MG22C224F512IM40-C",
         "EFR32MG22A224F512IM40",
     )
+
+
+def test_set_debug_mode_bounds_commander_and_escalates_to_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 1234
+        returncode = None
+
+        def __init__(self) -> None:
+            self.communicate_timeouts = []
+            self.terminated = False
+            self.killed = False
+            self.reaped = False
+
+        def communicate(self, timeout=None):
+            self.communicate_timeouts.append(timeout)
+            if len(self.communicate_timeouts) < 3:
+                raise subprocess.TimeoutExpired("commander", timeout)
+            self.returncode = -9
+            self.reaped = True
+            return "partial stdout", "partial stderr"
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+    observed = {}
+    process = FakeProcess()
+
+    def fake_popen(command, **kwargs):
+        observed["command"] = command
+        observed.update(kwargs)
+        return process
+
+    monkeypatch.setattr("utils.wpk.subprocess.Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="Commander timed out") as exc_info:
+        setDebugMode(
+            {
+                "vcom": {"enabled": True},
+                "dut": {"probe_sn": "440364944"},
+                "tools": {"commander": "commander-cli"},
+            },
+            "MCU",
+        )
+
+    assert observed["command"] == [
+        "commander-cli",
+        "adapter",
+        "dbgmode",
+        "MCU",
+        "--serialno",
+        "440364944",
+    ]
+    assert "start_new_session" not in observed
+    assert process.communicate_timeouts == [15.0, 5.0, 5.0]
+    assert process.terminated is True
+    assert process.killed is True
+    assert process.reaped is True
+    assert "partial stdout" in str(exc_info.value)
+    assert "partial stderr" in str(exc_info.value)
+
+
+def test_set_debug_mode_uses_a_bounded_commander_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            observed["timeout"] = timeout
+            return "", ""
+
+    def fake_popen(command, **kwargs):
+        observed["command"] = command
+        observed.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr("utils.wpk.subprocess.Popen", fake_popen)
+
+    setDebugMode(
+        {
+            "vcom": {"enabled": True},
+            "dut": {"probe_sn": "440364944"},
+            "tools": {"commander": "commander-cli"},
+        },
+        "OFF",
+    )
+
+    assert observed["timeout"] == 15.0
+    assert observed["text"] is True
+    assert observed["stdout"] is subprocess.PIPE
+    assert observed["stderr"] is subprocess.PIPE
+
+
+def test_set_debug_mode_reports_commander_that_survives_sigkill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StuckProcess:
+        pid = 4321
+        returncode = None
+
+        def __init__(self) -> None:
+            self.communicate_timeouts = []
+            self.terminated = False
+            self.killed = False
+
+        def communicate(self, timeout=None):
+            self.communicate_timeouts.append(timeout)
+            raise subprocess.TimeoutExpired("commander", timeout)
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+    process = StuckProcess()
+    monkeypatch.setattr("utils.wpk.subprocess.Popen", lambda *_args, **_kwargs: process)
+
+    with pytest.raises(RuntimeError, match="did not exit after SIGKILL"):
+        setDebugMode(
+            {
+                "vcom": {"enabled": True},
+                "dut": {"probe_sn": "440364944"},
+                "tools": {"commander": "commander-cli"},
+            },
+            "MCU",
+        )
+
+    assert process.communicate_timeouts == [15.0, 5.0, 5.0]
+    assert process.terminated is True
+    assert process.killed is True
 
 
 def _installed_simplicity_sdk_path(version: str) -> Path:

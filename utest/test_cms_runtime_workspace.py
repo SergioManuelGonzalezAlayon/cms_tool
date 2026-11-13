@@ -118,6 +118,9 @@ def test_abort_signals_active_session_without_publishing_terminal_state(tmp_path
 
     assert daemon.cancellation_events[request.request_id].is_set()
     assert daemon.active_measurement_id == request.request_id
+    assert (
+        daemon._runtime_workspace_path(request.request_id) / cmsd.CANCEL_REQUEST_FILENAME
+    ).is_file()
     assert result.state.value == "accepted"
     assert result.message == "cancellation requested"
 

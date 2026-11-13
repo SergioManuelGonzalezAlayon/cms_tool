@@ -22,6 +22,9 @@ _VCOM_PIN_DEFINE = "SL_VCOM_ENABLE_PIN"
 _DEFINE_RE = re.compile(r"^\s*#\s*define\s+(?P<name>\w+)\s+(?P<value>\S+)")
 _GPIO_PORT_RE = re.compile(r"^SL_GPIO_PORT_(?P<port>[A-Za-z])$")
 _DEVICE_PACKAGE_SUFFIX_RE = re.compile(r"-[A-Z]+$")
+COMMANDER_DEBUG_MODE_TIMEOUT_S = 15.0
+COMMANDER_TERMINATE_GRACE_S = 5.0
+COMMANDER_KILL_REAP_TIMEOUT_S = 5.0
 log = logging.getLogger(__name__)
 
 
@@ -166,14 +169,69 @@ def setDebugMode(config: dict[str, Any], mode: str) -> None:
         "--serialno",
         dut_probe_serial,
     ]
-    result = subprocess.run(command, check=False, text=True, capture_output=True)
-    if result.returncode != 0:
-        detail = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+    process = subprocess.Popen(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=COMMANDER_DEBUG_MODE_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        stdout, stderr = _terminate_and_reap_commander(process)
+        detail = _commander_output_detail(stdout, stderr)
+        raise RuntimeError(
+            f"Unable to set DUT debug mode {normalized_mode}: Commander timed out "
+            f"after {COMMANDER_DEBUG_MODE_TIMEOUT_S:g} seconds"
+            + (f": {detail}" if detail else "")
+        ) from exc
+    except BaseException:
+        _terminate_and_reap_commander(process)
+        raise
+
+    if process.returncode != 0:
+        detail = _commander_output_detail(stdout, stderr)
         raise RuntimeError(
             f"Unable to set DUT debug mode {normalized_mode}"
             + (f": {detail}" if detail else "")
         )
     log.info("Debug %s", normalized_mode)
+
+
+def _commander_output_detail(stdout: str | None, stderr: str | None) -> str:
+    return "\n".join(part for part in (stdout, stderr) if part).strip()
+
+
+def _terminate_and_reap_commander(
+    process: subprocess.Popen[str],
+) -> tuple[str, str]:
+    """Stop this Commander child and reap it within a bounded grace period."""
+
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except OSError:
+            # It may have exited between poll() and terminate(); if it is
+            # still alive, the bounded wait below leads to the hard-kill path.
+            pass
+
+    try:
+        stdout, stderr = process.communicate(timeout=COMMANDER_TERMINATE_GRACE_S)
+    except subprocess.TimeoutExpired:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                if process.poll() is None:
+                    raise
+        try:
+            stdout, stderr = process.communicate(timeout=COMMANDER_KILL_REAP_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Commander process {process.pid} did not exit after SIGKILL"
+            ) from exc
+
+    return stdout or "", stderr or ""
 
 
 def _normalize_radio_board_id(board: str) -> str:

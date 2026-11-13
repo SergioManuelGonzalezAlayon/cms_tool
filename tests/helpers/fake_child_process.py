@@ -24,6 +24,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Action in kind:value form; actions execute in the supplied order.",
     )
     parser.add_argument("--cleanup-marker", default="")
+    parser.add_argument("--wait-for-file", default="")
+    parser.add_argument("--wait-for-file-timeout", type=float, default=30.0)
     args = parser.parse_args(argv)
 
     try:
@@ -47,6 +49,13 @@ def main(argv: list[str] | None = None) -> int:
                 os._exit(int(value))
             else:
                 raise ValueError(f"unknown fake child action: {kind}")
+        if args.wait_for_file:
+            deadline = time.monotonic() + args.wait_for_file_timeout
+            marker = Path(args.wait_for_file)
+            while not marker.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not marker.is_file():
+                raise TimeoutError(f"timed out waiting for {marker}")
     finally:
         if args.cleanup_marker:
             Path(args.cleanup_marker).write_text("cleanup\n", encoding="utf-8")

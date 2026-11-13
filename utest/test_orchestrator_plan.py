@@ -1053,6 +1053,39 @@ def test_orchestrator_retries_retryable_startup_return_code(tmp_path, monkeypatc
     assert records[-1]["retry_count"] == 1
 
 
+def test_orchestrator_cancellation_finishes_active_job_without_retry_or_next_job(
+    tmp_path,
+    monkeypatch,
+):
+    jobs = [_job("first"), _job("second")]
+    results_log = tmp_path / "orchestrator_results.jsonl"
+    cancel_request_file = tmp_path / "cancel_requested"
+    executed = []
+
+    def fake_run_job(job, pytest_args, junit_path, *, include_junit_logs=False):
+        executed.append(job.job_id)
+        cancel_request_file.write_text("cancel\n", encoding="utf-8")
+        return RETRYABLE_STARTUP_EXIT_CODE, 0.01
+
+    monkeypatch.setattr(orchestrator, "build_jobs", lambda *args, **kwargs: jobs)
+    monkeypatch.setattr(orchestrator, "run_job", fake_run_job)
+
+    exit_code = orchestrator.main(
+        [
+            "--results-log",
+            str(results_log),
+            "--cancel-request-file",
+            str(cancel_request_file),
+        ]
+    )
+
+    assert exit_code == orchestrator.CANCELLATION_EXIT_CODE
+    assert executed == [jobs[0].job_id]
+    records = [json.loads(line) for line in results_log.read_text(encoding="utf-8").splitlines()]
+    assert [record["record_type"] for record in records] == ["job_started", "job_completed"]
+    assert records[-1]["retry_count"] == 0
+
+
 def test_orchestrator_stops_after_retryable_startup_retry_budget(tmp_path, monkeypatch):
     job = _job("default")
     results_log = tmp_path / "orchestrator_results.jsonl"
