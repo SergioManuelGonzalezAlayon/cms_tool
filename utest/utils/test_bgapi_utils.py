@@ -190,9 +190,12 @@ def test_connect_devices_waits_for_parameters_then_phy_status(monkeypatch) -> No
     central = _Device("central", [[
         _Event(address="peripheral", connection=7),
         _Event(_msg_name="parameters", connection=7, interval=12, latency=0, timeout=100),
-        _Event(_msg_name="phy_status", connection=7, phy=PHY_2M),
     ]])
-    peripheral = _Device("peripheral", [[_Event(address="central", connection=8)]])
+    peripheral = _Device("peripheral", [[
+        _Event(address="central", connection=8),
+        _Event(_msg_name="phy_status", connection=8, phy=PHY_1M),
+        _Event(_msg_name="phy_status", connection=8, phy=PHY_2M),
+    ]])
     params = ConnectionParameters(min_interval=12, max_interval=12, timeout=100, phy=PHY_2M)
     waits = []
     check_event = bgapi_utils.bgapi_check_event
@@ -208,11 +211,19 @@ def test_connect_devices_waits_for_parameters_then_phy_status(monkeypatch) -> No
     )
 
     assert handles == (7, 8)
-    assert central.bt.connection.default_preferred_phy_calls == [(PHY_2M, PHY_ANY)]
-    assert peripheral.bt.connection.default_preferred_phy_calls == [(PHY_2M, PHY_ANY)]
-    assert central.bt.connection.preferred_phy_calls == [(7, PHY_2M, PHY_ANY)]
-    assert [name for name, _ in waits] == ["opened", "opened", "parameters", "phy_status"]
-    assert [timeout for _, timeout in waits] == [conn_timeout] * 4
+    assert central.bt.connection.default_preferred_phy_calls == [(PHY_1M, PHY_ANY)]
+    assert peripheral.bt.connection.default_preferred_phy_calls == [
+        (PHY_1M, PHY_1M | PHY_2M)
+    ]
+    assert central.bt.connection.preferred_phy_calls == [(7, PHY_2M, PHY_2M)]
+    assert [name for name, _ in waits] == [
+        "opened",
+        "opened",
+        "parameters",
+        "phy_status",
+        "phy_status",
+    ]
+    assert [timeout for _, timeout in waits] == [conn_timeout] * 5
 
 
 def test_connect_devices_closes_central_handle_when_peripheral_open_event_times_out() -> None:

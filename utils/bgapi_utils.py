@@ -520,7 +520,11 @@ def close_connection(dev, conn_handle):
         log.debug("Error while closing central partial connection: %s", ex)
 
 
-def connection_config_params(dev, params: ConnectionParameters):
+def connection_config_params(dev,
+                             params: ConnectionParameters,
+                             *,
+                             default_preferred_phy=None,
+                             default_accepted_phy=PHY_ANY):
     dev.bt.connection.set_default_parameters(
         params.min_interval,
         params.max_interval,
@@ -528,8 +532,13 @@ def connection_config_params(dev, params: ConnectionParameters):
         params.timeout,
         params.min_ce_lenght,
         params.max_ce_lenght)
-    
-    dev.bt.connection.set_default_preferred_phy(params.phy, PHY_ANY)
+
+    if default_preferred_phy is None:
+        default_preferred_phy = params.phy
+    dev.bt.connection.set_default_preferred_phy(
+        default_preferred_phy,
+        default_accepted_phy,
+    )
     # ATT MTU must be at least 23. Treat rx_payload_length as payload sizing,
     # not a request to force an invalid MTU during default connection setup.
     if params.rx_payload_length >= 23:
@@ -564,30 +573,42 @@ def connection_set_live_params(dev,
     )
 
 
+def connection_wait_for_phy_status(dev, conn_handle, phy, connTimeout=5.0):
+    return bgapi_check_event(
+        dev,
+        "connection",
+        "phy_status",
+        lambda evt: evt.connection == conn_handle and evt.phy == phy,
+        eventTimeout=1,
+        maxTime=connTimeout,
+    )
+
+
 def connection_set_preferred_phy(dev,
                                  conn_handle,
                                  params: ConnectionParameters,
-                                 connTimeout=5.0):
+                                 connTimeout=5.0,
+                                 accepted_phy=PHY_ANY,
+                                 event_dev=None,
+                                 event_conn_handle=None):
     rsp = dev.bt.connection.set_preferred_phy(
         conn_handle,
         params.phy,
-        PHY_ANY,
+        accepted_phy,
     )
     log.info(
         "PHY preference request: connection=%s preferred_phy=%s accepted_phy=%s result=%s",
         conn_handle,
         params.phy,
-        PHY_ANY,
+        accepted_phy,
         rsp.result,
     )
     if params.phy != connection_open_phy(params.phy):
-        bgapi_check_event(
-                    dev,
-                    "connection",
-                    "phy_status",
-                    lambda evt: evt.connection == conn_handle and evt.phy == params.phy,
-                    eventTimeout=1,
-                    maxTime=connTimeout,
+        connection_wait_for_phy_status(
+            event_dev if event_dev is not None else dev,
+            event_conn_handle if event_conn_handle is not None else conn_handle,
+            params.phy,
+            connTimeout=connTimeout,
         )
 
 
@@ -613,8 +634,19 @@ def connect_devices(central,
 
     central_addr = central.bt.system.get_identity_address().address
 
-    connection_config_params(central, parameters)
-    connection_config_params(peripheral, parameters)
+    reference_2m_sequence = parameters.phy == PHY_2M
+    connection_config_params(
+        central,
+        parameters,
+        default_preferred_phy=PHY_1M if reference_2m_sequence else None,
+        default_accepted_phy=PHY_ANY,
+    )
+    connection_config_params(
+        peripheral,
+        parameters,
+        default_preferred_phy=PHY_1M if reference_2m_sequence else None,
+        default_accepted_phy=(PHY_1M | PHY_2M) if reference_2m_sequence else PHY_ANY,
+    )
 
     for attempt in range(max_retries):
         central_conn = -1
@@ -677,15 +709,30 @@ def connect_devices(central,
                     connection_parameters_event.timeout,
                 )
 
+                if reference_2m_sequence:
+                    log.info(
+                        "Waiting for peripheral connection.phy_status at initial 1M PHY"
+                    )
+                    connection_wait_for_phy_status(
+                        peripheral,
+                        peripheral_conn,
+                        PHY_1M,
+                        connTimeout=connTimeout,
+                    )
+
                 log.info(
-                    "Waiting up to %.3f s (7 connection intervals) for connection.phy_status",
+                    "Waiting up to %.3f s (7 connection intervals) for connection.phy_status on %s",
                     connTimeout,
+                    "peripheral" if reference_2m_sequence else "central",
                 )
                 connection_set_preferred_phy(
                     central,
                     central_conn,
                     parameters,
                     connTimeout=connTimeout,
+                    accepted_phy=PHY_2M if reference_2m_sequence else PHY_ANY,
+                    event_dev=peripheral if reference_2m_sequence else None,
+                    event_conn_handle=peripheral_conn if reference_2m_sequence else None,
                 )
                 log.info("Devices connected")
                 return central_conn, peripheral_conn
