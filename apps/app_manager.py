@@ -79,6 +79,7 @@ class SDKSelection:
     path: Path
     version: str
     source: str
+    build_number: str = ""
     commit: str = ""
     sdk_hash: str = ""
     xapi_path: Path | None = None
@@ -295,18 +296,31 @@ def _sisdk_version_from_properties(sdk_path: Path) -> str:
     raise RuntimeError(f"SiSDK package properties are missing version: {properties_path}")
 
 
+def _sisdk_build_number_from_package(sdk_path: Path) -> str:
+    build_number_path = sdk_path / ".build-number"
+    if not build_number_path.is_file():
+        raise RuntimeError(f"SiSDK package path is missing .build-number: {build_number_path}")
+    build_number = build_number_path.read_text(encoding="utf-8").strip()
+    if not build_number.isdecimal():
+        raise RuntimeError(
+            f"SiSDK package .build-number must contain a numeric build number: {build_number_path}"
+        )
+    return build_number
+
+
 def inspect_sdk_selection(
     package_path: str | Path,
     *,
     source: str,
     include_git_commit: bool = True,
 ) -> SDKSelection:
-    """Inspect one installed SiSDK package without relying on configured version text."""
+    """Inspect one installed SiSDK package using its package metadata."""
 
     sdk_path = Path(package_path).expanduser().resolve()
     if not sdk_path.exists() or not sdk_path.is_dir():
         raise RuntimeError(f"SiSDK package path does not exist or is not a directory: {sdk_path}")
     version = _sisdk_version_from_properties(sdk_path)
+    build_number = _sisdk_build_number_from_package(sdk_path)
     xapi_path = sdk_path / SL_BT_XAPI_PATH
     if not xapi_path.is_file():
         raise RuntimeError(f"Resolved SiSDK '{version}' cannot find `sl_bt.xapi`: {xapi_path}")
@@ -315,6 +329,7 @@ def inspect_sdk_selection(
         path=sdk_path,
         version=version,
         source=source,
+        build_number=build_number,
         commit=commit,
         sdk_hash=commit,
         xapi_path=xapi_path,
@@ -328,6 +343,7 @@ def sdk_selection_provenance(selection: SDKSelection) -> dict[str, str]:
     return {
         "source": selection.source,
         "version": selection.version,
+        "build_number": selection.build_number,
         "artifactory_version": selection.artifactory_version,
         "artifactory_build": selection.artifactory_build,
         "archive_path": str(selection.archive_path or ""),
@@ -340,17 +356,55 @@ def sdk_selection_provenance(selection: SDKSelection) -> dict[str, str]:
     }
 
 
-def resolve_diff_sdk_selections(config: dict) -> dict[str, SDKSelection]:
-    """Resolve independently configured version1 and version2 SDK packages for preflight."""
+def resolve_diff_sdk_selections(
+    config: dict,
+    parsed: argparse.Namespace | None = None,
+) -> dict[str, SDKSelection]:
+    """Resolve each differential SDK from configured package paths or Artifactory."""
 
     diff = config.get("diff")
     if not isinstance(diff, dict):
         raise RuntimeError(
-            "cms_client_config.json must contain a diff object with "
-            "sisdk_version1_path and sisdk_version2_path"
+            "cms_client_config.json must contain a diff object with the required "
+            "SDK release/build values or local SDK package paths"
         )
 
     selections: dict[str, SDKSelection] = {}
+    if parsed is not None and getattr(parsed, "artifactory", False):
+        requests: dict[str, tuple[str, str]] = {}
+        for variant, sdk_arg, build_arg in (
+            ("version1", "sisdkv1", "v1build"),
+            ("version2", "sisdkv2", "v2build"),
+        ):
+            version = str(getattr(parsed, sdk_arg, "") or diff.get(sdk_arg, "")).strip()
+            build = str(getattr(parsed, build_arg, "") or diff.get(build_arg, "")).strip()
+            if not version:
+                cli_option = "--sisdkv1" if variant == "version1" else "--sisdkv2"
+                raise RuntimeError(
+                    "cms BUILD --diff --artifactory requires both SDK releases; "
+                    f"provide {cli_option} or diff.{sdk_arg} in cms_client_config.json"
+                )
+            if not build:
+                cli_option = "--v1build" if variant == "version1" else "--v2build"
+                raise RuntimeError(
+                    "cms BUILD --diff --artifactory requires a build number for each SDK; "
+                    f"provide {cli_option} or diff.{build_arg} in cms_client_config.json"
+                )
+            if not re.fullmatch(r"\d{4}\.\d+", version):
+                raise RuntimeError(f"{sdk_arg} must use the SiSDK release format YYYY.MM")
+            if not build.isdecimal():
+                raise RuntimeError(f"{build_arg} must be a numeric Artifactory build number")
+            requests[variant] = (version, build)
+
+        for variant in ("version1", "version2"):
+            version, build = requests[variant]
+            selections[variant] = resolve_artifactory_sdk_selection(
+                version,
+                build,
+                fallback_to_latest=True,
+            )
+        return selections
+
     for variant in ("version1", "version2"):
         path = str(diff.get(f"sisdk_{variant}_path", "")).strip()
         if not path:
@@ -404,22 +458,44 @@ def resolve_sdk_selection(
     return selection
 
 
-def resolve_artifactory_sdk_selection(version: str, build: str) -> SDKSelection:
+def resolve_artifactory_sdk_selection(
+    version: str,
+    build: str = "",
+    *,
+    fallback_to_latest: bool = False,
+) -> SDKSelection:
     """Download and prepare one configured Artifactory SDK build in the stable cache."""
 
     version = version.strip()
     build = build.strip()
-    if not version or not build:
-        raise RuntimeError("Artifactory SDK selection requires both version and build")
+    if not version:
+        raise RuntimeError("Artifactory SDK selection requires a SiSDK release")
     if not re.fullmatch(r"\d{4}\.\d+", version):
-        raise RuntimeError("artifactory.version must use the SiSDK release format YYYY.MM")
-    if not build.isdecimal():
+        raise RuntimeError("SiSDK release must use the format YYYY.MM")
+    if build and not build.isdecimal():
         raise RuntimeError("artifactory.build must be a numeric Artifactory build number")
+    if not build:
+        raise RuntimeError("Artifactory SDK selection requires a build number")
 
     try:
-        archive = download_sdk(version, DEFAULT_OUTPUT_ROOT, build)
+        if fallback_to_latest:
+            archive = download_sdk(
+                version,
+                DEFAULT_OUTPUT_ROOT,
+                build or None,
+                fallback_to_latest=True,
+            )
+        else:
+            archive = download_sdk(version, DEFAULT_OUTPUT_ROOT, build)
     except ArtifactoryError as error:
-        raise RuntimeError(f"Could not obtain SiSDK {version} build {build}: {error}") from error
+        requested = f" build {build}" if build else ""
+        raise RuntimeError(f"Could not obtain SiSDK {version}{requested}: {error}") from error
+
+    selected_build = archive.parent.name
+    if not selected_build.isdecimal():
+        raise RuntimeError(
+            f"Artifactory returned an invalid build directory for SiSDK {version}: {selected_build!r}"
+        )
 
     package_path = archive.parent / "package"
     if not package_path.exists():
@@ -440,7 +516,7 @@ def resolve_artifactory_sdk_selection(version: str, build: str) -> SDKSelection:
                 total_bytes = sum(member.file_size for member in members if not member.is_dir())
                 with tqdm(
                     total=total_bytes,
-                    desc=f"Extracting SiSDK {version} build {build}",
+                    desc=f"Extracting SiSDK {version} build {selected_build}",
                     unit="B",
                     unit_scale=True,
                     unit_divisor=1024,
@@ -463,6 +539,12 @@ def resolve_artifactory_sdk_selection(version: str, build: str) -> SDKSelection:
                     "Downloaded SiSDK package version does not match the Artifactory release: "
                     f"requested={version}, archive={staged_version}"
                 )
+            staged_build_number = _sisdk_build_number_from_package(staging_path)
+            if staged_build_number != selected_build:
+                raise RuntimeError(
+                    "Downloaded SiSDK package build number does not match the Artifactory build: "
+                    f"requested={selected_build}, archive={staged_build_number}"
+                )
             if not (staging_path / SL_BT_XAPI_PATH).is_file():
                 raise RuntimeError(
                     f"Downloaded SiSDK '{version}' cannot find `sl_bt.xapi` under {staging_path}"
@@ -482,16 +564,22 @@ def resolve_artifactory_sdk_selection(version: str, build: str) -> SDKSelection:
             "Cached SiSDK package version does not match the Artifactory release: "
             f"requested={version}, cache={selection.version}"
         )
+    if selection.build_number != selected_build:
+        raise RuntimeError(
+            "Cached SiSDK package build number does not match the Artifactory build: "
+            f"requested={selected_build}, cache={selection.build_number}"
+        )
     return SDKSelection(
         path=selection.path,
         version=selection.version,
         source=selection.source,
+        build_number=selection.build_number,
         commit=selection.commit,
         sdk_hash=selection.sdk_hash,
         xapi_path=selection.xapi_path,
         xapi_hash=selection.xapi_hash,
         artifactory_version=version,
-        artifactory_build=build,
+        artifactory_build=selected_build,
         archive_path=archive.resolve(),
         archive_sha256=_sha256(archive),
     )
@@ -971,6 +1059,7 @@ def write_build_metadata(
         "sdk": {
             "source": sdk_selection.source if sdk_selection else "",
             "version": firmware_cfg["sisdk"],
+            "build_number": sdk_selection.build_number if sdk_selection else "",
             "artifactory_version": sdk_selection.artifactory_version if sdk_selection else "",
             "artifactory_build": sdk_selection.artifactory_build if sdk_selection else "",
             "archive_path": str(sdk_selection.archive_path or "") if sdk_selection else "",
@@ -1044,6 +1133,7 @@ def write_fw_data(
         "sdk": {
             "source": sdk_selection.source if sdk_selection else "",
             "version": firmware_cfg["sisdk"],
+            "build_number": sdk_selection.build_number if sdk_selection else "",
             "artifactory_version": sdk_selection.artifactory_version if sdk_selection else "",
             "artifactory_build": sdk_selection.artifactory_build if sdk_selection else "",
             "archive_path": str(sdk_selection.archive_path or "") if sdk_selection else "",
@@ -1365,13 +1455,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--artifactory",
         action="store_true",
-        help="obtain the SDK specified by artifactory.version and artifactory.build",
+        help=(
+            "obtain SDK builds from Artifactory; --diff requires a release and "
+            "build number for each variant"
+        ),
     )
     parser.add_argument(
         "--diff",
         action="store_true",
         help="build configured version1 and version2 SiSDK packages in isolated roots",
     )
+    parser.add_argument("--sisdkv1", default="", help="SiSDK release for differential variant version1")
+    parser.add_argument("--v1build", default="", help="Artifactory build number for differential variant version1")
+    parser.add_argument("--sisdkv2", "--sisdk2", dest="sisdkv2", default="", help="SiSDK release for differential variant version2")
+    parser.add_argument("--v2build", default="", help="Artifactory build number for differential variant version2")
     parser.add_argument("--sisdk-version", default="", help="override selected SiSDK version")
     parser.add_argument(
         "--build-number",
@@ -1547,7 +1644,7 @@ def build_diff_variants(
         raise RuntimeError("cms BUILD --diff does not support clean; remove one named variant root explicitly")
     if parsed.action not in {"build", "rebuild"}:
         raise RuntimeError("cms BUILD --diff supports only build or rebuild actions")
-    selections = resolve_diff_sdk_selections(client_config)
+    selections = resolve_diff_sdk_selections(client_config, parsed)
     print("Differential SDK provenance:")
     print(
         json.dumps(
@@ -1564,6 +1661,7 @@ def build_diff_variants(
         variant_values = vars(parsed).copy()
         variant_values.update(
             diff=False,
+            artifactory=False,
             sdk_package_path=str(selection.path),
             sisdk_version=selection.version,
             build_root=str(build_root / "diff" / variant),
@@ -1594,17 +1692,26 @@ def build_diff_variants(
 
 def main(argv: list[str] | None = None) -> int:
     parsed = parse_args(list(argv if argv is not None else sys.argv[1:]))
+    has_diff_selection = any(
+        getattr(parsed, name, "")
+        for name in ("sisdkv1", "v1build", "sisdkv2", "v2build")
+    )
+    if has_diff_selection and not (parsed.artifactory and parsed.diff):
+        raise RuntimeError("--sisdkv1/--sisdkv2/--v1build/--v2build require --diff --artifactory")
     if parsed.build_number and not parsed.artifactory:
         raise RuntimeError("--build-number can only be used with --artifactory")
     if parsed.artifactory and parsed.sdk_package_path:
         raise RuntimeError("--artifactory cannot be combined with --sdk-package-path")
-    if parsed.artifactory and parsed.diff:
-        raise RuntimeError("--artifactory cannot be combined with --diff")
+    if parsed.artifactory and parsed.diff and (parsed.sisdk_version or parsed.build_number):
+        raise RuntimeError(
+            "--sisdk-version and --build-number cannot be combined with --diff; "
+            "use --sisdkv1/--v1build and --sisdkv2/--v2build"
+        )
     if parsed.artifactory and parsed.action == "clean":
         raise RuntimeError("clean does not use --artifactory")
     config_path = Path(parsed.config) if parsed.config else None
     client_config = read_client_config(config_path)
-    if parsed.artifactory:
+    if parsed.artifactory and not parsed.diff:
         artifactory = client_config.get("artifactory", {})
         artifactory = artifactory if isinstance(artifactory, dict) else {}
         version = str(parsed.sisdk_version or artifactory.get("version", "")).strip()

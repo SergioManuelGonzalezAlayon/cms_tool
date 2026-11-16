@@ -138,7 +138,12 @@ def list_builds(version: str) -> list[str]:
     return [name for _, name in builds]
 
 
-def find_build(version: str, requested_build: str | None = None) -> str:
+def find_build(
+    version: str,
+    requested_build: str | None = None,
+    *,
+    fallback_to_latest: bool = False,
+) -> str:
     builds = list_builds(version)
     if not builds:
         raise ArtifactoryError(
@@ -148,6 +153,13 @@ def find_build(version: str, requested_build: str | None = None) -> str:
     if requested_build is None:
         return builds[-1]
     if requested_build not in builds:
+        if fallback_to_latest:
+            latest_build = builds[-1]
+            print(
+                f"SiSDK {version} build {requested_build} was not found; "
+                f"using latest available build {latest_build}."
+            )
+            return latest_build
         raise ArtifactoryError(
             f"Build {requested_build} was not found for SiSDK {version} in Artifactory."
         )
@@ -251,8 +263,18 @@ def validate_archive(archive: Path) -> None:
         raise ArtifactoryError("The downloaded SDK file is not a valid ZIP archive.") from error
 
 
-def download_sdk(version: str, output_root: Path, requested_build: str | None = None) -> Path:
-    build = find_build(version, requested_build)
+def download_sdk(
+    version: str,
+    output_root: Path,
+    requested_build: str | None = None,
+    *,
+    fallback_to_latest: bool = False,
+) -> Path:
+    build = find_build(
+        version,
+        requested_build,
+        fallback_to_latest=fallback_to_latest,
+    )
     build_path = f"sisdk-{version}/{build}"
     archive_path = f"{build_path}/{ARCHIVE_NAME}"
     destination = output_root / version / build / ARCHIVE_NAME

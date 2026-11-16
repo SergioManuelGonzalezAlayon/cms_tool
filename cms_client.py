@@ -1517,16 +1517,23 @@ def build_cli_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--artifactory",
         action="store_true",
-        help="use artifactory.version and artifactory.build from cms_client_config.json",
+        help=(
+            "use Artifactory SDK builds configured in cms_client_config.json; "
+            "--diff requires a release and build number for each variant"
+        ),
     )
     build.add_argument("--build-root", default="", help="override firmware build root")
     build.add_argument(
         "--diff",
         action="store_true",
         help=(
-            "build configured version1 and version2 SiSDK packages in isolated diff roots"
+            "build version1 and version2 SiSDK packages in isolated diff roots"
         ),
     )
+    build.add_argument("--sisdkv1", default="", help="SiSDK release for differential variant version1")
+    build.add_argument("--v1build", default="", help="Artifactory build number for differential variant version1")
+    build.add_argument("--sisdkv2", "--sisdk2", dest="sisdkv2", default="", help="SiSDK release for differential variant version2")
+    build.add_argument("--v2build", default="", help="Artifactory build number for differential variant version2")
     _add_bench_endpoint_arguments(build)
 
     send_fw = subparsers.add_parser(
@@ -2578,11 +2585,17 @@ def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
     is_diff = bool(getattr(args, "diff", False))
     use_artifactory = bool(getattr(args, "artifactory", False))
     build_number_override = str(getattr(args, "build_number", "") or "")
+    diff_options = {
+        "sisdkv1": str(getattr(args, "sisdkv1", "") or "").strip(),
+        "v1build": str(getattr(args, "v1build", "") or "").strip(),
+        "sisdkv2": str(getattr(args, "sisdkv2", "") or "").strip(),
+        "v2build": str(getattr(args, "v2build", "") or "").strip(),
+    }
+    if any(diff_options.values()) and not (is_diff and use_artifactory):
+        raise RuntimeError("--sisdkv1/--sisdkv2/--v1build/--v2build require --diff --artifactory")
     if build_number_override and not use_artifactory:
         raise RuntimeError("--build-number can only be used with --artifactory")
     if use_artifactory:
-        if is_diff:
-            raise RuntimeError("cms BUILD --artifactory cannot be combined with --diff")
         if args.sdk_package_path:
             raise RuntimeError(
                 "cms BUILD --artifactory cannot be combined with --sdk-package-path; "
@@ -2590,19 +2603,57 @@ def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
             )
         if args.action == "clean":
             raise RuntimeError("cms BUILD clean does not use --artifactory")
-        artifactory = load_client_config(config_path).artifactory or {}
-        version = str(getattr(args, "sisdk_version", "") or artifactory.get("version", "")).strip()
-        build_number = build_number_override or artifactory.get("build", "").strip()
-        if not version or not build_number:
-            raise RuntimeError(
-                "cms BUILD --artifactory requires artifactory.version and "
-                "artifactory.build in cms_client_config.json"
+        client_config = load_client_config(config_path)
+        if is_diff:
+            if getattr(args, "sisdk_version", "") or build_number_override:
+                raise RuntimeError(
+                    "--sisdk-version and --build-number cannot be combined with --diff; "
+                    "use per-variant --sisdkv1/--v1build and --sisdkv2/--v2build"
+                )
+            diff_config = client_config.diff or {}
+            resolved = {
+                key: value or str(diff_config.get(key, "")).strip()
+                for key, value in diff_options.items()
+            }
+            for release_key, build_key, release_option, build_option in (
+                ("sisdkv1", "v1build", "--sisdkv1", "--v1build"),
+                ("sisdkv2", "v2build", "--sisdkv2/--sisdk2", "--v2build"),
+            ):
+                release = resolved[release_key]
+                build_number = resolved[build_key]
+                if not release:
+                    raise RuntimeError(
+                        "cms BUILD --diff --artifactory requires both SDK releases; "
+                        f"provide {release_option} or diff.{release_key} in cms_client_config.json"
+                    )
+                if not re.fullmatch(r"\d{4}\.\d+", release):
+                    raise RuntimeError(f"{release_option} must use the SiSDK release format YYYY.MM")
+                if not build_number:
+                    raise RuntimeError(
+                        "cms BUILD --diff --artifactory requires a build number for each SDK; "
+                        f"provide {build_option} or diff.{build_key} in cms_client_config.json"
+                    )
+                if not build_number.isdecimal():
+                    raise RuntimeError(f"{build_option} must be a numeric Artifactory build number")
+            print(
+                "Using differential SiSDK builds from Artifactory: "
+                f"version1={resolved['sisdkv1']} build1={resolved['v1build']}, "
+                f"version2={resolved['sisdkv2']} build2={resolved['v2build']}"
             )
-        if not re.fullmatch(r"\d{4}\.\d+", version):
-            raise RuntimeError("artifactory.version must use the SiSDK release format YYYY.MM")
-        if not build_number.isdecimal():
-            raise RuntimeError("artifactory.build must be a numeric Artifactory build number")
-        print(f"Using SiSDK from Artifactory: version={version} build={build_number}")
+        else:
+            artifactory = client_config.artifactory or {}
+            version = str(getattr(args, "sisdk_version", "") or artifactory.get("version", "")).strip()
+            build_number = build_number_override or str(artifactory.get("build", "")).strip()
+            if not version or not build_number:
+                raise RuntimeError(
+                    "cms BUILD --artifactory requires artifactory.version and "
+                    "artifactory.build in cms_client_config.json"
+                )
+            if not re.fullmatch(r"\d{4}\.\d+", version):
+                raise RuntimeError("artifactory.version must use the SiSDK release format YYYY.MM")
+            if not build_number.isdecimal():
+                raise RuntimeError("artifactory.build must be a numeric Artifactory build number")
+            print(f"Using SiSDK from Artifactory: version={version} build={build_number}")
     elif not is_diff:
         _sync_config_sisdk_version(config_path, args.sdk_package_path)
     cmd = [sys.executable, str(Path("apps") / "app_manager.py"), args.action, *args.targets]
@@ -2615,6 +2666,10 @@ def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
         ("--sdk-package-path", args.sdk_package_path),
         ("--sisdk-version", getattr(args, "sisdk_version", "")),
         ("--build-number", build_number_override),
+        ("--sisdkv1", diff_options["sisdkv1"]),
+        ("--v1build", diff_options["v1build"]),
+        ("--sisdkv2", diff_options["sisdkv2"]),
+        ("--v2build", diff_options["v2build"]),
         ("--device", getattr(args, "device", "")),
         ("--build-root", args.build_root),
     ):

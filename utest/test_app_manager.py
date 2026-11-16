@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from apps import app_manager
+from apps import app_manager, sisdk_manager
 from utils import config_loader
 
 
@@ -214,8 +214,18 @@ def test_select_app_build_targets_maps_legacy_role_targets_to_profiles() -> None
     ) == (["tester"], True)
 
 
+@pytest.mark.parametrize(
+    ("sdk_version", "expected_config"),
+    [
+        ("2025.12.3", "sisdk2025.12.json"),
+        ("2026.12.0", "sisdk2026.12.json"),
+    ],
+)
 def test_run_firmware_action_uses_selected_release_config_and_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sdk_version: str,
+    expected_config: str,
 ) -> None:
     sdk_path = tmp_path / "sisdk"
     sdk_slcp = sdk_path / "bluetooth_le_app" / "example" / "bt_ncp" / "bt_ncp.slcp"
@@ -223,7 +233,7 @@ def test_run_firmware_action_uses_selected_release_config_and_profile(
     sdk_slcp.write_text("project", encoding="utf-8")
     selection = app_manager.SDKSelection(
         path=sdk_path,
-        version="2026.12.0",
+        version=sdk_version,
         source="test",
     )
     captured_profiles = []
@@ -265,7 +275,7 @@ def test_run_firmware_action_uses_selected_release_config_and_profile(
             "board": "BRD4182A_B06",
             "brev": "B06",
             "device": "EFR32MG22C224F512IM40-C",
-            "sisdk": "2026.12.0",
+            "sisdk": sdk_version,
         }
     }
 
@@ -276,7 +286,7 @@ def test_run_firmware_action_uses_selected_release_config_and_profile(
     assert slcp == sdk_slcp
     assert kwargs["profile_name"] == "dut_dcdc"
     assert kwargs["prs_configuration"] == "brd4182a"
-    assert kwargs["app_config_path"].name == "sisdk2026.12.json"
+    assert kwargs["app_config_path"].name == expected_config
 
 
 def test_resolve_sdk_selection_prefers_cli_then_config(
@@ -291,6 +301,7 @@ def test_resolve_sdk_selection_prefers_cli_then_config(
             "id=com.silabs.sdk.stack.sisdk\nversion=2026.1.0\n",
             encoding="utf-8",
         )
+        (sdk / ".build-number").write_text("1357\n", encoding="utf-8")
         return sdk
 
     cli_sdk = make_sdk("cli")
@@ -305,6 +316,7 @@ def test_resolve_sdk_selection_prefers_cli_then_config(
     )
     assert (cli.path, cli.source) == (cli_sdk.resolve(), "cli_package_path")
     assert (configured.path, configured.source) == (config_sdk.resolve(), "client_config_package_path")
+    assert cli.build_number == configured.build_number == "1357"
     assert cli.commit == cli.sdk_hash == "sdk-commit"
     assert cli.xapi_hash == app_manager._sha256(cli_sdk / app_manager.SL_BT_XAPI_PATH)
 
@@ -325,24 +337,116 @@ def test_resolve_sdk_selection_rejects_a_properties_version_mismatch(tmp_path: P
     xapi.parent.mkdir(parents=True)
     xapi.write_bytes(b"xapi")
     (sdk / ".properties").write_text("version=2025.12.3\n", encoding="utf-8")
+    (sdk / ".build-number").write_text("1357\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="target.sisdk=2026.1.0"):
         app_manager.resolve_sdk_selection(version="2026.1.0", cli_package_path=str(sdk))
 
 
+@pytest.mark.parametrize("build_number", [None, "build-1357", ""])
+def test_inspect_sdk_selection_rejects_missing_or_invalid_build_number(
+    tmp_path: Path, build_number: str | None
+) -> None:
+    sdk = tmp_path / "sdk"
+    xapi = sdk / app_manager.SL_BT_XAPI_PATH
+    xapi.parent.mkdir(parents=True)
+    xapi.write_bytes(b"xapi")
+    (sdk / ".properties").write_text("version=2026.12.0\n", encoding="utf-8")
+    if build_number is not None:
+        (sdk / ".build-number").write_text(build_number, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=r"\.build-number"):
+        app_manager.inspect_sdk_selection(sdk, source="test")
+
+
+def test_resolve_artifactory_sdk_selection_rejects_cached_build_number_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "2026.12" / "1357" / "gecko-sdk.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"archive")
+    (archive.parent / "package").mkdir()
+    monkeypatch.setattr(app_manager, "download_sdk", lambda version, output, build: archive)
+    monkeypatch.setattr(
+        app_manager,
+        "inspect_sdk_selection",
+        lambda path, *, source, include_git_commit=True: app_manager.SDKSelection(
+            path=path,
+            version="2026.12.0",
+            source=source,
+            build_number="1200",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Cached SiSDK package build number"):
+        app_manager.resolve_artifactory_sdk_selection("2026.12", "1357")
+
+
+def test_resolve_artifactory_sdk_selection_records_fallback_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = tmp_path / "2026.12" / "2000" / "gecko-sdk.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"archive")
+    package_path = archive.parent / "package"
+    package_path.mkdir()
+    calls = []
+
+    def fake_download(version, output_root, requested_build, *, fallback_to_latest):
+        calls.append((version, requested_build, fallback_to_latest))
+        return archive
+
+    monkeypatch.setattr(app_manager, "download_sdk", fake_download)
+    monkeypatch.setattr(
+        app_manager,
+        "inspect_sdk_selection",
+        lambda path, *, source, include_git_commit=True: app_manager.SDKSelection(
+            path=path,
+            version="2026.12.0",
+            source=source,
+            build_number="2000",
+        ),
+    )
+
+    selection = app_manager.resolve_artifactory_sdk_selection(
+        "2026.12", "1357", fallback_to_latest=True
+    )
+
+    assert calls == [("2026.12", "1357", True)]
+    assert selection.build_number == "2000"
+    assert selection.artifactory_build == "2000"
+    assert selection.archive_path == archive.resolve()
+
+
+def test_resolve_artifactory_sdk_selection_does_not_default_missing_diff_build() -> None:
+    with pytest.raises(RuntimeError, match="requires a build number"):
+        app_manager.resolve_artifactory_sdk_selection(
+            "2026.12", fallback_to_latest=True
+        )
+
+
+def test_find_build_falls_back_only_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sisdk_manager, "list_builds", lambda version: ["1000", "2000"])
+
+    assert sisdk_manager.find_build("2026.12", "1357", fallback_to_latest=True) == "2000"
+    with pytest.raises(sisdk_manager.ArtifactoryError, match="Build 1357 was not found"):
+        sisdk_manager.find_build("2026.12", "1357")
+
+
 def test_resolve_diff_sdk_selections_records_each_variant_provenance(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def make_sdk(name: str, version: str) -> Path:
+    def make_sdk(name: str, version: str, build_number: str) -> Path:
         sdk = tmp_path / name
         xapi = sdk / app_manager.SL_BT_XAPI_PATH
         xapi.parent.mkdir(parents=True)
         xapi.write_bytes(name.encode())
         (sdk / ".properties").write_text(f"version={version}\n", encoding="utf-8")
+        (sdk / ".build-number").write_text(f"{build_number}\n", encoding="utf-8")
         return sdk
 
-    version1 = make_sdk("version1", "2025.12.3")
-    version2 = make_sdk("version2", "2026.1.0")
+    version1 = make_sdk("version1", "2025.12.3", "1200")
+    version2 = make_sdk("version2", "2026.12.0", "1357")
     monkeypatch.setattr(
         app_manager,
         "_sdk_git_commit",
@@ -358,11 +462,13 @@ def test_resolve_diff_sdk_selections_records_each_variant_provenance(
         }
     )
 
-    assert selections["version2"].version == "2026.1.0"
+    assert selections["version2"].version == "2026.12.0"
+    assert selections["version2"].build_number == "1357"
     assert selections["version2"].source == "client_config_diff_version2_path"
     assert app_manager.sdk_selection_provenance(selections["version2"]) == {
         "source": "client_config_diff_version2_path",
-        "version": "2026.1.0",
+        "version": "2026.12.0",
+        "build_number": "1357",
         "package_path": str(version2.resolve()),
         "commit": "commit-version2",
         "hash": "commit-version2",
@@ -374,7 +480,76 @@ def test_resolve_diff_sdk_selections_records_each_variant_provenance(
         "archive_sha256": "",
     }
     assert selections["version1"].version == "2025.12.3"
+    assert selections["version1"].build_number == "1200"
     assert selections["version1"].xapi_path == version1 / app_manager.SL_BT_XAPI_PATH
+
+
+def test_resolve_artifactory_diff_selections_merge_cli_over_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str, bool]] = []
+
+    def fake_resolve(version: str, build: str, *, fallback_to_latest: bool):
+        calls.append((version, build, fallback_to_latest))
+        return app_manager.SDKSelection(
+            path=Path(version),
+            version=f"{version}.0",
+            source="artifactory",
+            build_number=build,
+            artifactory_version=version,
+            artifactory_build=build,
+        )
+
+    monkeypatch.setattr(app_manager, "resolve_artifactory_sdk_selection", fake_resolve)
+    parsed = app_manager.parse_args(
+        [
+            "build", "--diff", "--artifactory",
+            "--sisdkv1", "2026.1", "--v1build", "1234",
+            "--sisdk2", "2026.12",
+        ]
+    )
+
+    selections = app_manager.resolve_diff_sdk_selections(
+        {
+            "diff": {
+                "sisdkv1": "2025.12",
+                "v1build": "1000",
+                "sisdkv2": "2025.6",
+                "v2build": "5678",
+            }
+        },
+        parsed,
+    )
+
+    assert calls == [
+        ("2026.1", "1234", True),
+        ("2026.12", "5678", True),
+    ]
+    assert selections["version1"].artifactory_build == "1234"
+    assert selections["version2"].artifactory_version == "2026.12"
+
+
+@pytest.mark.parametrize(
+    ("diff", "message"),
+    [
+        ({"sisdkv1": "2025.12", "v1build": "1200", "v2build": "1357"}, "sisdkv2"),
+        ({"sisdkv1": "2025.12", "sisdkv2": "2026.12", "v1build": "1200"}, "v2build"),
+    ],
+)
+def test_resolve_artifactory_diff_selections_requires_each_release_and_build(
+    diff: dict[str, str], message: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app_manager,
+        "resolve_artifactory_sdk_selection",
+        lambda version, build, *, fallback_to_latest: app_manager.SDKSelection(
+            path=Path(version), version=f"{version}.0", source="artifactory", build_number=build
+        ),
+    )
+    parsed = app_manager.parse_args(["build", "--diff", "--artifactory"])
+
+    with pytest.raises(RuntimeError, match=message):
+        app_manager.resolve_diff_sdk_selections({"diff": diff}, parsed)
 
 
 @pytest.mark.parametrize(
@@ -400,6 +575,7 @@ def test_resolve_diff_sdk_selections_rejects_missing_xapi(tmp_path: Path) -> Non
     for sdk in (version1, version2):
         sdk.mkdir()
         (sdk / ".properties").write_text("version=2026.1.0\n", encoding="utf-8")
+        (sdk / ".build-number").write_text("1357\n", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="cannot find `sl_bt.xapi`"):
         app_manager.resolve_diff_sdk_selections(
@@ -423,17 +599,23 @@ def test_build_diff_variants_uses_isolated_roots_and_sdk_configuration(
             path=version1_sdk,
             version="2025.12.3",
             source="client_config_diff_version1_path",
+            build_number="1200",
         ),
         "version2": app_manager.SDKSelection(
             path=version2_sdk,
-            version="2026.1.0",
+            version="2026.12.0",
             source="client_config_diff_version2_path",
+            build_number="1357",
         ),
     }
     captured: list[tuple[argparse.Namespace, dict, Path, app_manager.SDKSelection, frozenset[str]]] = []
     manifest_calls: list[dict] = []
 
-    monkeypatch.setattr(app_manager, "resolve_diff_sdk_selections", lambda config: selections)
+    monkeypatch.setattr(
+        app_manager,
+        "resolve_diff_sdk_selections",
+        lambda config, parsed=None: selections,
+    )
     monkeypatch.setattr(
         app_manager,
         "run_firmware_action",
@@ -462,8 +644,9 @@ def test_build_diff_variants_uses_isolated_roots_and_sdk_configuration(
     ]
     assert [config["firmware"]["sisdk"] for _, config, _, _, _ in captured] == [
         "2025.12.3",
-        "2026.1.0",
+        "2026.12.0",
     ]
+    assert [selection.build_number for _, _, _, selection, _ in captured] == ["1200", "1357"]
     assert [config["firmware"]["sisdk_package_path"] for _, config, _, _, _ in captured] == [
         str(version1_sdk),
         str(version2_sdk),
@@ -764,10 +947,8 @@ def test_process_slcp_upgrade_keeps_explicit_upgrade_action(
     assert result["image"] == ""
 
 
-def test_write_build_metadata_records_firmware_and_artifacts() -> None:
-    out_dir = Path("build/test_write_build_metadata/demo")
-    if out_dir.parent.exists():
-        shutil.rmtree(out_dir.parent)
+def test_write_build_metadata_records_firmware_and_artifacts(tmp_path: Path) -> None:
+    out_dir = tmp_path / "test_write_build_metadata" / "demo"
     artifact_dir = out_dir / "cmake_gcc" / "build" / "base"
     artifact_dir.mkdir(parents=True)
     image = artifact_dir / "demo.s37"
@@ -781,6 +962,7 @@ def test_write_build_metadata_records_firmware_and_artifacts() -> None:
         path=sdk_path,
         version="2026.0.0",
         source="client_config_package_path",
+        build_number="1357",
         commit="sdk-commit",
         sdk_hash="sdk-hash",
         xapi_hash="xapi-hash",
@@ -814,6 +996,7 @@ def test_write_build_metadata_records_firmware_and_artifacts() -> None:
     assert metadata["sdk"] == {
         "source": "client_config_package_path",
         "version": "2026.0.0",
+        "build_number": "1357",
         "package_path": str(sdk_path.resolve()),
         "commit": "sdk-commit",
         "hash": "sdk-hash",
@@ -826,10 +1009,8 @@ def test_write_build_metadata_records_firmware_and_artifacts() -> None:
     assert {artifact["name"] for artifact in metadata["artifacts"]} == {"demo.s37", "demo.hex", "demo.map"}
 
 
-def test_write_fw_data_records_firmware_identity_and_role_hashes() -> None:
-    build_root = Path("build/test_write_fw_data")
-    if build_root.exists():
-        shutil.rmtree(build_root)
+def test_write_fw_data_records_firmware_identity_and_role_hashes(tmp_path: Path) -> None:
+    build_root = tmp_path / "test_write_fw_data"
     bootloader_out_dir = build_root / "bootloader-uart-bgapi"
     bootloader_dir = bootloader_out_dir / "cmake_gcc" / "build" / "base"
     bootloader_dir.mkdir(parents=True)
@@ -859,6 +1040,7 @@ def test_write_fw_data_records_firmware_identity_and_role_hashes() -> None:
         path=sdk_path,
         version="2026.0.0",
         source="slt",
+        build_number="1357",
         commit="sdk-commit",
         sdk_hash="sdk-hash",
         xapi_path=sdk_path / app_manager.SL_BT_XAPI_PATH,
@@ -944,6 +1126,7 @@ def test_write_fw_data_records_firmware_identity_and_role_hashes() -> None:
     assert fw_data["sdk"] == {
         "source": "slt",
         "version": "2026.0.0",
+        "build_number": "1357",
         "package_path": str(sdk_path.resolve()),
         "commit": "sdk-commit",
         "hash": "sdk-hash",
@@ -1020,7 +1203,10 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
     target = {"board": "brd4182a", "board_rev": "a06", "device": "EFR32MG22C224F512IM40"}
     roles = sorted(app_manager.REQUIRED_DIFF_FIRMWARE_ROLES)
     selections: dict[str, app_manager.SDKSelection] = {}
-    for variant, version in (("version1", "2025.12.3"), ("version2", "2026.1.0")):
+    for variant, version, build_number in (
+        ("version1", "2025.12.3", "1200"),
+        ("version2", "2026.12.0", "1357"),
+    ):
         variant_root = build_root / "diff" / variant
         variant_root.mkdir(parents=True)
         sdk_path = tmp_path / f"{variant}-sdk"
@@ -1029,6 +1215,7 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
             path=sdk_path,
             version=version,
             source=f"client_config_diff_{variant}_path",
+            build_number=build_number,
             commit=f"{variant}-commit",
             sdk_hash=f"{variant}-commit",
             xapi_path=xapi_path,
@@ -1044,7 +1231,7 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
                         "artifacts": [{"role": role} for role in roles],
                     },
                     "build": {"root": str(variant_root)},
-                    "sdk": {"version": version},
+                    "sdk": {"version": version, "build_number": build_number},
                 }
             ),
             encoding="utf-8",
@@ -1066,6 +1253,8 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
         build_root / "diff" / "version2" / app_manager.FW_DATA_FILENAME
     )
     assert manifest["variants"]["version1"]["sdk"]["version"] == "2025.12.3"
+    assert manifest["variants"]["version1"]["sdk"]["build_number"] == "1200"
+    assert manifest["variants"]["version2"]["sdk"]["build_number"] == "1357"
 
 
 def test_write_fw_data_records_resolved_vcom_metadata() -> None:

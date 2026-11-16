@@ -549,6 +549,21 @@ def test_build_parser_accepts_diff_preflight():
     assert args.diff is True
 
 
+def test_build_parser_accepts_per_variant_artifactory_options():
+    args = build_cli_parser().parse_args(
+        [
+            "BUILD", "--diff", "--artifactory",
+            "--sisdkv1", "2025.12", "--v1build", "1200",
+            "--sisdk2", "2026.12", "--v2build", "1357",
+        ]
+    )
+
+    assert args.sisdkv1 == "2025.12"
+    assert args.v1build == "1200"
+    assert args.sisdkv2 == "2026.12"
+    assert args.v2build == "1357"
+
+
 def test_build_parser_accepts_sdk_profile_and_artifactory_overrides():
     args = build_cli_parser().parse_args(
         [
@@ -603,6 +618,59 @@ def test_artifactory_build_forwards_sdk_and_device_profile_overrides(tmp_path, m
     assert command[command.index("--sisdk-version") + 1] == "2026.12"
     assert command[command.index("--build-number") + 1] == "1357"
     assert command[command.index("--device") + 1] == "dut_dcdc"
+
+
+def test_artifactory_diff_requires_both_build_numbers_from_cli_or_config(
+    tmp_path,
+) -> None:
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps({"diff": {"sisdkv1": "2025.12", "sisdkv2": "2026.12", "v1build": "1200"}}),
+        encoding="utf-8",
+    )
+    args = build_cli_parser().parse_args(["BUILD", "--diff", "--artifactory"])
+
+    with pytest.raises(RuntimeError, match="--v2build or diff.v2build"):
+        _run_local_build(args, str(config_path))
+
+
+def test_artifactory_diff_forwards_cli_overrides_and_uses_config_fallbacks(
+    tmp_path, monkeypatch
+):
+    config_path = tmp_path / "cms_client_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "artifactory": {"version": "2025.12", "build": "1234"},
+                "diff": {
+                    "sisdkv1": "2025.12",
+                    "v1build": "1200",
+                    "sisdkv2": "2026.12",
+                    "v2build": "1357",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(cms_client.subprocess, "run", fake_run)
+    args = build_cli_parser().parse_args(
+        ["BUILD", "--diff", "--artifactory", "--sisdkv1", "2026.1", "--v1build", "9999"]
+    )
+
+    assert _run_local_build(args, str(config_path)) == 0
+    command = captured["command"]
+    assert "--diff" in command
+    assert "--artifactory" in command
+    assert command[command.index("--sisdkv1") + 1] == "2026.1"
+    assert command[command.index("--v1build") + 1] == "9999"
+    assert "--sisdkv2" not in command
+    assert "--v2build" not in command
 
 
 def test_run_test_sends_requested_run_name_to_daemon():

@@ -40,6 +40,10 @@
     "vcom_supported": true
   },
   "diff": {
+    "sisdkv1": "",
+    "v1build": "",
+    "sisdkv2": "",
+    "v2build": "",
     "sisdk_version2_path": "C:\\path\\to\\child\\sisdk-package",
     "sisdk_version1_path": "C:\\path\\to\\parent\\sisdk-package"
   }
