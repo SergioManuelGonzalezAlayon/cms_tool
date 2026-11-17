@@ -1209,6 +1209,83 @@ def find_built_image(out_dir: Path) -> Path | None:
     return candidates[0]
 
 
+def _build_metadata_inputs(
+    *,
+    slcp: Path,
+    firmware_cfg: dict[str, str],
+    sdk_path: Path,
+    runtime_xapi_path: Path | None,
+    sdk_selection: SDKSelection | None = None,
+    app_configuration: dict | None = None,
+    project_name: str = "",
+) -> dict:
+    inputs = {
+        "project_name": project_name or slcp.stem,
+        "slcp": _relative_to_repo(slcp),
+        "firmware": {
+            "board": firmware_cfg["board"],
+            "brev": firmware_cfg.get("brev", ""),
+            "device": firmware_cfg["device"],
+            "sisdk": firmware_cfg["sisdk"],
+            "sdk_path": str(sdk_path.resolve()),
+        },
+        "sdk": {
+            "source": sdk_selection.source if sdk_selection else "",
+            "version": firmware_cfg["sisdk"],
+            "build_number": sdk_selection.build_number if sdk_selection else "",
+            "artifactory_version": sdk_selection.artifactory_version if sdk_selection else "",
+            "artifactory_build": sdk_selection.artifactory_build if sdk_selection else "",
+            "archive_path": str(sdk_selection.archive_path or "") if sdk_selection else "",
+            "archive_sha256": sdk_selection.archive_sha256 if sdk_selection else "",
+            "package_path": str(sdk_path.resolve()),
+            "commit": sdk_selection.commit if sdk_selection else "",
+            "hash": sdk_selection.sdk_hash if sdk_selection else "",
+            "xapi_sha256": (
+                sdk_selection.xapi_hash
+                if sdk_selection
+                else (
+                    _sha256(runtime_xapi_path)
+                    if runtime_xapi_path and runtime_xapi_path.is_file()
+                    else ""
+                )
+            ),
+        },
+    }
+    if app_configuration is not None:
+        inputs["app_configuration"] = app_configuration
+    return inputs
+
+
+def _build_metadata_matches_inputs(
+    *,
+    out_dir: Path,
+    slcp: Path,
+    firmware_cfg: dict[str, str],
+    sdk_path: Path,
+    runtime_xapi_path: Path | None,
+    sdk_selection: SDKSelection | None,
+    app_configuration: dict,
+    project_name: str,
+) -> bool:
+    metadata_path = out_dir / BUILD_METADATA_FILENAME
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    expected_inputs = _build_metadata_inputs(
+        slcp=slcp,
+        firmware_cfg=firmware_cfg,
+        sdk_path=sdk_path,
+        runtime_xapi_path=runtime_xapi_path,
+        sdk_selection=sdk_selection,
+        app_configuration=app_configuration,
+        project_name=project_name,
+    )
+    return all(metadata.get(key) == value for key, value in expected_inputs.items())
+
+
 def build_project(slcp: Path, *, out_dir: Path, board: str, sdk_path: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     image = find_built_image(out_dir)
@@ -1246,33 +1323,16 @@ def write_build_metadata(
     ]
     metadata = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "project_name": project_name or slcp.stem,
-        "slcp": _relative_to_repo(slcp),
+        **_build_metadata_inputs(
+            slcp=slcp,
+            firmware_cfg=firmware_cfg,
+            sdk_path=sdk_path,
+            runtime_xapi_path=runtime_xapi_path,
+            sdk_selection=sdk_selection,
+            app_configuration=app_configuration,
+            project_name=project_name,
+        ),
         "generated_slcp": _relative_to_repo(out_dir / slcp.name),
-        "firmware": {
-            "board": firmware_cfg["board"],
-            "brev": firmware_cfg.get("brev", ""),
-            "device": firmware_cfg["device"],
-            "sisdk": firmware_cfg["sisdk"],
-            "sdk_path": str(sdk_path.resolve()),
-        },
-        "sdk": {
-            "source": sdk_selection.source if sdk_selection else "",
-            "version": firmware_cfg["sisdk"],
-            "build_number": sdk_selection.build_number if sdk_selection else "",
-            "artifactory_version": sdk_selection.artifactory_version if sdk_selection else "",
-            "artifactory_build": sdk_selection.artifactory_build if sdk_selection else "",
-            "archive_path": str(sdk_selection.archive_path or "") if sdk_selection else "",
-            "archive_sha256": sdk_selection.archive_sha256 if sdk_selection else "",
-            "package_path": str(sdk_path.resolve()),
-            "commit": sdk_selection.commit if sdk_selection else "",
-            "hash": sdk_selection.sdk_hash if sdk_selection else "",
-            "xapi_sha256": (
-                sdk_selection.xapi_hash
-                if sdk_selection
-                else (_sha256(runtime_xapi_path) if runtime_xapi_path and runtime_xapi_path.is_file() else "")
-            ),
-        },
         "selected_image": {
             "name": image.name,
             "path": _relative_to_repo(image),
@@ -1284,8 +1344,6 @@ def write_build_metadata(
     }
     if vcom_metadata is not None:
         metadata["vcom"] = vcom_metadata
-    if app_configuration is not None:
-        metadata["app_configuration"] = app_configuration
     metadata_path = out_dir / BUILD_METADATA_FILENAME
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     return metadata_path
@@ -1624,8 +1682,6 @@ def process_sdk_app_profile(
     project_name = APP_PROFILE_PROJECT_NAMES[profile_name]
     out_dir = build_root / project_name
     started_at = time.perf_counter()
-    if action == "rebuild" and out_dir.exists():
-        shutil.rmtree(out_dir)
 
     slc_options = merge_slc_options(
         app_configuration["board_config"],
@@ -1635,6 +1691,37 @@ def process_sdk_app_profile(
         app_configuration["app_config"],
         profile_config,
     )
+    profile_build_configuration = {
+        "application": app_configuration["app_config"]["application"],
+        "device_profile": profile_name,
+        "board": board_id,
+        "prs_configuration": prs_configuration,
+        "config_file": _relative_to_repo(app_config_path),
+        "slc_options": slc_options,
+        "configuration": configuration,
+        "configuration_conditions": app_configuration["app_config"].get(
+            "configuration_conditions", {}
+        ),
+    }
+
+    if out_dir.exists() and (
+        action == "rebuild"
+        or (
+            action == "build"
+            and not _build_metadata_matches_inputs(
+                out_dir=out_dir,
+                slcp=slcp,
+                firmware_cfg=firmware_cfg,
+                sdk_path=sdk_path,
+                runtime_xapi_path=runtime_xapi_path,
+                sdk_selection=sdk_selection,
+                app_configuration=profile_build_configuration,
+                project_name=project_name,
+            )
+        )
+    ):
+        shutil.rmtree(out_dir)
+
     generate_slcp(
         slcp,
         out_dir=out_dir,
@@ -1661,18 +1748,7 @@ def process_sdk_app_profile(
             sdk_selection=sdk_selection,
             vcom_metadata=vcom_metadata,
             project_name=project_name,
-            app_configuration={
-                "application": app_configuration["app_config"]["application"],
-                "device_profile": profile_name,
-                "board": board_id,
-                "prs_configuration": prs_configuration,
-                "config_file": _relative_to_repo(app_config_path),
-                "slc_options": slc_options,
-                "configuration": configuration,
-                "configuration_conditions": app_configuration["app_config"].get(
-                    "configuration_conditions", {}
-                ),
-            },
+            app_configuration=profile_build_configuration,
         )
 
     return {
