@@ -54,13 +54,34 @@ def open_ble_dev(dev,
                  retry_sleep_s=0.5,
                  boot_event_timeout=5,
                  boot_max_time=10,
-                 awake_event_timeout=5,
-                 awake_max_time=10):
+                 awake_event_timeout=0.2,
+                 awake_max_time=1.0):
     last_error = None
 
     for attempt in range(1, open_retries + 1):
         try:
+            if wakeUp is not None:
+                # Wake before opening BGAPI: a sleeping NCP may not process reboot.
+                wakeUp.setDUTAwake()
+
             dev.open()
+            if wakeUp is not None:
+                try:
+                    bgapi_check_event(
+                        dev,
+                        "system",
+                        "awake",
+                        lambda evt: True,
+                        eventTimeout=awake_event_timeout,
+                        maxTime=awake_max_time,
+                    )
+                except BGAPIEventTimeoutError:
+                    # system.awake is sent when the NCP exits sleep, but not
+                    # necessarily when the wake line is asserted on an awake NCP.
+                    log.debug("No system.awake event; checking whether the NCP is already responsive")
+
+            # A response is also the awake handshake when no awake event is emitted.
+            dev.bt.system.hello()
             dev.bt.system.reboot()
             bgapi_check_event(
                 dev,
@@ -70,17 +91,12 @@ def open_ble_dev(dev,
                 eventTimeout=boot_event_timeout,
                 maxTime=boot_max_time,
             )
-
             if wakeUp is not None:
+                # Reboot resets the NCP wake state; generate a fresh wake edge.
                 wakeUp.setDUTAwake()
-                bgapi_check_event(
-                    dev,
-                    "system",
-                    "awake",
-                    lambda evt: True,
-                    eventTimeout=awake_event_timeout,
-                    maxTime=awake_max_time,
-                )
+            # Wait 200ms before testing the BGAPI traffic.
+            sleep(0.2)
+            dev.bt.system.hello()
 
             if attempt > 1:
                 log.info("BLE open/reset recovered on attempt %d/%d", attempt, open_retries)

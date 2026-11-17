@@ -385,6 +385,8 @@ def test_resolve_artifactory_sdk_selection_rejects_cached_build_number_mismatch(
 def test_resolve_artifactory_sdk_selection_records_fallback_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(app_manager, "DEFAULT_OUTPUT_ROOT", tmp_path / "sdk-cache")
+
     archive = tmp_path / "2026.12" / "2000" / "gecko-sdk.zip"
     archive.parent.mkdir(parents=True)
     archive.write_bytes(b"archive")
