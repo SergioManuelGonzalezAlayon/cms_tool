@@ -18,23 +18,170 @@ import base64
 import hashlib
 import json
 import os
+from enum import Enum, auto
 from pathlib import Path
 import re
 import shutil
 import sys
 import tempfile
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
-import zipfile
 
 
 ARTIFACTORY_ROOT = "https://artifactory.silabs.net/artifactory"
 REPOSITORY = "gsdk-generic-development"
 ARCHIVE_NAME = "gecko-sdk.zip"
+STATUS_FILENAME = "status.json"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / ".fw_build" / "sisdk"
 CHUNK_SIZE = 1024 * 1024
+DOWNLOAD_BUFFER_SIZE = 2 * 1024 * 1024
+SLIDING_WINDOW_MIN_SIZE = 1024 * 1024
+SLIDING_WINDOW_MAX_SIZE = 256 * 1024 * 1024
+SLIDING_WINDOW_N = 6
+
+
+class SlidingWindowStatus(Enum):
+    SUCCESSFUL_EXPAND = auto()
+    SUCCESSFUL_MAINTAIN = auto()
+    FAILED_REDUCE = auto()
+    FAILED_ABORT = auto()
+
+
+def SLIDING_WINDOW_ctrl(
+    current_size: int,
+    previous_size: int,
+    previous_status: SlidingWindowStatus,
+    *,
+    min_size: int = SLIDING_WINDOW_MIN_SIZE,
+    max_size: int = SLIDING_WINDOW_MAX_SIZE,
+) -> int:
+    """Choose the next read size from the outcome of the previous request."""
+    if previous_status is SlidingWindowStatus.SUCCESSFUL_EXPAND:
+        return min(current_size * 2, max_size)
+    if previous_status is SlidingWindowStatus.FAILED_REDUCE:
+        reduced_size = current_size // 2
+        return max(min_size, min(reduced_size, previous_size))
+    return current_size
+
+
+class SlidingWindow:
+    """Adapt read sizes and track throughput in memory for one operation."""
+
+    def __init__(
+        self,
+        initial_size: int,
+        *,
+        min_size: int = SLIDING_WINDOW_MIN_SIZE,
+        max_size: int = SLIDING_WINDOW_MAX_SIZE,
+        n: int = SLIDING_WINDOW_N,
+    ) -> None:
+        self.min_size = max(1, min_size)
+        self.max_size = max(self.min_size, max_size)
+        self.n = max(2, n)
+        self.current_size = self._bounded_size(initial_size)
+        self.previous_size = self.current_size
+        self.previous_status = SlidingWindowStatus.SUCCESSFUL_MAINTAIN
+        self.successful_requests_at_size = 0
+        self.failed_minimum_requests = 0
+        self.total_bytes_read = 0
+        self.total_read_seconds = 0.0
+        self.last_requested_size_bytes = 0
+        self.last_received_bytes = 0
+        self.last_request_seconds = 0.0
+
+    @property
+    def requests_before_expand(self) -> int:
+        return max(1, (self.n + 1) // 2)
+
+    @property
+    def is_aborted(self) -> bool:
+        return self.failed_minimum_requests >= self.n
+
+    def next_size(self) -> int:
+        if self.is_aborted:
+            raise RuntimeError("Sliding window aborted after repeated failures.")
+        return self.current_size
+
+    def record_read_success(
+        self, requested_size: int, received_bytes: int, elapsed_seconds: float
+    ) -> None:
+        """Record bytes and elapsed time for one successful read request."""
+        received_bytes = max(0, received_bytes)
+        elapsed_seconds = max(0.0, elapsed_seconds)
+        self.total_bytes_read += received_bytes
+        self.total_read_seconds += elapsed_seconds
+        self.last_requested_size_bytes = requested_size
+        self.last_received_bytes = received_bytes
+        self.last_request_seconds = elapsed_seconds
+
+    @property
+    def average_read_speed_bytes_per_second(self) -> float:
+        if self.total_read_seconds <= 0:
+            return 0.0
+        return self.total_bytes_read / self.total_read_seconds
+
+    @property
+    def last_request_speed_bytes_per_second(self) -> float:
+        if self.last_request_seconds <= 0:
+            return 0.0
+        return self.last_received_bytes / self.last_request_seconds
+
+    def record_success(self) -> SlidingWindowStatus:
+        self.previous_size = self.current_size
+        self.failed_minimum_requests = 0
+        self.successful_requests_at_size += 1
+        if (
+            self.successful_requests_at_size >= self.requests_before_expand
+            and self.current_size < self.max_size
+        ):
+            self.successful_requests_at_size = 0
+            self.previous_status = SlidingWindowStatus.SUCCESSFUL_EXPAND
+            self.current_size = self._bounded_size(
+                SLIDING_WINDOW_ctrl(
+                    self.current_size,
+                    self.previous_size,
+                    self.previous_status,
+                    min_size=self.min_size,
+                    max_size=self.max_size,
+                )
+            )
+        else:
+            if self.current_size >= self.max_size:
+                self.successful_requests_at_size = 0
+            self.previous_status = SlidingWindowStatus.SUCCESSFUL_MAINTAIN
+        return self.previous_status
+
+    def record_failure(self) -> SlidingWindowStatus:
+        self.successful_requests_at_size = 0
+        if self.current_size <= self.min_size:
+            self.failed_minimum_requests += 1
+            if self.failed_minimum_requests >= self.n:
+                self.previous_status = SlidingWindowStatus.FAILED_ABORT
+                return self.previous_status
+        self.failed_minimum_requests = (
+            self.failed_minimum_requests if self.current_size <= self.min_size else 0
+        )
+        self.previous_status = SlidingWindowStatus.FAILED_REDUCE
+        self.current_size = self._bounded_size(
+            SLIDING_WINDOW_ctrl(
+                self.current_size,
+                self.previous_size,
+                self.previous_status,
+                min_size=self.min_size,
+                max_size=self.max_size,
+            )
+        )
+        return self.previous_status
+
+    def _bounded_size(self, value: object) -> int:
+        try:
+            size = int(value)
+        except (TypeError, ValueError):
+            size = self.min_size
+        return min(self.max_size, max(self.min_size, size))
 
 
 class ArtifactoryError(Exception):
@@ -189,21 +336,77 @@ def list_downloaded_archives(output_root: Path) -> list[tuple[str, str, Path]]:
     )
 
 
-def get_checksums(path: str) -> dict:
+def load_sdk_status(status_path: Path) -> dict:
     try:
-        info = get_json(api_url(path))
-    except ArtifactoryError:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return {}
-
-    checksums = info.get("checksums", {})
-    if not isinstance(checksums, dict):
-        return {}
-    return {name.lower(): value.lower() for name, value in checksums.items() if value}
+    return status if isinstance(status, dict) else {}
 
 
-def download_archive(path: str, destination: Path, checksums: dict) -> None:
+def write_sdk_status(status_path: Path, status: dict) -> None:
+    # Window tuning and read measurements are per-operation runtime state.
+    for stage in ("download", "extraction"):
+        stage_status = status.get(stage)
+        if isinstance(stage_status, dict):
+            stage_status.pop("SLIDING_WINDOW", None)
+            stage_status.pop("spanning_window", None)
+
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{status_path.name}.",
+            suffix=".tmp",
+            dir=status_path.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(status, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, status_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as archive:
+        for chunk in iter(lambda: archive.read(CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_download_status(
+    status_path: Path,
+    version: str,
+    build: str,
+    download_status: dict,
+) -> None:
+    status = load_sdk_status(status_path)
+    status.update(
+        {
+            "schema_version": 1,
+            "version": version,
+            "build": build,
+        }
+    )
+    status.setdefault("extraction", {"status": "pending"})
+    status["download"] = download_status
+    write_sdk_status(status_path, status)
+
+
+def download_archive(
+    path: str,
+    destination: Path,
+    SLIDING_WINDOW: SlidingWindow,
+) -> None:
     url = download_url(path)
-    hashes = {name: hashlib.new(name) for name in ("sha256", "sha1", "md5")}
     try:
         with open_artifact(url) as response, destination.open("wb") as archive:
             content_length = response.headers.get("Content-Length")
@@ -216,11 +419,25 @@ def download_archive(path: str, destination: Path, checksums: dict) -> None:
 
             downloaded_bytes = 0
             last_percent = None
-            while chunk := response.read(CHUNK_SIZE):
+            while True:
+                requested_size = SLIDING_WINDOW.next_size()
+                read_started = time.perf_counter()
+                try:
+                    chunk = response.read(requested_size)
+                except Exception as error:
+                    SLIDING_WINDOW.record_failure()
+                    raise ArtifactoryError(
+                        f"SDK ZIP download read failed: {error}"
+                    ) from error
+                if not chunk:
+                    break
+
+                SLIDING_WINDOW.record_read_success(
+                    requested_size, len(chunk), time.perf_counter() - read_started
+                )
                 archive.write(chunk)
                 downloaded_bytes += len(chunk)
-                for digest in hashes.values():
-                    digest.update(chunk)
+                SLIDING_WINDOW.record_success()
                 if total_bytes is None:
                     print(
                         f"\rDownloaded {downloaded_bytes:,} bytes",
@@ -244,23 +461,10 @@ def download_archive(path: str, destination: Path, checksums: dict) -> None:
         raise ArtifactoryError(f"Could not save the SDK ZIP archive: {error}") from error
 
     if total_bytes is not None and downloaded_bytes != total_bytes:
+        SLIDING_WINDOW.record_failure()
         raise ArtifactoryError(
             f"SDK ZIP download ended early: received {downloaded_bytes:,} of {total_bytes:,} bytes."
         )
-
-    for name, expected in checksums.items():
-        if name in hashes and hashes[name].hexdigest() != expected:
-            raise ArtifactoryError(f"Downloaded archive failed its Artifactory {name} checksum.")
-
-
-def validate_archive(archive: Path) -> None:
-    try:
-        with zipfile.ZipFile(archive) as package:
-            bad_member = package.testzip()
-            if bad_member:
-                raise ArtifactoryError(f"SDK archive is corrupt at {bad_member}.")
-    except zipfile.BadZipFile as error:
-        raise ArtifactoryError("The downloaded SDK file is not a valid ZIP archive.") from error
 
 
 def download_sdk(
@@ -278,35 +482,155 @@ def download_sdk(
     build_path = f"sisdk-{version}/{build}"
     archive_path = f"{build_path}/{ARCHIVE_NAME}"
     destination = output_root / version / build / ARCHIVE_NAME
+    status_path = destination.parent / STATUS_FILENAME
+    saved_status = load_sdk_status(status_path)
+    download_status = saved_status.get("download")
+    if not isinstance(download_status, dict):
+        download_status = {}
+    status_matches = (
+        saved_status.get("version") == version
+        and saved_status.get("build") == build
+    )
 
     if destination.exists():
         if not destination.is_file():
             raise ArtifactoryError(
                 f"The archive destination exists but is not a file: {destination}"
             )
-        print(f"SiSDK {version} build {build} archive is already downloaded: {destination}")
-        return destination
 
-    checksums = get_checksums(archive_path)
+        stored_sha256 = download_status.get("sha256", "") if status_matches else ""
+        if download_status.get("status") == "complete" and stored_sha256:
+            verification_started = time.perf_counter()
+            actual_sha256 = _sha256_file(destination)
+            verification_seconds = time.perf_counter() - verification_started
+            if actual_sha256 == stored_sha256:
+                original_seconds = download_status.get("duration_seconds")
+                original_timing = (
+                    f"; original download took {original_seconds:.2f}s"
+                    if isinstance(original_seconds, (int, float))
+                    else ""
+                )
+                print(
+                    f"SiSDK {version} build {build} archive already exists; "
+                    f"SHA-256 verified in {verification_seconds:.2f}s{original_timing}."
+                )
+                return destination
+
+            print(
+                f"SiSDK {version} build {build} archive SHA-256 does not match "
+                "status.json; downloading a fresh copy."
+            )
+            destination.unlink()
+        else:
+            hash_started = time.perf_counter()
+            actual_sha256 = _sha256_file(destination)
+            hash_seconds = time.perf_counter() - hash_started
+            _write_download_status(
+                status_path,
+                version,
+                build,
+                {
+                    "status": "complete",
+                    "archive": ARCHIVE_NAME,
+                    "size_bytes": destination.stat().st_size,
+                    "sha256": actual_sha256,
+                    "duration_seconds": None,
+                    "hash_seconds": round(hash_seconds, 3),
+                    "adopted_existing_file": True,
+                    "completed_at": time.time(),
+                },
+            )
+            print(
+                f"SiSDK {version} build {build} archive already exists; "
+                f"recorded its SHA-256 in {hash_seconds:.2f}s."
+            )
+            return destination
+
+    SLIDING_WINDOW = SlidingWindow(DOWNLOAD_BUFFER_SIZE)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{build}-", dir=destination.parent))
     try:
         archive = staging / ARCHIVE_NAME
+        download_started_at = time.time()
+        download_started = time.perf_counter()
+        _write_download_status(
+            status_path,
+            version,
+            build,
+            {
+                "status": "in_progress",
+                "archive": ARCHIVE_NAME,
+                "started_at": download_started_at,
+            },
+        )
         print(f"Downloading SiSDK {version}, build {build}...")
+        transfer_started = time.perf_counter()
         try:
-            download_archive(archive_path, archive, checksums)
+            download_archive(archive_path, archive, SLIDING_WINDOW)
         except ArtifactoryError as error:
+            transfer_seconds = time.perf_counter() - transfer_started
+            _write_download_status(
+                status_path,
+                version,
+                build,
+                {
+                    "status": "failed",
+                    "archive": ARCHIVE_NAME,
+                    "duration_seconds": round(
+                        time.perf_counter() - download_started, 3
+                    ),
+                    "transfer_seconds": round(transfer_seconds, 3),
+                    "started_at": download_started_at,
+                    "completed_at": time.time(),
+                    "error": str(error),
+                },
+            )
+            if SLIDING_WINDOW.is_aborted:
+                raise ArtifactoryError(
+                    f"SiSDK {version} build {build} download aborted after "
+                    f"{SLIDING_WINDOW.n} failed requests at the minimum "
+                    f"{SLIDING_WINDOW.min_size:,}-byte read size."
+                ) from error
             archive_url = download_url(archive_path)
             if f"HTTP 404 for {archive_url}" in str(error):
                 raise ArtifactoryError(
                     f"SiSDK {version} build {build} does not have {ARCHIVE_NAME} available yet."
                 ) from error
             raise
-        if not checksums:
-            print("Artifactory checksum metadata is unavailable; validating the ZIP archive itself.")
-        validate_archive(archive)
+        transfer_seconds = time.perf_counter() - transfer_started
         os.replace(archive, destination)
+        hash_started = time.perf_counter()
+        archive_sha256 = _sha256_file(destination)
+        hash_seconds = time.perf_counter() - hash_started
+        download_seconds = time.perf_counter() - download_started
+        _write_download_status(
+            status_path,
+            version,
+            build,
+            {
+                "status": "complete",
+                "archive": ARCHIVE_NAME,
+                "size_bytes": destination.stat().st_size,
+                "sha256": archive_sha256,
+                "duration_seconds": round(download_seconds, 3),
+                "transfer_seconds": round(transfer_seconds, 3),
+                "hash_seconds": round(hash_seconds, 3),
+                "started_at": download_started_at,
+                "completed_at": time.time(),
+            },
+        )
+        print(
+            f"SiSDK {version} build {build} downloaded in {transfer_seconds:.2f}s; "
+            f"SHA-256 took {hash_seconds:.2f}s "
+            f"(total {download_seconds:.2f}s; read window "
+            f"{SLIDING_WINDOW.current_size / (1024 * 1024):g} MiB, "
+            f"N={SLIDING_WINDOW.n}; average read speed "
+            f"{SLIDING_WINDOW.average_read_speed_bytes_per_second / (1024 * 1024):.2f} MiB/s; "
+            f"last chunk {SLIDING_WINDOW.last_received_bytes / (1024 * 1024):.2f} MiB "
+            f"in {SLIDING_WINDOW.last_request_seconds:.3f}s at "
+            f"{SLIDING_WINDOW.last_request_speed_bytes_per_second / (1024 * 1024):.2f} MiB/s)."
+        )
         return destination
     finally:
         if staging.exists():

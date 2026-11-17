@@ -1510,6 +1510,14 @@ def build_cli_parser() -> argparse.ArgumentParser:
     _add_color_argument(build)
     build.add_argument("targets", nargs="*", help="optional SDK app, device profile, or bootloader target")
     build.add_argument("--action", default="build", choices=["generate", "upgrade", "build", "rebuild"])
+    build.add_argument(
+        "--clean",
+        action="store_true",
+        help=(
+            "nuke the configured build root (default: .fw_build), including firmware outputs "
+            "and the SiSDK cache there; prompts [n/Y]"
+        ),
+    )
     build.add_argument("--sdk-package-path", default="", help="override unpacked SiSDK package path")
     build.add_argument("--sisdk-version", default="", help="override SiSDK release or installed package version")
     build.add_argument("--build-number", "-bn", default="", help="override Artifactory build number")
@@ -2042,6 +2050,9 @@ def _main(argv: list[str] | None = None) -> int:
             args.config_set,
         )
     client_config = load_client_config(args.config)
+    if args.command in {"build", "BUILD"} and args.clean:
+        return _confirm_and_clean_build_root(args, client_config)
+
     uses_resolved_endpoint = (
         args.command == "health"
         or args.command in {"send_fw", "SEND_FW", "test", "TEST", "custom", "CUSTOM"}
@@ -2579,6 +2590,76 @@ def _sisdk_name_from_properties(sdk_package_path: Path) -> str:
         if separator and key.strip() == "id" and value.strip():
             return value.strip()
     return ""
+
+
+def _confirm_and_clean_build_root(
+    args: argparse.Namespace,
+    client_config: CMSClientConfig,
+) -> int:
+    build_options = (
+        args.action != "build",
+        bool(args.targets),
+        bool(args.sdk_package_path),
+        bool(args.sisdk_version),
+        bool(args.build_number),
+        bool(args.device),
+        bool(args.artifactory),
+        bool(args.diff),
+        bool(args.sisdkv1 or args.v1build or args.sisdkv2 or args.v2build),
+    )
+    if any(build_options):
+        raise RuntimeError(
+            "--clean cannot be combined with build, SDK, Artifactory, or differential options; "
+            "--config and --build-root are supported"
+        )
+
+    repo_root = Path(__file__).resolve().parent
+    build_config = client_config.build or {}
+    configured_root = args.build_root or build_config.get("root") or ".fw_build"
+    build_root = Path(configured_root).expanduser()
+    if not build_root.is_absolute():
+        build_root = repo_root / build_root
+    build_root = build_root.resolve()
+
+    if build_root == repo_root or repo_root.is_relative_to(build_root):
+        raise RuntimeError(
+            f"Refusing to clean a directory that contains the repository: {build_root}"
+        )
+
+    print("CMS build clean recursively deletes the selected firmware build root.")
+    print(f"Target: {build_root}")
+    if build_root == (repo_root / ".fw_build").resolve():
+        print(
+            "This also deletes firmware outputs and the cached SiSDK ZIPs, extracted "
+            "packages, and status.json files under .fw_build."
+        )
+    print("Press Enter or type Y to proceed; type N to leave everything untouched.")
+
+    while True:
+        try:
+            answer = input("Nuke this build root? [n/Y] ").strip().casefold()
+        except EOFError:
+            print("No confirmation received; clean cancelled.")
+            return CMSCLIExitCode.SUCCESS
+
+        if answer in {"", "y", "yes"}:
+            break
+        if answer in {"n", "no"}:
+            print("Clean cancelled; no files were removed.")
+            return CMSCLIExitCode.SUCCESS
+        print("Please enter Y or N.")
+
+    config_path = Path(args.config).expanduser().resolve()
+    command = [
+        sys.executable,
+        str(repo_root / "apps" / "app_manager.py"),
+        "clean",
+        "--config",
+        str(config_path),
+        "--build-root",
+        str(build_root),
+    ]
+    return subprocess.run(command, check=False, cwd=repo_root).returncode
 
 
 def _run_local_build(args: argparse.Namespace, config_path: str) -> int:

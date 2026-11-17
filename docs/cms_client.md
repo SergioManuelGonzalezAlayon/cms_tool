@@ -637,7 +637,7 @@ This downloads and prepares the configured archive under
 Artifactory release (`2026.12`) can differ from the package version in the SDK's
 `.properties` file (for example, `2026.12.3`); the build records both. This mode
 ignores `target.sisdk_package_path` and cannot be combined with
-`--sdk-package-path` or `--diff`.
+`--sdk-package-path`.
 
 The build section supports:
 
@@ -646,12 +646,34 @@ The build section supports:
 | `build.root` | Local root for generated projects, firmware images, runtime XAPI, and build metadata |
 | `build.bootloader_slcp` | Bootloader `.slcp` project used by the firmware build |
 
-The diff section is required by `cms BUILD --diff`:
+The diff section contains local package paths for path-based `cms BUILD --diff`
+and release/build selections for `cms BUILD --diff --artifactory`:
 
 | Field | Purpose |
 | --- | --- |
 | `diff.sisdk_version1_path` | Unpacked SiSDK package used to build the `version1` firmware set |
 | `diff.sisdk_version2_path` | Unpacked SiSDK package used to build the `version2` firmware set |
+| `diff.sisdkv1` | Artifactory release for differential variant `version1` |
+| `diff.v1build` | Required Artifactory build number for `version1` |
+| `diff.sisdkv2` | Artifactory release for differential variant `version2` |
+| `diff.v2build` | Required Artifactory build number for `version2` |
+
+For `cms BUILD --diff --artifactory`, configure both SDK release values under
+`diff` or pass them on the command line. `diff.sisdkv1` and `diff.sisdkv2` are
+required for this mode, as are `diff.v1build` and `diff.v2build`. The matching
+command-line options override these values. If a requested build is unavailable,
+the latest available build for that release is selected and reported. A build
+number must be supplied; the command does not default to the latest build. An
+unavailable release is an error.
+
+```text
+cms BUILD --diff --artifactory --sisdkv1 2025.12 --v1build 1200 --sisdkv2 2026.12 --v2build 1357
+```
+
+`--sisdk2` is also accepted as an alias for `--sisdkv2`. If the requested build
+number is not present in Artifactory, the latest build for that same release is
+used. Local path-based `cms BUILD --diff` continues to use
+`diff.sisdk_version1_path` and `diff.sisdk_version2_path`.
 
 The build writes the resulting paired provenance to
 `<build.root>/diff_fw_data.json`. The older `sisdk_child_path` and
@@ -768,6 +790,7 @@ The current CLI commands are:
 | `cms BUILD` | Build local firmware through `apps/app_manager.py` |
 | `cms BUILD --artifactory` | Build with `artifactory.version` and `artifactory.build` from client config |
 | `cms BUILD --diff` | Build isolated `version1` and `version2` firmware roots |
+| `cms BUILD --diff --artifactory` | Build both configured SDK releases from Artifactory with required per-variant build numbers |
 | `cms SEND_FW` | Stage firmware and metadata on the daemon |
 | `cms SEND_FW --diff` | Stage the provenanced differential firmware pair |
 | `cms TEST` | Start a remote test, exact config, or variable-filtered campaign using the most recently staged firmware |

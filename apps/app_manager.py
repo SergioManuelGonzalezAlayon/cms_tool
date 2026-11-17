@@ -29,9 +29,14 @@ from utils.svd import (
 )
 from utils.wpk import parse_board_vcom_gpio, vcom_gpio_header_path
 from apps.sisdk_manager import (
+    ARCHIVE_NAME,
+    STATUS_FILENAME,
     ArtifactoryError,
     DEFAULT_OUTPUT_ROOT,
+    SlidingWindow,
     download_sdk,
+    load_sdk_status,
+    write_sdk_status,
 )
 
 
@@ -42,6 +47,7 @@ APP_CONFIG_DIR = APPS_DIR / "configs"
 SDK_BLUETOOTH_APP_ROOT = Path("bluetooth_le_app") / "example"
 BUILD_METADATA_FILENAME = "build_metadata.json"
 FW_DATA_FILENAME = "fw_data.json"
+EXTRACTION_CHUNK_SIZE = 32 * 1024 * 1024
 DIFF_FW_DATA_FILENAME = "diff_fw_data.json"
 BGAPI_RUNTIME_DIRNAME = "runtime"
 BGAPI_XAPI_FILENAME = "sl_bt.xapi"
@@ -458,6 +464,20 @@ def resolve_sdk_selection(
     return selection
 
 
+def _matching_sdk_status(status_path: Path, version: str, build: str) -> dict:
+    status = load_sdk_status(status_path)
+    if status.get("version") != version or status.get("build") != build:
+        status = {}
+    status.update(
+        {
+            "schema_version": 1,
+            "version": version,
+            "build": build,
+        }
+    )
+    return status
+
+
 def resolve_artifactory_sdk_selection(
     version: str,
     build: str = "",
@@ -476,6 +496,103 @@ def resolve_artifactory_sdk_selection(
         raise RuntimeError("artifactory.build must be a numeric Artifactory build number")
     if not build:
         raise RuntimeError("Artifactory SDK selection requires a build number")
+
+    cached_package_path = DEFAULT_OUTPUT_ROOT / version / build / "package"
+    if cached_package_path.is_dir():
+        cache_check_started = time.perf_counter()
+        cached_selection = inspect_sdk_selection(
+            cached_package_path,
+            source="artifactory",
+            include_git_commit=False,
+        )
+        if (
+            cached_selection.version != version
+            and not cached_selection.version.startswith(f"{version}.")
+        ):
+            raise RuntimeError(
+                "Cached SiSDK package version does not match the Artifactory release: "
+                f"requested={version}, cache={cached_selection.version}"
+            )
+        if cached_selection.build_number != build:
+            raise RuntimeError(
+                "Cached SiSDK package build number does not match the Artifactory build: "
+                f"requested={build}, cache={cached_selection.build_number}"
+            )
+
+        cached_archive = cached_package_path.parent / ARCHIVE_NAME
+        cached_status_path = cached_package_path.parent / STATUS_FILENAME
+        cached_status = _matching_sdk_status(cached_status_path, version, build)
+        cached_download = cached_status.get("download")
+        if not isinstance(cached_download, dict):
+            cached_download = {}
+        cached_archive_sha256 = str(cached_download.get("sha256", ""))
+        if cached_archive.is_file() and not (
+            cached_download.get("status") == "complete" and cached_archive_sha256
+        ):
+            hash_started = time.perf_counter()
+            cached_archive_sha256 = _sha256(cached_archive)
+            hash_seconds = time.perf_counter() - hash_started
+            cached_download = {
+                "status": "complete",
+                "archive": ARCHIVE_NAME,
+                "size_bytes": cached_archive.stat().st_size,
+                "sha256": cached_archive_sha256,
+                "duration_seconds": None,
+                "hash_seconds": round(hash_seconds, 3),
+                "adopted_existing_file": True,
+                "completed_at": time.time(),
+            }
+            cached_status["download"] = cached_download
+            print(
+                f"Recorded SHA-256 for the existing SiSDK {version} build {build} "
+                f"archive in {hash_seconds:.2f}s."
+            )
+
+        cached_extraction = cached_status.get("extraction")
+        if not isinstance(cached_extraction, dict) or cached_extraction.get("status") != "complete":
+            cached_extraction = {
+                "status": "complete",
+                "duration_seconds": None,
+                "adopted_existing_package": True,
+                "completed_at": time.time(),
+            }
+            cached_status["extraction"] = cached_extraction
+        else:
+            cached_extraction["last_reused_at"] = time.time()
+        write_sdk_status(cached_status_path, cached_status)
+        cache_check_seconds = time.perf_counter() - cache_check_started
+        previous_download_seconds = cached_download.get("duration_seconds")
+        previous_download_timing = (
+            f"; original download and hashing took {previous_download_seconds:.2f}s"
+            if isinstance(previous_download_seconds, (int, float))
+            else ""
+        )
+        previous_extraction_seconds = cached_extraction.get("duration_seconds")
+        previous_extraction_timing = (
+            f"; original extraction took {previous_extraction_seconds:.2f}s"
+            if isinstance(previous_extraction_seconds, (int, float))
+            else ""
+        )
+        print(
+            f"SiSDK {version} build {build} is already unpacked at "
+            f"{cached_package_path}; reusing it (cache check took "
+            f"{cache_check_seconds:.2f}s{previous_download_timing}"
+            f"{previous_extraction_timing})."
+        )
+        return SDKSelection(
+            path=cached_selection.path,
+            version=cached_selection.version,
+            source=cached_selection.source,
+            build_number=cached_selection.build_number,
+            commit=cached_selection.commit,
+            sdk_hash=cached_selection.sdk_hash,
+            xapi_path=cached_selection.xapi_path,
+            xapi_hash=cached_selection.xapi_hash,
+            artifactory_version=version,
+            artifactory_build=build,
+            archive_path=cached_archive.resolve() if cached_archive.is_file() else None,
+            archive_sha256=cached_archive_sha256,
+        )
 
     try:
         if fallback_to_latest:
@@ -499,60 +616,132 @@ def resolve_artifactory_sdk_selection(
 
     package_path = archive.parent / "package"
     if not package_path.exists():
-        staging_path = Path(
-            tempfile.mkdtemp(prefix=".package-", dir=str(archive.parent))
-        ).resolve()
+        status_path = archive.parent / STATUS_FILENAME
+        extraction_started_at = time.time()
+        extraction_started = time.perf_counter()
+        sdk_status = _matching_sdk_status(status_path, version, selected_build)
+        spanning_window = SlidingWindow(EXTRACTION_CHUNK_SIZE)
+        sdk_status["extraction"] = {
+            "status": "in_progress",
+            "started_at": extraction_started_at,
+        }
+        write_sdk_status(status_path, sdk_status)
         try:
-            with zipfile.ZipFile(archive) as package:
-                extraction_root = staging_path.resolve()
-                for member in package.infolist():
-                    member_path = (extraction_root / member.filename).resolve()
-                    if not member_path.is_relative_to(extraction_root):
-                        raise RuntimeError(
-                            f"SiSDK archive contains a path outside its package: {member.filename}"
-                        )
-
-                members = package.infolist()
-                total_bytes = sum(member.file_size for member in members if not member.is_dir())
-                with tqdm(
-                    total=total_bytes,
-                    desc=f"Extracting SiSDK {version} build {selected_build}",
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                ) as progress:
+            staging_path = Path(
+                tempfile.mkdtemp(prefix=".package-", dir=str(archive.parent))
+            ).resolve()
+            try:
+                with zipfile.ZipFile(archive) as package:
+                    extraction_root = staging_path.resolve()
+                    members = package.infolist()
                     for member in members:
-                        destination = staging_path / member.filename
-                        if member.is_dir():
-                            destination.mkdir(parents=True, exist_ok=True)
-                            continue
+                        member_path = (extraction_root / member.filename).resolve()
+                        if not member_path.is_relative_to(extraction_root):
+                            raise RuntimeError(
+                                "SiSDK archive contains a path outside its package: "
+                                f"{member.filename}"
+                            )
 
-                        destination.parent.mkdir(parents=True, exist_ok=True)
-                        with package.open(member) as source, destination.open("wb") as output:
-                            while chunk := source.read(1024 * 1024):
-                                output.write(chunk)
-                                progress.update(len(chunk))
+                    total_bytes = sum(
+                        member.file_size for member in members if not member.is_dir()
+                    )
+                    with tqdm(
+                        total=total_bytes,
+                        desc=f"Extracting SiSDK {version} build {selected_build}",
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                    ) as progress:
+                        for member in members:
+                            destination = staging_path / member.filename
+                            if member.is_dir():
+                                destination.mkdir(parents=True, exist_ok=True)
+                                continue
 
-            staged_version = _sisdk_version_from_properties(staging_path)
-            if staged_version != version and not staged_version.startswith(f"{version}."):
-                raise RuntimeError(
-                    "Downloaded SiSDK package version does not match the Artifactory release: "
-                    f"requested={version}, archive={staged_version}"
-                )
-            staged_build_number = _sisdk_build_number_from_package(staging_path)
-            if staged_build_number != selected_build:
-                raise RuntimeError(
-                    "Downloaded SiSDK package build number does not match the Artifactory build: "
-                    f"requested={selected_build}, archive={staged_build_number}"
-                )
-            if not (staging_path / SL_BT_XAPI_PATH).is_file():
-                raise RuntimeError(
-                    f"Downloaded SiSDK '{version}' cannot find `sl_bt.xapi` under {staging_path}"
-                )
-            staging_path.replace(package_path)
-        finally:
-            if staging_path.exists():
-                shutil.rmtree(staging_path)
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            with package.open(member) as source, destination.open("wb") as output:
+                                while True:
+                                    requested_size = spanning_window.next_size()
+                                    read_started = time.perf_counter()
+                                    try:
+                                        chunk = source.read(requested_size)
+                                    except Exception:
+                                        spanning_window.record_failure()
+                                        raise
+                                    if not chunk:
+                                        break
+                                    spanning_window.record_read_success(
+                                        requested_size,
+                                        len(chunk),
+                                        time.perf_counter() - read_started,
+                                    )
+                                    output.write(chunk)
+                                    progress.update(len(chunk))
+                                    spanning_window.record_success()
+
+                staged_version = _sisdk_version_from_properties(staging_path)
+                if staged_version != version and not staged_version.startswith(f"{version}."):
+                    raise RuntimeError(
+                        "Downloaded SiSDK package version does not match the Artifactory release: "
+                        f"requested={version}, archive={staged_version}"
+                    )
+                staged_build_number = _sisdk_build_number_from_package(staging_path)
+                if staged_build_number != selected_build:
+                    raise RuntimeError(
+                        "Downloaded SiSDK package build number does not match the Artifactory build: "
+                        f"requested={selected_build}, archive={staged_build_number}"
+                    )
+                if not (staging_path / SL_BT_XAPI_PATH).is_file():
+                    raise RuntimeError(
+                        f"Downloaded SiSDK '{version}' cannot find `sl_bt.xapi` under {staging_path}"
+                    )
+                # Windows scanners can briefly hold a freshly extracted tree open.
+                for attempt in range(8):
+                    try:
+                        staging_path.rename(package_path)
+                        break
+                    except PermissionError as error:
+                        if package_path.exists():
+                            raise
+                        if attempt == 7:
+                            raise RuntimeError(
+                                "Could not promote the extracted SiSDK package "
+                                f"after repeated access-denied errors: {error}"
+                            ) from error
+                        time.sleep(min(0.25 * (2**attempt), 4.0))
+            finally:
+                if staging_path.exists():
+                    shutil.rmtree(staging_path)
+        except Exception as error:
+            extraction_seconds = time.perf_counter() - extraction_started
+            sdk_status["extraction"] = {
+                "status": "failed",
+                "duration_seconds": round(extraction_seconds, 3),
+                "started_at": extraction_started_at,
+                "completed_at": time.time(),
+                "error": str(error),
+            }
+            write_sdk_status(status_path, sdk_status)
+            raise
+
+        extraction_seconds = time.perf_counter() - extraction_started
+        sdk_status["extraction"] = {
+            "status": "complete",
+            "duration_seconds": round(extraction_seconds, 3),
+            "started_at": extraction_started_at,
+            "completed_at": time.time(),
+        }
+        write_sdk_status(status_path, sdk_status)
+        print(
+            f"SiSDK {version} build {selected_build} extraction completed "
+            f"in {extraction_seconds:.2f}s "
+            f"(read window {spanning_window.current_size / (1024 * 1024):g} MiB, "
+            f"N={spanning_window.n}; average read speed "
+            f"{spanning_window.average_read_speed_bytes_per_second / (1024 * 1024):.2f} MiB/s; "
+            f"last chunk {spanning_window.last_received_bytes / (1024 * 1024):.2f} MiB "
+            f"in {spanning_window.last_request_seconds:.3f}s at "
+            f"{spanning_window.last_request_speed_bytes_per_second / (1024 * 1024):.2f} MiB/s)."
+        )
 
     selection = inspect_sdk_selection(
         package_path,
@@ -569,6 +758,17 @@ def resolve_artifactory_sdk_selection(
             "Cached SiSDK package build number does not match the Artifactory build: "
             f"requested={selected_build}, cache={selection.build_number}"
         )
+    sdk_status = _matching_sdk_status(
+        archive.parent / STATUS_FILENAME,
+        version,
+        selected_build,
+    )
+    download_status = sdk_status.get("download")
+    archive_sha256 = (
+        str(download_status.get("sha256", ""))
+        if isinstance(download_status, dict)
+        else ""
+    )
     return SDKSelection(
         path=selection.path,
         version=selection.version,
@@ -581,7 +781,7 @@ def resolve_artifactory_sdk_selection(
         artifactory_version=version,
         artifactory_build=selected_build,
         archive_path=archive.resolve(),
-        archive_sha256=_sha256(archive),
+        archive_sha256=archive_sha256,
     )
 
 
@@ -1287,10 +1487,65 @@ def write_diff_fw_data(
     return output_path
 
 
+def _remove_path_recursively(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        path.unlink()
+        return
+
+    if os.name == "nt":
+        environment = os.environ.copy()
+        environment["CMS_BUILD_ROOT_TO_CLEAN"] = str(path)
+        result = subprocess.run(
+            'cmd.exe /d /c rd /s /q "%CMS_BUILD_ROOT_TO_CLEAN%"',
+            check=False,
+            env=environment,
+        )
+    elif os.name == "posix":
+        result = subprocess.run(
+            ["rm", "-rf", "--", str(path)],
+            check=False,
+        )
+    else:
+        shutil.rmtree(path)
+        return
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not remove build path {path}; "
+            f"native recursive delete exited with {result.returncode}"
+        )
+
+
 def clean_build_root(build_root: Path) -> int:
     if not build_root.exists():
         return 0
-    shutil.rmtree(build_root)
+
+    sisdk_root = build_root / "sisdk"
+    if sisdk_root.is_dir() and not sisdk_root.is_symlink():
+        sdk_versions = sorted(
+            (
+                path
+                for path in sisdk_root.iterdir()
+                if path.is_dir() and not path.is_symlink()
+            ),
+            key=lambda path: path.name,
+        )
+        for sdk_version_path in sdk_versions:
+            print(f"Deleting SiSDK {sdk_version_path.name} cache...")
+            shutil.rmtree(sdk_version_path)
+            print(f"Deleted SiSDK {sdk_version_path.name} cache.")
+
+        for remaining_path in sorted(sisdk_root.iterdir(), key=lambda path: path.name):
+            print(f"Deleting remaining SiSDK cache entry {remaining_path.name}...")
+            _remove_path_recursively(remaining_path)
+        sisdk_root.rmdir()
+
+    for build_entry in sorted(build_root.iterdir(), key=lambda path: path.name):
+        print(f"Deleting build entry {build_entry.name}...")
+        _remove_path_recursively(build_entry)
+        print(f"Deleted build entry {build_entry.name}.")
+
+    build_root.rmdir()
     return 1
 
 
