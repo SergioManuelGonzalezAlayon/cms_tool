@@ -298,7 +298,7 @@ def DUTAdvConfig(DUT,
     log.info("DUT Advertiser configured")
 
     DUT.bt.advertiser.set_tx_power(config.set, config.tx_power)
-    
+
     DUT.bt.extended_advertiser.set_phy(
         config.set,
         config.primary_phy,
@@ -899,6 +899,92 @@ def ConnectBLEDevices(Config):
             log.info("Connection closed succesfully")
         except Exception as exc:
             _log_fixture_cleanup_failure("BLE connection", exc)
+
+
+def test_firmware_smoke(Config, DUT, Tester, DUTAdvConfig, TesterScanConfig):
+    """Provision and exercise both NCPs without running a measurement capture."""
+
+    advertiser_set = DUTAdvConfig.set
+    advertiser_start_attempted = False
+    scanner_start_attempted = False
+    primary_error = None
+    cleanup_errors = []
+
+    try:
+        for role, device in (("DUT", DUT), ("Tester", Tester)):
+            response = device.bt.system.hello()
+            assert response.result == 0, (
+                f"{role} system.hello returned result {response.result}"
+            )
+            log.info("Firmware smoke BGAPI hello passed: role=%s", role)
+
+        advertiser_start_attempted = True
+        response = DUT.bt.extended_advertiser.start(
+            advertiser_set,
+            DUT.bt.extended_advertiser.CONNECTION_MODE_NON_CONNECTABLE,
+            0,
+        )
+        assert response.result == 0, (
+            f"DUT advertiser start returned result {response.result}"
+        )
+        log.info("Firmware smoke DUT advertiser start passed")
+
+        scan_mode = getattr(Tester.bt.scanner, "SCAN_MODE_SCAN_MODE_PASSIVE", 0)
+        scanner_config = TesterScanConfig(mode=scan_mode)
+        scanner_start_attempted = True
+        response = Tester.bt.scanner.start(
+            scanner_config.phy,
+            Tester.bt.scanner.DISCOVER_MODE_DISCOVER_OBSERVATION,
+        )
+        assert response.result == 0, (
+            f"Tester scanner start returned result {response.result}"
+        )
+        log.info("Firmware smoke Tester scanner start passed")
+    except Exception as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_actions = []
+        if scanner_start_attempted:
+            cleanup_actions.append(
+                ("Tester scanner stop", Tester.bt.scanner.stop)
+            )
+        if advertiser_start_attempted:
+            cleanup_actions.append(
+                (
+                    "DUT advertiser stop",
+                    lambda: DUT.bt.advertiser.stop(advertiser_set),
+                )
+            )
+        cleanup_actions.append(
+            (
+                "DUT advertiser delete",
+                lambda: DUT.bt.advertiser.delete_set(advertiser_set),
+            )
+        )
+
+        for operation, cleanup in cleanup_actions:
+            try:
+                response = cleanup()
+                assert response.result == 0, (
+                    f"{operation} returned result {response.result}"
+                )
+                log.info("Firmware smoke cleanup passed: operation=%s", operation)
+            except Exception as exc:
+                cleanup_errors.append((operation, exc))
+
+        if cleanup_errors:
+            details = "; ".join(
+                f"{operation}: {error}"
+                for operation, error in cleanup_errors
+            )
+            if primary_error is None:
+                raise RuntimeError(f"Firmware smoke cleanup failed: {details}") from cleanup_errors[0][1]
+            log.error(
+                "Firmware smoke cleanup also failed after %s: %s",
+                primary_error,
+                details,
+            )
 
 def test_legacy_beacon(JoulescopeDev,
                        DUT,

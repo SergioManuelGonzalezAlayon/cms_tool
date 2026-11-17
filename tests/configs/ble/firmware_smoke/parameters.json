@@ -1,0 +1,17 @@
+{
+    "test": "firmware_smoke",
+    "generator": {
+        "base_config": "default.json",
+        "output_dir": ".",
+        "steps": 0,
+        "analyses": {
+            "one_factor": {
+                "enabled": false
+            },
+            "full_sweep": {
+                "enabled": false
+            }
+        }
+    },
+    "parameters": []
+}
