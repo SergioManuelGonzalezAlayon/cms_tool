@@ -1045,6 +1045,16 @@ def _artifact_cache_fingerprint(inputs: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _artifact_cache_build_root(sdk_selection: SDKSelection) -> Path:
+    release = sisdk_release_from_version(sdk_selection.version)
+    build_number = sdk_selection.build_number or sdk_selection.artifactory_build
+    if not build_number.isdecimal():
+        raise RuntimeError(
+            "Firmware artifact caching requires a numeric SDK package build number"
+        )
+    return DEFAULT_OUTPUT_ROOT / release / build_number
+
+
 def _artifact_cache_path(
     sdk_selection: SDKSelection,
     profile: str,
@@ -1052,16 +1062,8 @@ def _artifact_cache_path(
 ) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
         raise RuntimeError(f"Invalid firmware artifact cache profile: {profile!r}")
-    release = sisdk_release_from_version(sdk_selection.version)
-    build_number = sdk_selection.build_number or sdk_selection.artifactory_build
-    if not build_number.isdecimal():
-        raise RuntimeError(
-            "Firmware artifact caching requires a numeric SDK package build number"
-        )
     return (
-        DEFAULT_OUTPUT_ROOT
-        / release
-        / build_number
+        _artifact_cache_build_root(sdk_selection)
         / ARTIFACT_CACHE_DIRNAME
         / profile
         / fingerprint
@@ -1703,6 +1705,61 @@ def write_fw_data(
     return fw_data_path
 
 
+def write_sdk_build_cache_manifest(
+    *,
+    fw_data_path: Path,
+    sdk_selection: SDKSelection,
+    runtime_xapi_path: Path,
+) -> Path | None:
+    """Write a complete role set and its runtime metadata beside one SDK cache."""
+
+    fw_data = json.loads(fw_data_path.read_text(encoding="utf-8"))
+    firmware = fw_data.get("firmware")
+    artifacts = firmware.get("artifacts") if isinstance(firmware, dict) else None
+    if not isinstance(artifacts, list):
+        raise RuntimeError(f"Build provenance has no firmware artifact list: {fw_data_path}")
+    build = fw_data.get("build")
+    sdk = fw_data.get("sdk")
+    if not isinstance(build, dict) or not isinstance(sdk, dict):
+        raise RuntimeError(f"Build provenance is incomplete: {fw_data_path}")
+    roles = [str(item.get("role", "")) for item in artifacts if isinstance(item, dict)]
+    if not REQUIRED_DIFF_FIRMWARE_ROLES.issubset(roles):
+        return None
+    validate_firmware_artifact_roles(artifacts, REQUIRED_DIFF_FIRMWARE_ROLES)
+
+    cache_root = _artifact_cache_build_root(sdk_selection)
+    manifest_path = cache_root / FW_DATA_FILENAME
+    _ensure_artifact_cache_parent(manifest_path)
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    source_xapi = runtime_xapi_path.resolve()
+    if not source_xapi.is_file():
+        raise RuntimeError(f"Built SiSDK runtime metadata is missing: {source_xapi}")
+    xapi_hash = _sha256(source_xapi)
+    if sdk_selection.xapi_hash and sdk_selection.xapi_hash != xapi_hash:
+        raise RuntimeError("SiSDK runtime metadata hash changed during the firmware build")
+    cached_xapi = cache_root / BGAPI_RUNTIME_DIRNAME / BGAPI_XAPI_FILENAME
+    cached_xapi.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_xapi, cached_xapi)
+    if _sha256(cached_xapi) != xapi_hash:
+        raise RuntimeError(f"Cached SiSDK runtime metadata failed its SHA-256 check: {cached_xapi}")
+    build["source_root"] = build.get("root", "")
+    build["root"] = str(cache_root.resolve())
+    build["xapi"] = str(cached_xapi.resolve())
+    sdk["xapi_sha256"] = xapi_hash
+    sdk["cache_build_root"] = str(cache_root.resolve())
+    fw_data["cache"] = {
+        "schema_version": ARTIFACT_CACHE_SCHEMA_VERSION,
+        "release": sisdk_release_from_version(sdk_selection.version),
+        "build_number": sdk_selection.build_number or sdk_selection.artifactory_build,
+    }
+
+    temporary_path = manifest_path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(fw_data, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(manifest_path)
+    return manifest_path
+
+
 def firmware_artifacts_from_summaries(summaries: list[dict]) -> list[dict[str, str]]:
     """Describe known firmware roles from their declared SLCP project identity."""
 
@@ -1722,7 +1779,6 @@ def firmware_artifacts_from_summaries(summaries: list[dict]) -> list[dict[str, s
                 "project_name": project_name,
                 "image": str(image),
                 "sha256": _sha256(image),
-                "cache_manifest": str(summary.get("cache_manifest", "")),
             }
         )
     return artifacts
@@ -2361,6 +2417,14 @@ def run_firmware_action(
             sdk_selection=sdk_selection,
             vcom_metadata=vcom_metadata,
         )
+        if sdk_selection is not None:
+            cache_manifest_path = write_sdk_build_cache_manifest(
+                fw_data_path=fw_data_path,
+                sdk_selection=sdk_selection,
+                runtime_xapi_path=runtime_xapi_path,
+            )
+            if cache_manifest_path is not None:
+                print(f"Cached complete firmware build manifest={cache_manifest_path}")
 
     print(
         "App manager: "

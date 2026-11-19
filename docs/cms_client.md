@@ -781,11 +781,28 @@ Regular and differential builds share this cache, while keeping their
 2. Build a request from command-line arguments, `cms_client_config.json`, and
    `dev_config.json`.
 
-When no explicit image path is supplied, the client reads the role and cache
-manifest path from `fw_data.json` under the configured build root, then resolves
-the selected image through that cache manifest. This keeps discovery bound to
-the build selected by that root instead of finding an older image in another
-project output directory.
+To stage one exact cached SiSDK build, pass both selectors:
+
+```text
+cms SEND_FW --sisdk-version 2026.6 --build-number 3582
+```
+
+`-bn` is an alias for `--build-number`. The client reads the complete role set
+and runtime metadata from `.fw_build/sisdk/<release>/<build>/fw_data.json`, then
+checks the SDK identity, cached image hashes, `sl_bt.xapi` hash, and
+VCOM metadata before staging. A full `cms BUILD` writes this cache-level
+manifest after the DUT DCDC, DUT no-DCDC, tester, and bootloader artifacts are
+available.
+
+The release and build selectors must be supplied together. They cannot be
+combined with `--diff`, `--request-json`, explicit image paths, or
+`--build-root`. Without the selectors, `cms SEND_FW` continues to use the
+configured build root; with them, it selects from the repository SiSDK cache.
+
+When no explicit image path is supplied, the client reads the role, image path,
+and SHA-256 from `fw_data.json` under the configured build root. This keeps
+discovery bound to the build selected by that root instead of finding an older
+image in another project output directory.
 
 | Role | Manifest role selected |
 | --- | --- |
@@ -827,6 +844,7 @@ The current CLI commands are:
 | `cms BUILD --diff` | Build isolated `version1` and `version2` firmware roots |
 | `cms BUILD --diff --artifactory` | Build both configured SDK releases from Artifactory with required per-variant build numbers |
 | `cms SEND_FW` | Stage firmware and metadata on the daemon |
+| `cms SEND_FW --sisdk-version <release> --build-number <build>` | Stage verified firmware from one exact SiSDK cache build |
 | `cms SEND_FW --diff` | Stage the provenanced differential firmware pair |
 | `cms TEST` | Start a remote test, exact config, or variable-filtered campaign using the most recently staged firmware |
 | `cms CUSTOM` | Update a feature's mutable `custom.json` configuration |

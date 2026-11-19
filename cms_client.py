@@ -91,7 +91,12 @@ from cms_variable_filters import (
     validate_variable_filters,
     variable_help_text,
 )
-from apps.sisdk_manager import ArtifactoryError, list_builds, list_sdk_versions
+from apps.sisdk_manager import (
+    DEFAULT_OUTPUT_ROOT as SISDK_CACHE_ROOT,
+    ArtifactoryError,
+    list_builds,
+    list_sdk_versions,
+)
 from utils.config_loader import (
     load_test_config,
     validate_test_config_data,
@@ -99,6 +104,12 @@ from utils.config_loader import (
 )
 
 CMS_CLIENT_CONFIG = "cms_client_config.json"
+FW_DATA_FILENAME = "fw_data.json"
+ARTIFACT_CACHE_SCHEMA_VERSION = 1
+REQUIRED_CACHED_FIRMWARE_ROLES = frozenset(
+    {"dut_dcdc", "dut_no_dcdc", "tester", "bootloader"}
+)
+FIRMWARE_CACHE_IMAGE_SUFFIXES = {".s37", ".hex"}
 
 _MEASUREMENT_ID_TIMESTAMP_RE = re.compile(
     r"(?P<date>\d{8})T(?P<time>\d{6})(?:\d{1,6})?Z"
@@ -1555,7 +1566,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "  cms SEND_FW\n"
             "  cms SEND_FW --diff\n\n"
             "Defaults:\n"
-            "  Firmware images and sl_bt.xapi are discovered from the configured build root.\n\n"
+            "  Firmware and sl_bt.xapi are discovered from the configured build root, or select an SDK cache build with --sisdk-version and --build-number.\n\n"
             "Next:\n"
             "  Run cms TEST --mode default --feature beacon --config-name default --preview before starting a test.\n"
             "  After cms SEND_FW --diff, run cms TEST --mode diff --feature beacon --verbose."
@@ -1579,9 +1590,23 @@ def build_cli_parser() -> argparse.ArgumentParser:
     send_fw.add_argument("--board", default="", help="target board id")
     send_fw.add_argument("--device", default="", help="target device id")
     send_fw.add_argument("--git-commit", default="", help="firmware source commit")
-    send_fw.add_argument("--sisdk-version", default="", help="SiSDK version")
+    send_fw.add_argument(
+        "--sisdk-version",
+        default="",
+        help="SiSDK release to select from the artifact cache (YYYY.MM)",
+    )
+    send_fw.add_argument(
+        "--build-number",
+        "-bn",
+        default="",
+        help="numeric SiSDK build to select from the artifact cache",
+    )
     send_fw.add_argument("--sisdk-commit", default="", help="SiSDK commit")
-    send_fw.add_argument("--build-root", default="", help="override firmware build root used for provenance")
+    send_fw.add_argument(
+        "--build-root",
+        default="",
+        help="override firmware build root; unavailable with SDK cache selectors",
+    )
     send_fw.add_argument("--requested-by", default="", help="request owner")
 
     staged = subparsers.add_parser(
@@ -2044,6 +2069,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(argv: list[str] | None = None) -> int:
     args = build_cli_parser().parse_args(argv)
+    if args.command in {"send_fw", "SEND_FW"}:
+        args._send_fw_cache_selection = _resolve_send_fw_cache_selection(args)
     colors = color_formatter(args.color)
     if args.command in {"custom", "CUSTOM"} and args.config_set:
         args.custom_config_set_data = _load_validated_local_custom_config_set(
@@ -2316,23 +2343,133 @@ def _print_saved_measurements(
     )
 
 
+def _resolve_send_fw_cache_selection(
+    args: argparse.Namespace,
+) -> tuple[str, str, Path] | None:
+    release_value = str(getattr(args, "sisdk_version", "")).strip()
+    build_number = str(getattr(args, "build_number", "")).strip()
+    if not release_value and not build_number:
+        return None
+    if not release_value or not build_number:
+        raise RuntimeError("--sisdk-version and --build-number/-bn must be used together")
+    if getattr(args, "request_json", ""):
+        raise RuntimeError("SDK cache selectors cannot be combined with --request-json")
+    if getattr(args, "diff", False):
+        raise RuntimeError("SDK cache selectors cannot be combined with --diff")
+    if getattr(args, "build_root", ""):
+        raise RuntimeError(
+            "SDK cache selectors use the repository SiSDK cache and cannot be combined with --build-root"
+        )
+    if any(
+        getattr(args, option, "")
+        for option in ("dut_image", "tester_image", "bootloader_image")
+    ):
+        raise RuntimeError("SDK cache selectors cannot be combined with explicit firmware image paths")
+
+    release_match = re.fullmatch(r"(\d{4}\.\d+)(?:\.\d+)?", release_value)
+    if release_match is None:
+        raise RuntimeError("--sisdk-version must use the SiSDK release format YYYY.MM")
+    if not build_number.isdecimal():
+        raise RuntimeError("--build-number/-bn must be a numeric SiSDK build number")
+
+    release = release_match.group(1)
+    cache_base = SISDK_CACHE_ROOT.resolve()
+    cache_root = (SISDK_CACHE_ROOT / release / build_number).resolve()
+    if not cache_root.is_relative_to(cache_base):
+        raise RuntimeError(f"Selected SDK cache path escapes {cache_base}: {cache_root}")
+    return release, build_number, cache_root
+
+
+def _sisdk_release_from_version(version: str) -> str:
+    match = re.fullmatch(r"(\d{4}\.\d+)(?:\.\d+)?", version.strip())
+    if match is None:
+        raise RuntimeError(f"Invalid SiSDK version in build provenance: {version!r}")
+    return match.group(1)
+
+
+def _resolve_path_under(root: Path, value: str, label: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise RuntimeError(f"{label} escapes its cache directory: {path}")
+    return resolved
+
+
+def _validate_selected_cached_build(
+    cache_root: Path,
+    release: str,
+    build_number: str,
+) -> tuple[dict[str, Any], dict[str, Path]]:
+    fw_data_path = cache_root / FW_DATA_FILENAME
+    fw_data = _read_json_file(fw_data_path)
+    if not isinstance(fw_data, dict):
+        raise RuntimeError(f"Cached build manifest is invalid: {fw_data_path}")
+    cache = fw_data.get("cache", {})
+    if cache != {
+        "schema_version": ARTIFACT_CACHE_SCHEMA_VERSION,
+        "release": release,
+        "build_number": build_number,
+    }:
+        raise RuntimeError(f"Cached build manifest selection metadata does not match: {fw_data_path}")
+    firmware = fw_data.get("firmware", {})
+    sdk = fw_data.get("sdk", {})
+    if not isinstance(firmware, dict) or not isinstance(sdk, dict):
+        raise RuntimeError(f"Cached build manifest has incomplete SDK or firmware data: {fw_data_path}")
+    if _sisdk_release_from_version(str(sdk.get("version", ""))) != release:
+        raise RuntimeError(f"Cached build manifest SiSDK release does not match {release}")
+    if str(sdk.get("build_number") or sdk.get("artifactory_build") or "") != build_number:
+        raise RuntimeError(f"Cached build manifest SiSDK build does not match {build_number}")
+
+    firmware_cfg = dict(firmware)
+    firmware_cfg["build_root"] = str(cache_root)
+    image_paths = {
+        role: _discover_built_firmware(role, firmware_cfg, cached_build=True)
+        for role in REQUIRED_CACHED_FIRMWARE_ROLES
+    }
+    build = fw_data.get("build", {})
+    if not isinstance(build, dict) or not build.get("xapi"):
+        raise RuntimeError(f"Cached build manifest has no SiSDK xapi path: {fw_data_path}")
+    image_paths["xapi"] = _resolve_path_under(
+        cache_root, str(build["xapi"]), "cached SiSDK xapi file"
+    )
+    return fw_data, image_paths
+
+
 def _request_from_send_fw_args(
     args: argparse.Namespace,
     client_config: CMSClientConfig | None = None,
 ) -> MeasurementRequest:
+    cache_selection = getattr(args, "_send_fw_cache_selection", None)
+    if not hasattr(args, "_send_fw_cache_selection"):
+        cache_selection = (
+            _resolve_send_fw_cache_selection(args)
+            if hasattr(args, "build_number")
+            else None
+        )
     if args.request_json:
         with Path(args.request_json).open("r", encoding="utf-8") as request_file:
             return measurement_request_from_dict(json.load(request_file))
 
     target_cfg = client_config.target if client_config and client_config.target else {}
     build_cfg = client_config.build if client_config and client_config.build else {}
-    build_root = Path(args.build_root or str(build_cfg.get("root", ".fw_build")))
+    if cache_selection is not None:
+        selected_release, selected_build, build_root = cache_selection
+        fw_data, cached_image_paths = _validate_selected_cached_build(
+            build_root,
+            selected_release,
+            selected_build,
+        )
+    else:
+        build_root = Path(args.build_root or str(build_cfg.get("root", ".fw_build")))
+        fw_data = _read_json_file(build_root / FW_DATA_FILENAME)
+        cached_image_paths = {}
     if getattr(args, "diff", False):
         return _request_from_diff_build_manifest(args, build_root)
-    fw_data = _read_json_file(build_root / "fw_data.json")
     if not fw_data:
         raise RuntimeError(
-            f"Build provenance is missing: {build_root / 'fw_data.json'}. "
+            f"Build provenance is missing: {build_root / FW_DATA_FILENAME}. "
             "Run `cms build` before creating a firmware request."
         )
     firmware_cfg = dict(fw_data.get("firmware", {}))
@@ -2356,26 +2493,55 @@ def _request_from_send_fw_args(
     if missing_provenance:
         raise RuntimeError(
             "Build provenance is incomplete in "
-            f"{build_root / 'fw_data.json'}: {', '.join(missing_provenance)}. "
+            f"{build_root / FW_DATA_FILENAME}: {', '.join(missing_provenance)}. "
             "Run `cms build` again before creating a firmware request."
         )
-    _require_matching_build_provenance("SiSDK version", args.sisdk_version, sdk_version)
+    if cache_selection is None:
+        _require_matching_build_provenance("SiSDK version", args.sisdk_version, sdk_version)
     _require_matching_build_provenance("SiSDK commit", args.sisdk_commit, sdk_commit)
-    dut_image_arg = args.dut_image or str(target_cfg.get("dut_image", ""))
-    tester_image_arg = args.tester_image or str(target_cfg.get("tester_image", ""))
-    bootloader_image_arg = args.bootloader_image or str(target_cfg.get("bootloader_image", ""))
+    cached_build = cache_selection is not None
+    built_board = str(firmware_cfg.get("board", ""))
+    built_device = str(firmware_cfg.get("device", ""))
+    if cached_build:
+        _require_matching_build_provenance("board", args.board, built_board)
+        _require_matching_build_provenance("device", args.device, built_device)
+    dut_image_arg = (
+        str(cached_image_paths["dut_dcdc"])
+        if cached_build
+        else args.dut_image or str(target_cfg.get("dut_image", ""))
+    )
+    no_dcdc_arg = str(cached_image_paths["dut_no_dcdc"]) if cached_build else ""
+    tester_image_arg = (
+        str(cached_image_paths["tester"])
+        if cached_build
+        else args.tester_image or str(target_cfg.get("tester_image", ""))
+    )
+    bootloader_image_arg = (
+        str(cached_image_paths["bootloader"])
+        if cached_build
+        else args.bootloader_image or str(target_cfg.get("bootloader_image", ""))
+    )
     dut_image = _firmware_image_from_arg(dut_image_arg, "dut_dcdc", firmware_cfg)
-    no_dcdc_dut_image = _firmware_image_from_arg("", "dut_no_dcdc", firmware_cfg)
+    no_dcdc_dut_image = _firmware_image_from_arg(no_dcdc_arg, "dut_no_dcdc", firmware_cfg)
     tester_image = _firmware_image_from_arg(tester_image_arg, "tester", firmware_cfg)
     bootloader_image = _firmware_image_from_arg(
-        bootloader_image_arg,
-        "bootloader",
-        firmware_cfg,
+        bootloader_image_arg, "bootloader", firmware_cfg
     ) if bootloader_image_arg or firmware_cfg.get("bootloader_app_hash") else None
+    dut_sha_fallback = str(target_cfg.get("dut_sha256", firmware_cfg.get("dut_app_hash", "")))
+    tester_sha_fallback = str(target_cfg.get("tester_sha256", firmware_cfg.get("tester_app_hash", "")))
+    bootloader_sha_fallback = str(target_cfg.get("bootloader_sha256", firmware_cfg.get("bootloader_app_hash", "")))
+    request_board = (
+        built_board if cached_build
+        else args.board or str(target_cfg.get("board", firmware_cfg.get("board", "")))
+    )
+    request_device = (
+        built_device if cached_build
+        else args.device or str(target_cfg.get("device", firmware_cfg.get("device", "")))
+    )
     dut_sha256 = _selected_firmware_sha256(
         dut_image,
         requested=args.dut_sha256,
-        fallback=str(target_cfg.get("dut_sha256", firmware_cfg.get("dut_app_hash", ""))),
+        fallback=dut_sha_fallback,
     )
     no_dcdc_dut_sha256 = _selected_firmware_sha256(
         no_dcdc_dut_image,
@@ -2385,15 +2551,13 @@ def _request_from_send_fw_args(
     tester_sha256 = _selected_firmware_sha256(
         tester_image,
         requested=args.tester_sha256,
-        fallback=str(target_cfg.get("tester_sha256", firmware_cfg.get("tester_app_hash", ""))),
+        fallback=tester_sha_fallback,
     )
     bootloader_sha256 = (
         _selected_firmware_sha256(
             bootloader_image,
             requested=args.bootloader_sha256,
-            fallback=str(
-                target_cfg.get("bootloader_sha256", firmware_cfg.get("bootloader_app_hash", ""))
-            ),
+            fallback=bootloader_sha_fallback,
         )
         if bootloader_image is not None
         else ""
@@ -2410,12 +2574,15 @@ def _request_from_send_fw_args(
             "Selected SiSDK package does not declare an SDK id in .properties: "
             f"{sdk_package_path}"
         )
-    xapi_file = sdk_package_path / "bluetooth_le_host" / "api" / "sl_bt.xapi"
-    if not xapi_file.is_file():
-        raise RuntimeError(
-            "Selected SiSDK BGAPI definition does not exist: "
-            f"{xapi_file}"
-        )
+    if cached_build:
+        xapi_file = cached_image_paths["xapi"]
+    else:
+        xapi_file = sdk_package_path / "bluetooth_le_host" / "api" / "sl_bt.xapi"
+        if not xapi_file.is_file():
+            raise RuntimeError(
+                "Selected SiSDK BGAPI definition does not exist: "
+                f"{xapi_file}"
+            )
     xapi_hash = _sha256_file(xapi_file)
     if recorded_xapi_hash != xapi_hash:
         raise RuntimeError(
@@ -2455,8 +2622,8 @@ def _request_from_send_fw_args(
                 sha256=bootloader_sha256,
             ) if bootloader_image is not None else None,
             bootloader_img_hash=bootloader_sha256,
-            board=args.board or str(target_cfg.get("board", firmware_cfg.get("board", ""))),
-            device=args.device or str(target_cfg.get("device", firmware_cfg.get("device", ""))),
+            board=request_board,
+            device=request_device,
             xapi_file=FirmwareImage(
                 name=xapi_file.name,
                 url=str(xapi_file),
@@ -3086,7 +3253,12 @@ def _read_json_file(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
-def _discover_built_firmware(role: str, firmware_cfg: dict[str, Any]) -> Path:
+def _discover_built_firmware(
+    role: str,
+    firmware_cfg: dict[str, Any],
+    *,
+    cached_build: bool = False,
+) -> Path:
     build_root = Path(str(firmware_cfg.get("build_root", ".fw_build")))
     candidates_by_role = {
         "dut": ("dut_dcdc", "dut_no_dcdc"),
@@ -3099,7 +3271,7 @@ def _discover_built_firmware(role: str, firmware_cfg: dict[str, Any]) -> Path:
     if requested_roles is None:
         raise RuntimeError(f"Unsupported built firmware role: {role}")
 
-    manifest_path = build_root / "fw_data.json"
+    manifest_path = build_root / FW_DATA_FILENAME
     manifest = _read_json_file(manifest_path)
     if not isinstance(manifest, dict):
         raise RuntimeError(f"Build provenance is invalid: {manifest_path}")
@@ -3113,52 +3285,31 @@ def _discover_built_firmware(role: str, firmware_cfg: dict[str, Any]) -> Path:
 
     missing_paths: list[str] = []
     for requested_role in requested_roles:
-        for artifact in artifacts:
-            if not isinstance(artifact, dict) or str(artifact.get("role", "")) != requested_role:
-                continue
+        role_artifacts = [
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, dict) and str(artifact.get("role", "")) == requested_role
+        ]
+        if cached_build and len(role_artifacts) != 1:
+            raise RuntimeError(
+                f"Cached build must contain one {requested_role} firmware artifact: {manifest_path}"
+            )
+        for artifact in role_artifacts:
             image = str(artifact.get("image", ""))
             if not image:
                 continue
             image_path = Path(image).expanduser()
             if not image_path.is_absolute():
                 image_path = build_root / image_path
-
-            cache_manifest_value = str(artifact.get("cache_manifest", ""))
-            if cache_manifest_value:
-                cache_manifest_path = Path(cache_manifest_value).expanduser()
-                if not cache_manifest_path.is_absolute():
-                    cache_manifest_path = build_root / cache_manifest_path
-                cache_manifest = _read_json_file(cache_manifest_path)
-                if not isinstance(cache_manifest, dict):
-                    raise RuntimeError(
-                        f"Firmware cache manifest is invalid: {cache_manifest_path}"
-                    )
-                selected_image = cache_manifest.get("selected_image")
-                if not isinstance(selected_image, dict):
-                    raise RuntimeError(
-                        f"Firmware cache manifest is incomplete: {cache_manifest_path}"
-                    )
-                selected_relative = Path(str(selected_image.get("path", "")))
-                if (
-                    not str(selected_image.get("path", ""))
-                    or selected_relative.is_absolute()
-                    or any(part in {"", ".", ".."} for part in selected_relative.parts)
-                ):
-                    raise RuntimeError(
-                        f"Firmware cache manifest has an unsafe image path: {cache_manifest_path}"
-                    )
-                cache_root = cache_manifest_path.parent.resolve()
-                cached_image_path = (cache_root / selected_relative).resolve()
-                if not cached_image_path.is_relative_to(cache_root):
-                    raise RuntimeError(
-                        f"Firmware cache image escapes its manifest directory: {cache_manifest_path}"
-                    )
-                if image_path.resolve() != cached_image_path:
-                    raise RuntimeError(
-                        "Build provenance image does not match its firmware cache manifest: "
-                        f"{image_path} != {cached_image_path}"
-                    )
-                image_path = cached_image_path
+            if cached_build:
+                image_path = _resolve_path_under(build_root, str(image_path), "cached firmware image")
+            expected_sha256 = str(artifact.get("sha256", ""))
+            if cached_build and not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                raise RuntimeError(f"Cached firmware has no valid SHA-256: {image_path}")
+            if expected_sha256 and image_path.is_file() and _sha256_file(image_path) != expected_sha256:
+                raise RuntimeError(f"Built firmware failed its SHA-256 check: {image_path}")
+            if cached_build and image_path.is_file() and image_path.suffix.lower() not in FIRMWARE_CACHE_IMAGE_SUFFIXES:
+                raise RuntimeError(f"Built firmware is not flashable: {image_path}")
             if image_path.is_file():
                 return image_path
             missing_paths.append(str(image_path))
@@ -3187,12 +3338,15 @@ def _selected_firmware_sha256(
 ) -> str:
     """Hash the exact local image that will be uploaded to the Bench."""
 
-    if requested:
-        return requested
     source = image["url"]
     if source.startswith("http://") or source.startswith("https://"):
-        return fallback
-    return _sha256_file(Path(source))
+        return requested or fallback
+    actual = _sha256_file(Path(source))
+    if requested and requested.casefold() != actual:
+        raise RuntimeError(
+            f"Requested firmware SHA-256 does not match the selected image: {source}"
+        )
+    return actual
 
 
 def _sha256_file(path: Path) -> str:
