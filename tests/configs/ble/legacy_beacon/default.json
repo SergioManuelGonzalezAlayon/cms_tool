@@ -3,8 +3,8 @@
         "name": "default"
     },
     "advertiser": {
-        "interval": 200,
-        "payload": 18,
+        "interval": 1000,
+        "payload": 31,
         "phy": "1m",
         "tx_power": 0
     },
@@ -19,6 +19,6 @@
         "board": "brd4182a"
     },
     "hw": {
-        "supply_v": 3.0
+        "supply_v": 3.3
     }
 }

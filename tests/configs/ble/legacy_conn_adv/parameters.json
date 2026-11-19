@@ -38,7 +38,7 @@
             "name": "supply_voltage",
             "label": "Supply voltage",
             "control": "hardware",
-            "default": "3.0 V",
+            "default": "3.3 V",
             "file_token": "vdd",
             "values": [
                 "1.8 V",
@@ -110,7 +110,7 @@
             "name": "advertising_interval",
             "label": "Advertising Interval",
             "control": "bgapi",
-            "default": "20 ms",
+            "default": "1 s",
             "file_token": "adv",
             "range": {
                 "min": "20 ms",
@@ -122,7 +122,7 @@
             "name": "tx_payload_length",
             "label": "TX Payload Length",
             "control": "bgapi",
-            "default": "10 bytes",
+            "default": "18 bytes",
             "file_token": "payload",
             "range": {
                 "min": "0 bytes",

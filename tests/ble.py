@@ -473,15 +473,25 @@ def DUTPAwRStart(DUT,
 
 
 @pytest.fixture
-def DUTScanSync(DUT):
+def DUTScanSync(DUT, Config):
     """Configure DUT PAwR synchronization with a specific advertiser."""
     started = False
     sync_handle = None
+    pawr_cfg = dataclass_from_dict(PAWRConfig, Config.get("pawr", {}))
 
-    def _start(*, address, address_type, adv_sid=0, skip=0, timeout=200, reporting_mode=None):
+    def _start(*, address, address_type, adv_sid=0, skip=0, timeout=None, reporting_mode=None):
         nonlocal started, sync_handle
+        if timeout is None:
+            timeout = Config.get("sync", {}).get("timeout", 200)
         if reporting_mode is None:
-            reporting_mode = DUT.bt.sync.REPORTING_MODE_REPORT_ALL
+            configured_mode = str(
+                Config.get("sync", {}).get("reporting_mode", "REPORT_ALL")
+            ).strip().upper()
+            configured_mode = configured_mode.removeprefix("REPORT_")
+            reporting_mode = getattr(
+                DUT.bt.sync,
+                f"REPORTING_MODE_REPORT_{configured_mode}",
+            )
 
         rsp = DUT.bt.sync_scanner.set_sync_parameters(skip, timeout, reporting_mode)
         assert rsp.result == 0
@@ -495,6 +505,7 @@ def DUTScanSync(DUT):
         rsp = DUT.bt.sync_scanner.open(address, address_type, adv_sid)
         assert rsp.result == 0
         sync_handle = rsp.sync
+        started = True
         log.info(
             "DUT sync open requested: sync=%s address=%s address_type=%s adv_sid=%s",
             sync_handle,
@@ -504,18 +515,31 @@ def DUTScanSync(DUT):
         )
 
         try:
-            bgapi_check_event(
+            opened_evt = bgapi_check_event(
                 DUT,
                 "pawr_sync",
                 "opened",
-                lambda evt: evt.sync == sync_handle,
+                lambda evt: (
+                    evt.sync == sync_handle
+                    and evt.address == address
+                    and evt.address_type == address_type
+                    and evt.adv_sid == adv_sid
+                ),
                 eventTimeout=1,
                 maxTime=10,
             )
-            log.info("DUT PAwR sync opened")
-
+            sync_handle = opened_evt.sync
+            log.info(
+                "DUT PAwR sync opened: sync=%s address=%s address_type=%s adv_sid=%s",
+                sync_handle,
+                _format_bd_addr(opened_evt.address),
+                opened_evt.address_type,
+                opened_evt.adv_sid,
+            )
         except BGAPIEventTimeoutError:
-            bgapi_check_event(
+            if reporting_mode == DUT.bt.sync.REPORTING_MODE_REPORT_NONE:
+                raise
+            report_evt = bgapi_check_event(
                 DUT,
                 "pawr_sync",
                 "subevent_report",
@@ -523,9 +547,20 @@ def DUTScanSync(DUT):
                 eventTimeout=1,
                 maxTime=10,
             )
+            sync_handle = report_evt.sync
             log.info("DUT PAwR sync established via subevent reports")
 
         started = True
+        sync_subevents = bytes(range(pawr_cfg.num_subevents))
+        if not sync_subevents:
+            raise ValueError("PAwR observer requires at least one configured subevent")
+        rsp = DUT.bt.pawr_sync.set_sync_subevents(sync_handle, sync_subevents)
+        assert rsp.result == 0
+        log.info(
+            "DUT PAwR sync subevents selected: sync=%s subevents=%s",
+            sync_handle,
+            list(sync_subevents),
+        )
         return sync_handle
 
     yield _start
@@ -677,15 +712,24 @@ def TesterDiscoverPAwRAdvertiser(Tester,
     raise NotImplementedError("TesterDiscoverPAwRAdvertiser fixture is not implemented yet.")
 
 @pytest.fixture
-def TesterScanSync(Tester):
+def TesterScanSync(Tester, Config):
     """Configure tester PAwR synchronization with a specific advertiser."""
     started = False
     sync_handle = None
 
-    def _start(*, address, address_type, adv_sid=0, skip=0, timeout=200, reporting_mode=None):
+    def _start(*, address, address_type, adv_sid=0, skip=0, timeout=None, reporting_mode=None):
         nonlocal started, sync_handle
+        if timeout is None:
+            timeout = Config.get("sync", {}).get("timeout", 200)
         if reporting_mode is None:
-            reporting_mode = Tester.bt.sync.REPORTING_MODE_REPORT_ALL
+            configured_mode = str(
+                Config.get("sync", {}).get("reporting_mode", "REPORT_ALL")
+            ).strip().upper()
+            configured_mode = configured_mode.removeprefix("REPORT_")
+            reporting_mode = getattr(
+                Tester.bt.sync,
+                f"REPORTING_MODE_REPORT_{configured_mode}",
+            )
 
         rsp = Tester.bt.sync_scanner.set_sync_parameters(skip, timeout, reporting_mode)
         assert rsp.result == 0
@@ -699,6 +743,7 @@ def TesterScanSync(Tester):
         rsp = Tester.bt.sync_scanner.open(address, address_type, adv_sid)
         assert rsp.result == 0
         sync_handle = rsp.sync
+        started = True
         log.info(
             "Tester sync open requested: sync=%s address=%s address_type=%s adv_sid=%s",
             sync_handle,
@@ -708,29 +753,31 @@ def TesterScanSync(Tester):
         )
 
         try:
-            bgapi_check_event(
-                Tester,
-                "sync",
-                "closed",
-                lambda evt: _log_sync_event(evt),
-                eventTimeout=0.5,
-                maxTime=2,
-            )
-        except BGAPIEventTimeoutError:
-            log.info("No sync.closed event observed during initial sync debug window")
-
-        try:
-            bgapi_check_event(
+            opened_evt = bgapi_check_event(
                 Tester,
                 "pawr_sync",
                 "opened",
-                lambda evt: evt.sync == sync_handle,
+                lambda evt: (
+                    evt.sync == sync_handle
+                    and evt.address == address
+                    and evt.address_type == address_type
+                    and evt.adv_sid == adv_sid
+                ),
                 eventTimeout=1,
                 maxTime=10,
             )
-            log.info("Tester PAwR sync opened")
+            sync_handle = opened_evt.sync
+            log.info(
+                "Tester PAwR sync opened: sync=%s address=%s address_type=%s adv_sid=%s",
+                sync_handle,
+                _format_bd_addr(opened_evt.address),
+                opened_evt.address_type,
+                opened_evt.adv_sid,
+            )
         except BGAPIEventTimeoutError:
-            bgapi_check_event(
+            if reporting_mode == Tester.bt.sync.REPORTING_MODE_REPORT_NONE:
+                raise
+            report_evt = bgapi_check_event(
                 Tester,
                 "pawr_sync",
                 "subevent_report",
@@ -738,9 +785,9 @@ def TesterScanSync(Tester):
                 eventTimeout=1,
                 maxTime=10,
             )
+            sync_handle = report_evt.sync
             log.info("Tester PAwR sync established via subevent reports")
 
-        started = True
         return sync_handle
 
     yield _start

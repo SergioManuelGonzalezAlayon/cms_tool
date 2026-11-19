@@ -433,6 +433,7 @@ def test_ble_callers_only_pass_duration_using_existing_capture_context(
             None, None, SimpleNamespace(max_interval=80),
         )),
         "Config": {"pawr": {"interval": 223.9875}},
+        "PAWRConfig": ble.PAWRConfigType(interval=223.9875),
     }
     test = getattr(ble, test_name)
     kwargs = {name: values.get(name, MagicMock()) for name in signature(test).parameters}

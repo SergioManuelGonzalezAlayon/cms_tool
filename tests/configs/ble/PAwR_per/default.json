@@ -13,6 +13,10 @@
         "window": 50,
         "phy": "1m"
     },
+    "sync": {
+        "timeout": 200,
+        "reporting_mode": "NONE"
+    },
     "pawr": {
         "interval": 1000,
         "rx_payload_length": 10,

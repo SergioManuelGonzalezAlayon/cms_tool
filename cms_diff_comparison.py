@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,7 @@ class PairingIdentity:
     board: str
     device: str
     firmware_role: str
+    supply_voltage_v: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,13 +85,15 @@ class PairingResult:
 
 @dataclass(frozen=True, slots=True)
 class MeasurementMetrics:
-    """Current values extracted from one raw measurement result artifact."""
+    """Numerical metrics extracted from one raw measurement result artifact."""
 
     avg_current_ma: float | None
     peak_current_ma: float | None
     rx_current_ma: float | None
     tx_current_ma: float | None
     sleep_current_ma: float | None
+    event_energy_nj: float | None
+    interval_energy_nj: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +133,7 @@ class ComparisonDiagnostic:
                 "board": self.identity.board,
                 "device": self.identity.device,
                 "firmware_role": self.identity.firmware_role,
+                "supply_voltage_v": self.identity.supply_voltage_v,
             }
         return payload
 
@@ -143,7 +148,7 @@ class ComparisonInputs:
 
 @dataclass(frozen=True, slots=True)
 class PercentageThresholdPolicy:
-    """Initial differential status policy for positive current regressions."""
+    """Initial differential status policy for positive metric regressions."""
 
     warning_percent: float = 1.5
     failure_percent: float = 2.0
@@ -161,6 +166,8 @@ _METRIC_FIELDS = (
     "rx_current_ma",
     "tx_current_ma",
     "sleep_current_ma",
+    "event_energy_nj",
+    "interval_energy_nj",
 )
 
 _TABLE_METRIC_ORDER = (
@@ -169,15 +176,28 @@ _TABLE_METRIC_ORDER = (
     "rx_current_ma",
     "tx_current_ma",
     "sleep_current_ma",
+    "event_energy_nj",
+    "interval_energy_nj",
 )
+
+_METRIC_UNITS = {
+    "avg_current_ma": "mA",
+    "peak_current_ma": "mA",
+    "rx_current_ma": "mA",
+    "tx_current_ma": "mA",
+    "sleep_current_ma": "mA",
+    "event_energy_nj": "nJ",
+    "interval_energy_nj": "nJ",
+}
 
 
 def extract_measurement_metrics(payload: dict[str, Any]) -> MeasurementMetrics:
-    """Extract Phase 4 metrics from the established raw-result schema.
+    """Extract comparable metrics from the established raw-result schema.
 
     ``result_metric`` contains average, peak, RX, and TX values.  Sleep
     current is specifically the ``i_mean_ma`` value of the sole
-    ``result_summary`` entry whose ``meas_type`` is ``Interval``.
+    ``result_summary`` entry whose ``meas_type`` is ``Interval``. Event and
+    interval energy use the corresponding ``e_mean_nj`` summary values.
     """
 
     if not isinstance(payload, dict):
@@ -191,6 +211,8 @@ def extract_measurement_metrics(payload: dict[str, Any]) -> MeasurementMetrics:
         rx_current_ma=_optional_current(result_metric, "rx_current_ma"),
         tx_current_ma=_optional_current(result_metric, "tx_current_ma"),
         sleep_current_ma=_interval_sleep_current(payload),
+        event_energy_nj=_summary_metric(payload, "Event", "e_mean_nj"),
+        interval_energy_nj=_summary_metric(payload, "Interval", "e_mean_nj"),
     )
 
 
@@ -226,6 +248,15 @@ def prepare_comparison_inputs(pairing: PairingResult) -> ComparisonInputs:
         for variable in _METRIC_FIELDS:
             version1_reason = _metric_omission_reason(pair.version1.payload, variable)
             version2_reason = _metric_omission_reason(pair.version2.payload, variable)
+            if (
+                variable in {"event_energy_nj", "interval_energy_nj"}
+                and getattr(version1_metrics, variable) is None
+                and getattr(version2_metrics, variable) is None
+                and version1_reason == version2_reason
+                and version1_reason is not None
+                and version1_reason.startswith("missing_")
+            ):
+                continue
             if version1_reason is not None:
                 diagnostics.append(_omission_diagnostic(pair.version1, variable, version1_reason))
             if version2_reason is not None:
@@ -345,9 +376,12 @@ def render_diff_comparison_table(report: dict[str, Any]) -> str:
         rows = [metric_by_name[name] for name in _TABLE_METRIC_ORDER if name in metric_by_name]
         if not rows:
             continue
+        include_metric_units = len(_units_for_rows(rows)) > 1
         table_rows = [
             (
-                _format_metric_name(str(metric["variable"])),
+                _format_metric_name(
+                    str(metric["variable"]), include_unit=include_metric_units
+                ),
                 _format_number(metric.get("version2")),
                 _format_number(metric.get("version1")),
                 _format_number(metric.get("delta"), signed=True),
@@ -360,7 +394,7 @@ def render_diff_comparison_table(report: dict[str, Any]) -> str:
             (
                 _table_title(identity),
                 _render_terminal_table_with_sisdk(pair, 
-                    ("Metric [mA]", "Version 2", "Version 1", "Δ (v2 − v1)", "Change", "Result"),
+                    (_metric_header(rows), "Version 2", "Version 1", "Δ (v2 − v1)", "Change", "Result"),
                     table_rows,
                 ),
                 "",
@@ -377,10 +411,31 @@ def _table_title(identity: dict[str, Any]) -> str:
     )
 
 
-def _format_metric_name(variable: str) -> str:
-    """Make known current metric names concise without changing report keys."""
+def _format_metric_name(variable: str, *, include_unit: bool = False) -> str:
+    """Make known metric names concise without changing report keys."""
 
-    return variable.removesuffix("_current_ma").replace("_", " ")
+    name = (
+        variable.removesuffix("_current_ma")
+        .removesuffix("_energy_nj")
+        .replace("_", " ")
+    )
+    unit = _METRIC_UNITS.get(variable)
+    return f"{name} [{unit}]" if include_unit and unit else name
+
+
+def _units_for_rows(rows: list[dict[str, Any]]) -> set[str]:
+    return {
+        _METRIC_UNITS[variable]
+        for metric in rows
+        if (variable := str(metric.get("variable", ""))) in _METRIC_UNITS
+    }
+
+
+def _metric_header(rows: list[dict[str, Any]]) -> str:
+    units = _units_for_rows(rows)
+    if len(units) == 1:
+        return f"Metric [{next(iter(units))}]"
+    return "Metric"
 
 
 def _render_terminal_table_with_sisdk(
@@ -474,7 +529,7 @@ def _comparison_status(
     return ComparisonStatus.PASS
 
 
-def _identity_to_dict(identity: PairingIdentity) -> dict[str, str]:
+def _identity_to_dict(identity: PairingIdentity) -> dict[str, Any]:
     return {
         "feature": identity.feature,
         "config_path": identity.config_path,
@@ -484,6 +539,7 @@ def _identity_to_dict(identity: PairingIdentity) -> dict[str, str]:
         "board": identity.board,
         "device": identity.device,
         "firmware_role": identity.firmware_role,
+        "supply_voltage_v": identity.supply_voltage_v,
     }
 
 
@@ -512,16 +568,17 @@ def _extract_or_diagnose(
 
 
 def _metric_omission_reason(payload: dict[str, Any], variable: str) -> str | None:
-    if variable == "sleep_current_ma":
-        summaries = payload.get("result_summary")
-        if summaries is None:
-            return "missing_interval_summary"
-        intervals = [item for item in summaries if item.get("meas_type") == "Interval"]
-        if not intervals:
-            return "missing_interval_summary"
-        if intervals[0].get("i_mean_ma") is None:
-            return "null_metric"
-        return None
+    summary_metric_types = {
+        "sleep_current_ma": ("Interval", "i_mean_ma"),
+        "event_energy_nj": ("Event", "e_mean_nj"),
+        "interval_energy_nj": ("Interval", "e_mean_nj"),
+    }
+    if variable in summary_metric_types:
+        meas_type, field = summary_metric_types[variable]
+        summary = _summary_entry(payload, meas_type)
+        if summary is None:
+            return f"missing_{meas_type.lower()}_summary"
+        return "null_metric" if summary.get(field) is None else None
 
     result_metric = payload["result_metric"]
     if variable not in result_metric:
@@ -547,25 +604,38 @@ def _omission_diagnostic(
 
 
 def _interval_sleep_current(payload: dict[str, Any]) -> float | None:
+    return _summary_metric(payload, "Interval", "i_mean_ma")
+
+
+def _summary_metric(payload: dict[str, Any], meas_type: str, field: str) -> float | None:
+    summary = _summary_entry(payload, meas_type)
+    return _optional_number(summary, field) if summary is not None else None
+
+
+def _summary_entry(payload: dict[str, Any], meas_type: str) -> dict[str, Any] | None:
     summaries = payload.get("result_summary")
     if summaries is None:
         return None
     if not isinstance(summaries, list):
         raise ResultMetricParseError("measurement result result_summary must be a list")
-    intervals: list[dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
     for index, summary in enumerate(summaries, start=1):
         if not isinstance(summary, dict):
             raise ResultMetricParseError(f"result_summary entry {index} must be an object")
-        if summary.get("meas_type") == "Interval":
-            intervals.append(summary)
-    if not intervals:
+        if summary.get("meas_type") == meas_type:
+            matches.append(summary)
+    if not matches:
         return None
-    if len(intervals) != 1:
-        raise ResultMetricParseError("result_summary has multiple Interval entries")
-    return _optional_current(intervals[0], "i_mean_ma")
+    if len(matches) != 1:
+        raise ResultMetricParseError(f"result_summary has multiple {meas_type} entries")
+    return matches[0]
 
 
 def _optional_current(payload: dict[str, Any], field: str) -> float | None:
+    return _optional_number(payload, field)
+
+
+def _optional_number(payload: dict[str, Any], field: str) -> float | None:
     value = payload.get(field)
     if value is None:
         return None
@@ -672,6 +742,14 @@ def _load_variant_results(
                     f"{path} partition does not match its paired-plan job"
                 )
         firmware = _required_object(payload, "firmware", source=str(path))
+        parameters = payload.get("parameters")
+        if parameters is not None and not isinstance(parameters, dict):
+            raise DifferentialPairingError(
+                f"{path} has no object field 'parameters'"
+            )
+        supply_voltage = _optional_supply_voltage(
+            parameters or {}, source=str(path)
+        )
         results.append(
             VariantResult(
                 variant=variant,
@@ -685,6 +763,7 @@ def _load_variant_results(
                     board=_required_text(firmware, "board", source=str(path)),
                     device=_required_text(firmware, "device", source=str(path)),
                     firmware_role=planned_identity.firmware_role,
+                    supply_voltage_v=supply_voltage,
                 ),
                 payload=payload,
             )
@@ -749,6 +828,24 @@ def _text_or_empty(payload: dict[str, Any], field: str, *, source: str) -> str:
     return value.strip()
 
 
+def _optional_supply_voltage(
+    parameters: dict[str, Any], *, source: str
+) -> float | None:
+    value = parameters.get("supply_voltage_v")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise DifferentialPairingError(
+            f"{source} has no numeric 'parameters.supply_voltage_v' field"
+        )
+    voltage = float(value)
+    if not math.isfinite(voltage):
+        raise DifferentialPairingError(
+            f"{source} has a non-finite 'parameters.supply_voltage_v' field"
+        )
+    return voltage
+
+
 def _normalised_path(value: str) -> str:
     normalised = value.replace("\\", "/")
     marker = "tests/configs/"
@@ -776,4 +873,9 @@ def _identity_sort_key(identity: PairingIdentity) -> tuple[str, ...]:
         identity.board,
         identity.device,
         identity.firmware_role,
+        (
+            ""
+            if identity.supply_voltage_v is None
+            else format(identity.supply_voltage_v, ".17g")
+        ),
     )

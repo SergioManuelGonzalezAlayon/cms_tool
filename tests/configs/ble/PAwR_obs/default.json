@@ -13,8 +13,12 @@
         "window": 50,
         "phy": "1m"
     },
+    "sync": {
+        "timeout": 500,
+        "reporting_mode": "NONE"
+    },
     "pawr": {
-        "interval": 1000,
+        "interval": 2240,
         "rx_payload_length": 10,
         "num_subevents": 1,
         "subevent_interval": 6,
@@ -28,6 +32,6 @@
         "board": "brd4182a"
     },
     "hw": {
-        "supply_v": 3.0
+        "supply_v": 3.3
     }
 }
