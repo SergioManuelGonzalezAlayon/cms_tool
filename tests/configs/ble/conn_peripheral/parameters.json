@@ -39,7 +39,7 @@
             "name": "supply_voltage",
             "label": "Supply voltage",
             "control": "hardware",
-            "default": "3.0 V",
+            "default": "3.3 V",
             "file_token": "vdd",
             "values": [
                 "1.8 V",
@@ -126,7 +126,7 @@
             "name": "connection_interval",
             "label": "Connection Interval",
             "control": "bgapi",
-            "default": "15 ms",
+            "default": "200 ms",
             "file_token": "conn",
             "range": {
                 "min": "7.5 ms",

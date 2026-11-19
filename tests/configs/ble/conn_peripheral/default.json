@@ -13,9 +13,9 @@
         "phy": "1m"
     },
     "connection": {
-        "interval": 15,
+        "interval": 200,
         "latency": 0,
-        "timeout": 10,
+        "timeout": 41,
         "tx_payload_length": 10,
         "rx_payload_length": 23,
         "phy": "1m",
@@ -27,6 +27,6 @@
         "board": "brd4182a"
     },
     "hw": {
-        "supply_v": 3.0
+        "supply_v": 3.3
     }
 }

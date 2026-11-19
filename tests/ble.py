@@ -472,7 +472,7 @@ def DUTPAwRStart(DUT,
 
 
 @pytest.fixture
-def DUTScanSync(DUT):
+def DUTScanSync(DUT, Config):
     """Configure DUT PAwR synchronization with a specific advertiser."""
     started = False
     sync_handle = None
@@ -480,7 +480,13 @@ def DUTScanSync(DUT):
     def _start(*, address, address_type, adv_sid=0, skip=0, timeout=200, reporting_mode=None):
         nonlocal started, sync_handle
         if reporting_mode is None:
-            reporting_mode = DUT.bt.sync.REPORTING_MODE_REPORT_ALL
+            configured_mode = str(
+                Config.get("sync", {}).get("reporting_mode", "REPORT_ALL")
+            ).strip().upper()
+            reporting_mode = getattr(
+                DUT.bt.sync,
+                f"REPORTING_MODE_{configured_mode}",
+            )
 
         rsp = DUT.bt.sync_scanner.set_sync_parameters(skip, timeout, reporting_mode)
         assert rsp.result == 0

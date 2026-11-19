@@ -58,7 +58,7 @@ def load_test_config(path: str | Path) -> dict:
     config = _load_json(path)
     if not isinstance(config, dict):
         raise ValueError(f"test config must be a JSON object: {path}")
-    for section in ("test", "advertiser", "scanner", "connection", "pawr", "firmware", "hw"):
+    for section in ("test", "advertiser", "scanner", "connection", "sync", "pawr", "firmware", "hw"):
         if section in config and not isinstance(config[section], dict):
             raise ValueError(f"test config section must be an object: {section}")
     return config
@@ -67,7 +67,7 @@ def load_test_config(path: str | Path) -> dict:
 def validate_test_config_data(config: dict) -> None:
     if not isinstance(config, dict):
         raise ValueError("test config must be a JSON object")
-    for section in ("test", "advertiser", "scanner", "connection", "pawr", "firmware", "hw"):
+    for section in ("test", "advertiser", "scanner", "connection", "sync", "pawr", "firmware", "hw"):
         if section in config and not isinstance(config[section], dict):
             raise ValueError(f"test config section must be an object: {section}")
     validate_ble_test_config(config)
@@ -190,6 +190,13 @@ def validate_ble_test_config(config: dict) -> None:
             raise ValueError(f"invalid PAwR parameters: {exc}") from exc
         if not is_generated_pawr_config_valid(config):
             raise ValueError("PAwR timing and payload parameters are incompatible")
+    sync = config.get("sync", {})
+    reporting_mode = sync.get("reporting_mode")
+    if reporting_mode is not None and (
+        not isinstance(reporting_mode, str)
+        or reporting_mode.strip().upper() not in {"NONE", "REPORT_ALL"}
+    ):
+        raise ValueError("sync.reporting_mode must be NONE or REPORT_ALL")
 
 
 def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
