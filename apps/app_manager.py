@@ -97,6 +97,7 @@ class SDKSelection:
     artifactory_build: str = ""
     archive_path: Path | None = None
     archive_sha256: str = ""
+    sdk_id: str = ""
 
 
 _TOOL_OVERRIDES: dict[str, str] = {}
@@ -305,6 +306,17 @@ def _sisdk_version_from_properties(sdk_path: Path) -> str:
     raise RuntimeError(f"SiSDK package properties are missing version: {properties_path}")
 
 
+def _sisdk_id_from_properties(sdk_path: Path) -> str:
+    properties_path = sdk_path / ".properties"
+    if not properties_path.is_file():
+        return ""
+    for line in properties_path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "id":
+            return value.strip()
+    return ""
+
+
 def _sisdk_build_number_from_package(sdk_path: Path) -> str:
     build_number_path = sdk_path / ".build-number"
     if not build_number_path.is_file():
@@ -338,6 +350,7 @@ def inspect_sdk_selection(
         path=sdk_path,
         version=version,
         source=source,
+        sdk_id=_sisdk_id_from_properties(sdk_path),
         build_number=build_number,
         commit=commit,
         sdk_hash=commit,
@@ -481,13 +494,33 @@ def _matching_sdk_status(status_path: Path, version: str, build: str) -> dict:
     return status
 
 
+def _prune_artifactory_sdk_package(sdk_selection: SDKSelection) -> None:
+    package_path = sdk_selection.path
+    cache_root = _artifact_cache_build_root(sdk_selection).resolve()
+    if (
+        sdk_selection.source != "artifactory"
+        or not re.fullmatch(r"[0-9a-f]{64}", sdk_selection.archive_sha256)
+        or package_path.name != "package"
+        or package_path.is_symlink()
+        or package_path.resolve().parent != cache_root
+        or not package_path.is_dir()
+    ):
+        return
+    try:
+        shutil.rmtree(package_path)
+        print(f"Pruned extracted SiSDK package {package_path}")
+    except OSError as error:
+        print(f"Could not prune extracted SiSDK package {package_path}: {error}")
+
+
 def resolve_artifactory_sdk_selection(
     version: str,
     build: str = "",
     *,
     fallback_to_latest: bool = False,
+    require_package: bool = False,
 ) -> SDKSelection:
-    """Download and prepare one configured Artifactory SDK build in the stable cache."""
+    """Resolve an Artifactory SDK from its package or complete build cache."""
 
     version = version.strip()
     build = build.strip()
@@ -586,6 +619,7 @@ def resolve_artifactory_sdk_selection(
             path=cached_selection.path,
             version=cached_selection.version,
             source=cached_selection.source,
+            sdk_id=cached_selection.sdk_id,
             build_number=cached_selection.build_number,
             commit=cached_selection.commit,
             sdk_hash=cached_selection.sdk_hash,
@@ -596,6 +630,62 @@ def resolve_artifactory_sdk_selection(
             archive_path=cached_archive.resolve() if cached_archive.is_file() else None,
             archive_sha256=cached_archive_sha256,
         )
+
+    cache_root = (DEFAULT_OUTPUT_ROOT / version / build).resolve()
+    if not require_package and cache_root.is_relative_to(DEFAULT_OUTPUT_ROOT.resolve()):
+        try:
+            fw_data = json.loads((cache_root / FW_DATA_FILENAME).read_text(encoding="utf-8"))
+            cache, sdk, build_data = fw_data["cache"], fw_data["sdk"], fw_data["build"]
+            firmware = fw_data["firmware"]
+            validate_firmware_artifact_roles(
+                firmware["artifacts"], REQUIRED_DIFF_FIRMWARE_ROLES
+            )
+            package_path = (cache_root / "package").resolve()
+            xapi_path = (cache_root / BGAPI_RUNTIME_DIRNAME / BGAPI_XAPI_FILENAME).resolve()
+            archive_path = Path(str(sdk.get("archive_path", ""))).resolve()
+            archive_sha256 = str(sdk.get("archive_sha256", ""))
+            sdk_version = str(sdk.get("version", ""))
+            if (
+                cache == {
+                    "schema_version": ARTIFACT_CACHE_SCHEMA_VERSION,
+                    "release": version,
+                    "build_number": build,
+                }
+                and sdk.get("source") == "artifactory"
+                and sdk.get("artifactory_version") == version
+                and str(sdk.get("artifactory_build", "")) == build
+                and str(sdk.get("build_number", "")) == build
+                and (sdk_version == version or sdk_version.startswith(f"{version}."))
+                and Path(str(sdk.get("package_path", ""))).resolve() == package_path
+                and Path(str(build_data.get("root", ""))).resolve() == cache_root
+                and Path(str(build_data.get("xapi", ""))).resolve() == xapi_path
+                and xapi_path.is_file()
+                and re.fullmatch(r"[0-9a-f]{64}", str(sdk.get("xapi_sha256", "")))
+                and _sha256(xapi_path) == sdk["xapi_sha256"]
+                and re.fullmatch(r"[0-9a-f]{64}", archive_sha256)
+                and (not sdk.get("archive_path") or archive_path == (cache_root / ARCHIVE_NAME).resolve())
+                and isinstance(fw_data.get("sdk_id"), str)
+                and fw_data["sdk_id"].strip()
+                and isinstance(fw_data.get("vcom"), dict)
+            ):
+                print(f"Using cached SiSDK {version} build {build} manifest={cache_root / FW_DATA_FILENAME}")
+                return SDKSelection(
+                    path=package_path,
+                    version=sdk_version,
+                    source="artifactory",
+                    sdk_id=fw_data["sdk_id"].strip(),
+                    build_number=build,
+                    commit=str(sdk.get("commit", "")),
+                    sdk_hash=str(sdk.get("hash", "")),
+                    xapi_path=package_path / SL_BT_XAPI_PATH,
+                    xapi_hash=str(sdk["xapi_sha256"]),
+                    artifactory_version=version,
+                    artifactory_build=build,
+                    archive_path=archive_path if sdk.get("archive_path") else None,
+                    archive_sha256=archive_sha256,
+                )
+        except (OSError, AttributeError, KeyError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+            pass
 
     try:
         if fallback_to_latest:
@@ -776,6 +866,7 @@ def resolve_artifactory_sdk_selection(
         path=selection.path,
         version=selection.version,
         source=selection.source,
+        sdk_id=selection.sdk_id,
         build_number=selection.build_number,
         commit=selection.commit,
         sdk_hash=selection.sdk_hash,
@@ -906,9 +997,14 @@ def load_app_configuration(version: str, board: str) -> tuple[dict, dict, Path]:
     return app_config, board_config, config_path
 
 
-def resolve_sdk_app_slcp(sdk_path: Path, application: str) -> Path:
+def resolve_sdk_app_slcp(
+    sdk_path: Path,
+    application: str,
+    *,
+    must_exist: bool = True,
+) -> Path:
     slcp = sdk_path / SDK_BLUETOOTH_APP_ROOT / application / f"{application}.slcp"
-    if not slcp.is_file():
+    if must_exist and not slcp.is_file():
         raise FileNotFoundError(
             f"SiSDK application {application!r} was not found at the expected path: {slcp}"
         )
@@ -1092,7 +1188,7 @@ def _firmware_artifact_cache_inputs(
         "project": {
             "name": project_name,
             "slcp": _relative_to_repo(slcp),
-            "slcp_sha256": _sha256(slcp),
+            "slcp_sha256": _sha256(slcp) if slcp.is_file() else "",
         },
         "firmware": {
             "board": firmware_cfg["board"],
@@ -1287,7 +1383,35 @@ def _cached_firmware_for_build(
 ) -> tuple[Path, Path] | None:
     if action != "build" or cache_entry is None or cache_inputs is None:
         return None
-    return _cached_firmware_artifact(cache_entry, cache_inputs)
+    cached = _cached_firmware_artifact(cache_entry, cache_inputs)
+    if cached is not None or cache_inputs["project"]["slcp_sha256"]:
+        return cached
+
+    _ensure_artifact_cache_parent(cache_entry)
+    for candidate in cache_entry.parent.iterdir() if cache_entry.parent.is_dir() else ():
+        if candidate.is_symlink() or not candidate.is_dir():
+            continue
+        manifest_path = candidate / ARTIFACT_CACHE_MANIFEST_FILENAME
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            inputs = manifest["inputs"]
+            project = inputs["project"]
+            project_hash = str(project["slcp_sha256"])
+            if not re.fullmatch(r"[0-9a-f]{64}", project_hash):
+                continue
+            comparable = dict(inputs)
+            comparable["project"] = {**project, "slcp_sha256": ""}
+            if (
+                comparable != cache_inputs
+                or candidate.name != _artifact_cache_fingerprint(inputs)
+            ):
+                continue
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        cached = _cached_firmware_artifact(candidate, inputs)
+        if cached is not None:
+            return cached
+    return None
 
 
 def _store_firmware_artifact_if_cached(
@@ -1672,6 +1796,8 @@ def write_fw_data(
         hash_by_role[hash_key_by_role[artifact["role"]]] = artifact["sha256"]
 
     fw_data = {
+        "sdk_id": (sdk_selection.sdk_id if sdk_selection else "")
+        or _sisdk_id_from_properties(sdk_path),
         "firmware": {
             "board": firmware_cfg["board"],
             "brev": firmware_cfg.get("brev", ""),
@@ -1971,6 +2097,7 @@ def process_slcp(
     application: str = "",
     release_config_path: Path | None = None,
     release_config: dict | None = None,
+    cache_only: bool = False,
 ) -> dict:
     out_dir = output_dir_for(slcp, build_root)
     started_at = time.perf_counter()
@@ -2022,6 +2149,16 @@ def process_slcp(
             metadata_path=cache_manifest,
             cache_manifest=cache_manifest,
             cache_hit=True,
+        )
+    if cache_only:
+        return _firmware_build_summary(
+            summary_context,
+            started_at,
+            generated_slcp=None,
+            image=None,
+            metadata_path=None,
+            cache_manifest=None,
+            cache_hit=False,
         )
 
     if out_dir.exists() and (
@@ -2084,6 +2221,7 @@ def process_sdk_app_profile(
     prs_configuration: str,
     profile_name: str,
     profile_config: dict,
+    cache_only: bool = False,
 ) -> dict:
     project_name = APP_PROFILE_PROJECT_NAMES[profile_name]
     out_dir = build_root / project_name
@@ -2158,6 +2296,16 @@ def process_sdk_app_profile(
             metadata_path=cache_manifest,
             cache_manifest=cache_manifest,
             cache_hit=True,
+        )
+    if cache_only:
+        return _firmware_build_summary(
+            summary_context,
+            started_at,
+            generated_slcp=None,
+            image=None,
+            metadata_path=None,
+            cache_manifest=None,
+            cache_hit=False,
         )
 
     if out_dir.exists() and (
@@ -2289,12 +2437,15 @@ def run_firmware_action(
     """Run one normal firmware action in the supplied, fully isolated build root."""
 
     total_start = time.perf_counter()
+    cached_sdk_build = None
     if sdk_selection is None and parsed.artifactory:
         artifactory = effective_config.get("artifactory", {})
         sdk_selection = resolve_artifactory_sdk_selection(
             str(artifactory.get("version", "")),
             str(artifactory.get("build", "")),
         )
+        effective_config["firmware"]["sisdk"] = sdk_selection.version
+    elif parsed.artifactory and sdk_selection is not None:
         effective_config["firmware"]["sisdk"] = sdk_selection.version
 
     firmware_cfg = validate_firmware_config(effective_config)
@@ -2310,6 +2461,21 @@ def run_firmware_action(
             f"{sdk_selection.version} != {firmware_cfg['sisdk']}"
         )
     sdk_path = sdk_selection.path
+    if (
+        parsed.action == "build"
+        and sdk_selection.source == "artifactory"
+        and not sdk_path.is_dir()
+    ):
+        cached_manifest = _artifact_cache_build_root(sdk_selection) / FW_DATA_FILENAME
+        try:
+            cached_sdk_build = (sdk_selection, json.loads(cached_manifest.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            sdk_selection = resolve_artifactory_sdk_selection(
+                sdk_selection.artifactory_version,
+                sdk_selection.artifactory_build,
+                require_package=True,
+            )
+            sdk_path = sdk_selection.path
 
     app_config, board_config, app_config_path = load_app_configuration(
         sdk_selection.version,
@@ -2323,7 +2489,12 @@ def run_firmware_action(
         profiles=profiles,
         requested_device=parsed.device,
     )
-    sdk_app_slcp = resolve_sdk_app_slcp(sdk_path, application)
+    cache_only = cached_sdk_build is not None
+    sdk_app_slcp = resolve_sdk_app_slcp(
+        sdk_path,
+        application,
+        must_exist=not cache_only,
+    )
     board_id = firmware_cfg["board"].strip().lower().split("_", 1)[0]
     app_config_context = {
         "app_config": app_config,
@@ -2333,56 +2504,89 @@ def run_firmware_action(
     if required_firmware_roles and parsed.device:
         raise RuntimeError("--diff requires all firmware profiles and cannot be combined with --device")
 
-    trust_sisdk(sdk_path)
     runtime_xapi_path = None
     vcom_metadata = None
     if parsed.action in {"build", "rebuild"}:
+        if cache_only:
+            cached_fw_data = cached_sdk_build[1]
+            runtime_xapi_path = Path(cached_fw_data["build"]["xapi"])
+            vcom_metadata = cached_fw_data["vcom"]
+        else:
+            trust_sisdk(sdk_path)
+            runtime_xapi_path = copy_bgapi_xapi(build_root, sdk_path)
+            vcom_metadata = resolve_vcom_build_metadata(
+                firmware_cfg=firmware_cfg,
+                sdk_path=sdk_path,
+                build_root=build_root,
+            )
+    elif not cache_only:
+        trust_sisdk(sdk_path)
+
+    def process_targets(*, use_cache_only: bool) -> list[dict]:
+        summaries: list[dict] = []
+        if include_bootloader:
+            summaries.append(
+                process_slcp(
+                    resolve_bootloader_slcp(),
+                    build_root=build_root,
+                    firmware_cfg=firmware_cfg,
+                    sdk_path=sdk_path,
+                    runtime_xapi_path=runtime_xapi_path,
+                    action=parsed.action,
+                    sdk_selection=sdk_selection,
+                    vcom_metadata=vcom_metadata,
+                    application=application,
+                    release_config_path=app_config_path,
+                    release_config=app_config_context,
+                    cache_only=use_cache_only,
+                )
+            )
+
+        for profile_name in selected_profiles:
+            profile_config = profiles[profile_name]
+            if not isinstance(profile_config, dict):
+                raise RuntimeError(f"SiSDK app profile {profile_name!r} must be an object")
+            summaries.append(
+                process_sdk_app_profile(
+                    sdk_app_slcp,
+                    build_root=build_root,
+                    firmware_cfg=firmware_cfg,
+                    sdk_path=sdk_path,
+                    runtime_xapi_path=runtime_xapi_path,
+                    action=parsed.action,
+                    sdk_selection=sdk_selection,
+                    vcom_metadata=vcom_metadata,
+                    app_configuration=app_config_context,
+                    app_config_path=app_config_path,
+                    board_id=board_id,
+                    prs_configuration=board_config["prs_configuration"],
+                    profile_name=profile_name,
+                    profile_config=profile_config,
+                    cache_only=use_cache_only,
+                )
+            )
+        return summaries
+
+    summaries = process_targets(use_cache_only=cache_only)
+    if cache_only and (
+        not summaries or not all(summary["cache_hit"] for summary in summaries)
+    ):
+        sdk_selection = resolve_artifactory_sdk_selection(
+            sdk_selection.artifactory_version,
+            sdk_selection.artifactory_build,
+            require_package=True,
+        )
+        sdk_path = sdk_selection.path
+        sdk_app_slcp = resolve_sdk_app_slcp(sdk_path, application)
+        trust_sisdk(sdk_path)
         runtime_xapi_path = copy_bgapi_xapi(build_root, sdk_path)
         vcom_metadata = resolve_vcom_build_metadata(
             firmware_cfg=firmware_cfg,
             sdk_path=sdk_path,
             build_root=build_root,
         )
-
-    summaries: list[dict] = []
-    if include_bootloader:
-        bootloader_slcp = resolve_bootloader_slcp()
-        summary = process_slcp(
-            bootloader_slcp,
-            build_root=build_root,
-            firmware_cfg=firmware_cfg,
-            sdk_path=sdk_path,
-            runtime_xapi_path=runtime_xapi_path,
-            action=parsed.action,
-            sdk_selection=sdk_selection,
-            vcom_metadata=vcom_metadata,
-            application=application,
-            release_config_path=app_config_path,
-            release_config=app_config_context,
-        )
-        summaries.append(summary)
-
-    for profile_name in selected_profiles:
-        profile_config = profiles[profile_name]
-        if not isinstance(profile_config, dict):
-            raise RuntimeError(f"SiSDK app profile {profile_name!r} must be an object")
-        summary = process_sdk_app_profile(
-            sdk_app_slcp,
-            build_root=build_root,
-            firmware_cfg=firmware_cfg,
-            sdk_path=sdk_path,
-            runtime_xapi_path=runtime_xapi_path,
-            action=parsed.action,
-            sdk_selection=sdk_selection,
-            vcom_metadata=vcom_metadata,
-            app_configuration=app_config_context,
-            app_config_path=app_config_path,
-            board_id=board_id,
-            prs_configuration=board_config["prs_configuration"],
-            profile_name=profile_name,
-            profile_config=profile_config,
-        )
-        summaries.append(summary)
+        summaries = process_targets(use_cache_only=False)
+        cache_only = False
 
     for summary in summaries:
         cache_state = (
@@ -2408,16 +2612,20 @@ def run_firmware_action(
 
     fw_data_path = None
     if parsed.action in {"build", "rebuild"} and runtime_xapi_path is not None:
-        fw_data_path = write_fw_data(
-            build_root=build_root,
-            firmware_cfg=firmware_cfg,
-            sdk_path=sdk_path,
-            runtime_xapi_path=runtime_xapi_path,
-            summaries=summaries,
-            sdk_selection=sdk_selection,
-            vcom_metadata=vcom_metadata,
-        )
-        if sdk_selection is not None:
+        cache_root = _artifact_cache_build_root(sdk_selection) if sdk_selection else None
+        if cache_only and cache_root is not None and build_root.resolve() == cache_root.resolve():
+            fw_data_path = cache_root / FW_DATA_FILENAME
+        else:
+            fw_data_path = write_fw_data(
+                build_root=build_root,
+                firmware_cfg=firmware_cfg,
+                sdk_path=sdk_path,
+                runtime_xapi_path=runtime_xapi_path,
+                summaries=summaries,
+                sdk_selection=sdk_selection,
+                vcom_metadata=vcom_metadata,
+            )
+        if sdk_selection is not None and not cache_only:
             cache_manifest_path = write_sdk_build_cache_manifest(
                 fw_data_path=fw_data_path,
                 sdk_selection=sdk_selection,
@@ -2425,6 +2633,7 @@ def run_firmware_action(
             )
             if cache_manifest_path is not None:
                 print(f"Cached complete firmware build manifest={cache_manifest_path}")
+                _prune_artifactory_sdk_package(sdk_selection)
 
     print(
         "App manager: "

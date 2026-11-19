@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import argparse
 import errno
+import filecmp
 import json
 import os
 import platform
@@ -3669,7 +3670,26 @@ def _write_differential_firmware_payloads(
             + "\n",
             encoding="utf-8",
         )
-        staged_root.replace(destination_root)
+        try:
+            staged_root.rename(destination_root)
+        except OSError:
+            if not destination_root.is_dir() or destination_root.is_symlink():
+                raise
+            staged_files = {
+                path.relative_to(staged_root): path
+                for path in staged_root.rglob("*")
+                if path.is_file()
+            }
+            destination_files = {
+                path.relative_to(destination_root): path
+                for path in destination_root.rglob("*")
+                if path.is_file()
+            }
+            if staged_files.keys() != destination_files.keys() or any(
+                not filecmp.cmp(path, destination_files[relative_path], shallow=False)
+                for relative_path, path in staged_files.items()
+            ):
+                raise
     except Exception:
         shutil.rmtree(temporary_root, ignore_errors=True)
         raise

@@ -2563,21 +2563,20 @@ def _request_from_send_fw_args(
         else ""
     )
     sdk_package_path = Path(str(sdk_cfg.get("package_path", "")))
-    if not sdk_package_path.is_dir():
-        raise RuntimeError(
-            "Selected firmware build does not record a usable SiSDK package path: "
-            f"{sdk_package_path}"
-        )
-    sisdk_name = _sisdk_name_from_properties(sdk_package_path)
+    sisdk_name = str(fw_data.get("sdk_id", "")).strip()
+    if not sisdk_name and sdk_package_path.is_dir():
+        sisdk_name = _sisdk_name_from_properties(sdk_package_path)
     if not sisdk_name:
         raise RuntimeError(
-            "Selected SiSDK package does not declare an SDK id in .properties: "
+            "Selected firmware build does not record a usable SiSDK id or package path: "
             f"{sdk_package_path}"
         )
     if cached_build:
         xapi_file = cached_image_paths["xapi"]
     else:
-        xapi_file = sdk_package_path / "bluetooth_le_host" / "api" / "sl_bt.xapi"
+        xapi_file = Path(str(fw_data.get("build", {}).get("xapi", "")))
+        if not xapi_file.is_file():
+            xapi_file = sdk_package_path / "bluetooth_le_host" / "api" / "sl_bt.xapi"
         if not xapi_file.is_file():
             raise RuntimeError(
                 "Selected SiSDK BGAPI definition does not exist: "
