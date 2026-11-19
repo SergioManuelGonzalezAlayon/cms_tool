@@ -49,6 +49,9 @@ BUILD_METADATA_FILENAME = "build_metadata.json"
 FW_DATA_FILENAME = "fw_data.json"
 EXTRACTION_CHUNK_SIZE = 32 * 1024 * 1024
 DIFF_FW_DATA_FILENAME = "diff_fw_data.json"
+ARTIFACT_CACHE_SCHEMA_VERSION = 1
+ARTIFACT_CACHE_DIRNAME = "firmware"
+ARTIFACT_CACHE_MANIFEST_FILENAME = "manifest.json"
 BGAPI_RUNTIME_DIRNAME = "runtime"
 BGAPI_XAPI_FILENAME = "sl_bt.xapi"
 TOOL_ENV_VARS = {
@@ -1032,6 +1035,297 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _artifact_cache_fingerprint(inputs: dict) -> str:
+    encoded = json.dumps(
+        inputs,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _artifact_cache_path(
+    sdk_selection: SDKSelection,
+    profile: str,
+    fingerprint: str,
+) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
+        raise RuntimeError(f"Invalid firmware artifact cache profile: {profile!r}")
+    release = sisdk_release_from_version(sdk_selection.version)
+    build_number = sdk_selection.build_number or sdk_selection.artifactory_build
+    if not build_number.isdecimal():
+        raise RuntimeError(
+            "Firmware artifact caching requires a numeric SDK package build number"
+        )
+    return (
+        DEFAULT_OUTPUT_ROOT
+        / release
+        / build_number
+        / ARTIFACT_CACHE_DIRNAME
+        / profile
+        / fingerprint
+    )
+
+
+def _firmware_artifact_cache_inputs(
+    *,
+    project_name: str,
+    application: str,
+    profile: str,
+    slcp: Path,
+    firmware_cfg: dict[str, str],
+    sdk_path: Path,
+    sdk_selection: SDKSelection,
+    release_config_path: Path | None,
+    release_config: dict | None,
+    merged_configuration: dict,
+    slc_options: list[str],
+) -> dict:
+    release_config_path = release_config_path.resolve() if release_config_path else None
+    return {
+        "cache_schema_version": ARTIFACT_CACHE_SCHEMA_VERSION,
+        "application": application,
+        "profile": profile,
+        "project": {
+            "name": project_name,
+            "slcp": _relative_to_repo(slcp),
+            "slcp_sha256": _sha256(slcp),
+        },
+        "firmware": {
+            "board": firmware_cfg["board"],
+            "board_revision": firmware_cfg.get("brev", ""),
+            "device": firmware_cfg["device"],
+            "sisdk": firmware_cfg["sisdk"],
+            "adapter_board": firmware_cfg.get("adapter_board", "brd4002a"),
+        },
+        "sdk": sdk_selection_provenance(sdk_selection),
+        "release_config": {
+            "path": _relative_to_repo(release_config_path) if release_config_path else "",
+            "sha256": _sha256(release_config_path) if release_config_path else "",
+            "values": release_config or {},
+        },
+        "merged_configuration": merged_configuration,
+        "slc_options": list(slc_options),
+    }
+
+
+def _remove_artifact_cache_entry(cache_entry: Path) -> None:
+    if cache_entry.is_symlink() or cache_entry.is_file():
+        cache_entry.unlink()
+    elif cache_entry.is_dir():
+        shutil.rmtree(cache_entry)
+
+
+def _ensure_artifact_cache_parent(cache_entry: Path) -> None:
+    cache_root = DEFAULT_OUTPUT_ROOT.resolve()
+    cache_parent = cache_entry.parent.resolve()
+    if not cache_parent.is_relative_to(cache_root):
+        raise RuntimeError(
+            f"Firmware artifact cache path escapes {cache_root}: {cache_entry}"
+        )
+
+
+def _cached_firmware_artifact(
+    cache_entry: Path,
+    expected_inputs: dict,
+) -> tuple[Path, Path] | None:
+    _ensure_artifact_cache_parent(cache_entry)
+    if not cache_entry.exists() and not cache_entry.is_symlink():
+        return None
+    if cache_entry.is_symlink():
+        print(f"Ignoring symlinked firmware artifact cache entry {cache_entry}")
+        _remove_artifact_cache_entry(cache_entry)
+        return None
+
+    manifest_path = cache_entry / ARTIFACT_CACHE_MANIFEST_FILENAME
+    try:
+        if manifest_path.is_symlink():
+            raise ValueError("cache manifest must not be a symlink")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest root is not an object")
+        fingerprint = _artifact_cache_fingerprint(expected_inputs)
+        if manifest.get("schema_version") != ARTIFACT_CACHE_SCHEMA_VERSION:
+            raise ValueError("cache schema does not match")
+        if manifest.get("fingerprint") != fingerprint:
+            raise ValueError("cache fingerprint does not match")
+        if manifest.get("inputs") != expected_inputs:
+            raise ValueError("cache inputs do not match")
+
+        cache_root = cache_entry.resolve()
+        artifact_root = (cache_entry / "artifacts").resolve()
+        if not artifact_root.is_relative_to(cache_root):
+            raise ValueError("artifact directory escapes the cache entry")
+        artifact_records = manifest.get("artifacts")
+        if not isinstance(artifact_records, list) or not artifact_records:
+            raise ValueError("manifest has no artifacts")
+        verified_paths: dict[str, Path] = {}
+        for artifact in artifact_records:
+            if not isinstance(artifact, dict):
+                raise ValueError("manifest contains an invalid artifact record")
+            relative_text = str(artifact.get("path", ""))
+            relative_path = Path(relative_text)
+            if (
+                not relative_text
+                or relative_path.is_absolute()
+                or any(part in {"", ".", ".."} for part in relative_path.parts)
+            ):
+                raise ValueError("manifest contains an unsafe artifact path")
+            artifact_path = (cache_entry / relative_path).resolve()
+            if not artifact_path.is_relative_to(artifact_root):
+                raise ValueError("artifact path escapes the cache entry")
+            if not artifact_path.is_file():
+                raise ValueError(f"cached artifact is missing: {relative_text}")
+            if artifact_path.suffix.lower() not in FIRMWARE_ARTIFACT_SUFFIXES:
+                raise ValueError(f"cached artifact has an unsupported suffix: {relative_text}")
+            if artifact.get("size") != artifact_path.stat().st_size:
+                raise ValueError(f"cached artifact size changed: {relative_text}")
+            expected_sha256 = str(artifact.get("sha256", ""))
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+                raise ValueError(f"cached artifact hash is invalid: {relative_text}")
+            if _sha256(artifact_path) != expected_sha256:
+                raise ValueError(f"cached artifact hash changed: {relative_text}")
+            verified_paths[relative_path.as_posix()] = artifact_path
+
+        selected_image = manifest.get("selected_image")
+        if not isinstance(selected_image, dict):
+            raise ValueError("manifest has no selected image")
+        selected_relative = str(selected_image.get("path", ""))
+        selected_path = verified_paths.get(Path(selected_relative).as_posix())
+        if selected_path is None or selected_path.suffix.lower() not in FIRMWARE_IMAGE_SUFFIXES:
+            raise ValueError("manifest selected image is not a verified firmware artifact")
+        return selected_path, manifest_path
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+        print(f"Ignoring invalid firmware artifact cache entry {cache_entry}: {error}")
+        _remove_artifact_cache_entry(cache_entry)
+        return None
+
+
+def _store_firmware_artifact_cache(
+    *,
+    cache_entry: Path,
+    inputs: dict,
+    out_dir: Path,
+    selected_image: Path,
+) -> tuple[Path, Path]:
+    artifacts = find_artifacts(out_dir, FIRMWARE_ARTIFACT_SUFFIXES)
+    output_root = out_dir.resolve()
+    selected_relative = selected_image.resolve().relative_to(output_root)
+    if selected_image.resolve() not in artifacts:
+        raise RuntimeError(
+            f"Selected firmware image is missing from the build artifact set: {selected_image}"
+        )
+
+    _ensure_artifact_cache_parent(cache_entry)
+    cache_entry.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_artifact_cache_parent(cache_entry)
+    staging_path = Path(
+        tempfile.mkdtemp(prefix=f".{cache_entry.name}-", dir=cache_entry.parent)
+    )
+    try:
+        artifact_records = []
+        for artifact in artifacts:
+            relative_path = artifact.relative_to(output_root)
+            cache_relative = Path("artifacts") / relative_path
+            destination = staging_path / cache_relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(artifact, destination)
+            artifact_records.append(
+                {
+                    "path": cache_relative.as_posix(),
+                    "name": artifact.name,
+                    "suffix": artifact.suffix.lower(),
+                    "size": destination.stat().st_size,
+                    "sha256": _sha256(destination),
+                }
+            )
+
+        selected_cache_path = Path("artifacts") / selected_relative
+        selected_record = next(
+            (item for item in artifact_records if item["path"] == selected_cache_path.as_posix()),
+            None,
+        )
+        if selected_record is None:
+            raise RuntimeError(f"Selected firmware image was not copied into {cache_entry}")
+
+        manifest = {
+            "schema_version": ARTIFACT_CACHE_SCHEMA_VERSION,
+            "fingerprint": _artifact_cache_fingerprint(inputs),
+            "inputs": inputs,
+            "project_name": str(inputs["project"]["name"]),
+            "profile": str(inputs["profile"]),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "selected_image": {
+                "path": selected_record["path"],
+                "name": selected_record["name"],
+                "size": selected_record["size"],
+                "sha256": selected_record["sha256"],
+            },
+            "artifacts": artifact_records,
+        }
+        (staging_path / ARTIFACT_CACHE_MANIFEST_FILENAME).write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        _remove_artifact_cache_entry(cache_entry)
+        os.replace(staging_path, cache_entry)
+    finally:
+        if staging_path.exists():
+            shutil.rmtree(staging_path)
+
+    return cache_entry / selected_cache_path, cache_entry / ARTIFACT_CACHE_MANIFEST_FILENAME
+
+
+def _cached_firmware_for_build(
+    *,
+    action: str,
+    cache_entry: Path | None,
+    cache_inputs: dict | None,
+) -> tuple[Path, Path] | None:
+    if action != "build" or cache_entry is None or cache_inputs is None:
+        return None
+    return _cached_firmware_artifact(cache_entry, cache_inputs)
+
+
+def _store_firmware_artifact_if_cached(
+    *,
+    image: Path | None,
+    cache_entry: Path | None,
+    cache_inputs: dict | None,
+    out_dir: Path,
+) -> tuple[Path | None, Path | None]:
+    if image is None or cache_entry is None or cache_inputs is None:
+        return image, None
+    return _store_firmware_artifact_cache(
+        cache_entry=cache_entry,
+        inputs=cache_inputs,
+        out_dir=out_dir,
+        selected_image=image,
+    )
+
+
+def _firmware_build_summary(
+    context: dict,
+    started_at: float,
+    *,
+    generated_slcp: Path | None,
+    image: Path | None,
+    metadata_path: Path | None,
+    cache_manifest: Path | None,
+    cache_hit: bool,
+) -> dict:
+    return {
+        **context,
+        "generated_slcp": str(generated_slcp) if generated_slcp else "",
+        "image": str(image) if image else "",
+        "metadata": str(metadata_path) if metadata_path else "",
+        "cache_manifest": str(cache_manifest) if cache_manifest else "",
+        "cache_hit": cache_hit,
+        "elapsed_s": round(time.perf_counter() - started_at, 2),
+    }
+
+
 def find_artifacts(out_dir: Path, suffixes: tuple[str, ...]) -> list[Path]:
     root = out_dir / "cmake_gcc"
     artifacts: list[Path] = []
@@ -1428,6 +1722,7 @@ def firmware_artifacts_from_summaries(summaries: list[dict]) -> list[dict[str, s
                 "project_name": project_name,
                 "image": str(image),
                 "sha256": _sha256(image),
+                "cache_manifest": str(summary.get("cache_manifest", "")),
             }
         )
     return artifacts
@@ -1617,14 +1912,65 @@ def process_slcp(
     action: str,
     sdk_selection: SDKSelection | None = None,
     vcom_metadata: dict | None = None,
+    application: str = "",
+    release_config_path: Path | None = None,
+    release_config: dict | None = None,
 ) -> dict:
     out_dir = output_dir_for(slcp, build_root)
     started_at = time.perf_counter()
     generated_slcp = out_dir / slcp.name
+    summary_context = {
+        "slcp": str(slcp),
+        "project_name": slcp.stem,
+        "firmware_role": "bootloader",
+        "out_dir": str(out_dir),
+        "sdk_path": str(sdk_path),
+        "action": action,
+    }
     image = None
     metadata_path = None
+    cache_entry = None
+    cache_inputs = None
 
-    if action == "rebuild" and out_dir.exists():
+    if action in {"build", "rebuild"} and sdk_selection is not None:
+        cache_inputs = _firmware_artifact_cache_inputs(
+            project_name=slcp.stem,
+            application=application,
+            profile="bootloader",
+            slcp=slcp,
+            firmware_cfg=firmware_cfg,
+            sdk_path=sdk_path,
+            sdk_selection=sdk_selection,
+            release_config_path=release_config_path,
+            release_config=release_config,
+            merged_configuration={},
+            slc_options=[],
+        )
+        cache_entry = _artifact_cache_path(
+            sdk_selection,
+            "bootloader",
+            _artifact_cache_fingerprint(cache_inputs),
+        )
+    cached = _cached_firmware_for_build(
+        action=action,
+        cache_entry=cache_entry,
+        cache_inputs=cache_inputs,
+    )
+    if cached is not None:
+        cached_image, cache_manifest = cached
+        return _firmware_build_summary(
+            summary_context,
+            started_at,
+            generated_slcp=None,
+            image=cached_image,
+            metadata_path=cache_manifest,
+            cache_manifest=cache_manifest,
+            cache_hit=True,
+        )
+
+    if out_dir.exists() and (
+        action == "rebuild" or (action == "build" and cache_inputs is not None)
+    ):
         shutil.rmtree(out_dir)
 
     if action in {"generate", "upgrade", "rebuild"}:
@@ -1649,17 +1995,21 @@ def process_slcp(
             sdk_selection=sdk_selection,
             vcom_metadata=vcom_metadata,
         )
-
-    return {
-        "slcp": str(slcp),
-        "out_dir": str(out_dir),
-        "generated_slcp": str(generated_slcp),
-        "image": str(image) if image else "",
-        "metadata": str(metadata_path) if metadata_path else "",
-        "sdk_path": str(sdk_path),
-        "elapsed_s": round(time.perf_counter() - started_at, 2),
-        "action": action,
-    }
+    image, cache_manifest = _store_firmware_artifact_if_cached(
+        image=image,
+        cache_entry=cache_entry,
+        cache_inputs=cache_inputs,
+        out_dir=out_dir,
+    )
+    return _firmware_build_summary(
+        summary_context,
+        started_at,
+        generated_slcp=generated_slcp,
+        image=image,
+        metadata_path=metadata_path,
+        cache_manifest=cache_manifest,
+        cache_hit=False,
+    )
 
 
 def process_sdk_app_profile(
@@ -1682,6 +2032,14 @@ def process_sdk_app_profile(
     project_name = APP_PROFILE_PROJECT_NAMES[profile_name]
     out_dir = build_root / project_name
     started_at = time.perf_counter()
+    summary_context = {
+        "slcp": str(slcp),
+        "project_name": project_name,
+        "firmware_role": profile_name,
+        "out_dir": str(out_dir),
+        "sdk_path": str(sdk_path),
+        "action": action,
+    }
 
     slc_options = merge_slc_options(
         app_configuration["board_config"],
@@ -1704,19 +2062,64 @@ def process_sdk_app_profile(
         ),
     }
 
+    cache_entry = None
+    cache_inputs = None
+    if action in {"build", "rebuild"} and sdk_selection is not None:
+        cache_inputs = _firmware_artifact_cache_inputs(
+            project_name=project_name,
+            application=str(app_configuration["app_config"]["application"]),
+            profile=profile_name,
+            slcp=slcp,
+            firmware_cfg=firmware_cfg,
+            sdk_path=sdk_path,
+            sdk_selection=sdk_selection,
+            release_config_path=app_config_path,
+            release_config={
+                "app": app_configuration["app_config"],
+                "board": app_configuration["board_config"],
+                "profile": profile_config,
+            },
+            merged_configuration=configuration,
+            slc_options=slc_options,
+        )
+        cache_entry = _artifact_cache_path(
+            sdk_selection,
+            profile_name,
+            _artifact_cache_fingerprint(cache_inputs),
+        )
+    cached = _cached_firmware_for_build(
+        action=action,
+        cache_entry=cache_entry,
+        cache_inputs=cache_inputs,
+    )
+    if cached is not None:
+        cached_image, cache_manifest = cached
+        return _firmware_build_summary(
+            summary_context,
+            started_at,
+            generated_slcp=None,
+            image=cached_image,
+            metadata_path=cache_manifest,
+            cache_manifest=cache_manifest,
+            cache_hit=True,
+        )
+
     if out_dir.exists() and (
         action == "rebuild"
         or (
             action == "build"
-            and not _build_metadata_matches_inputs(
-                out_dir=out_dir,
-                slcp=slcp,
-                firmware_cfg=firmware_cfg,
-                sdk_path=sdk_path,
-                runtime_xapi_path=runtime_xapi_path,
-                sdk_selection=sdk_selection,
-                app_configuration=profile_build_configuration,
-                project_name=project_name,
+            and (
+                cache_inputs is not None
+                or not _build_metadata_matches_inputs(
+                    out_dir=out_dir,
+                    slcp=slcp,
+                    firmware_cfg=firmware_cfg,
+                    sdk_path=sdk_path,
+                    runtime_xapi_path=runtime_xapi_path,
+                    sdk_selection=sdk_selection,
+                    app_configuration=profile_build_configuration,
+                    project_name=project_name,
+                )
             )
         )
     ):
@@ -1750,19 +2153,21 @@ def process_sdk_app_profile(
             project_name=project_name,
             app_configuration=profile_build_configuration,
         )
-
-    return {
-        "slcp": str(slcp),
-        "project_name": project_name,
-        "firmware_role": profile_name,
-        "out_dir": str(out_dir),
-        "generated_slcp": str(out_dir / slcp.name),
-        "image": str(image) if image else "",
-        "metadata": str(metadata_path) if metadata_path else "",
-        "sdk_path": str(sdk_path),
-        "elapsed_s": round(time.perf_counter() - started_at, 2),
-        "action": action,
-    }
+    image, cache_manifest = _store_firmware_artifact_if_cached(
+        image=image,
+        cache_entry=cache_entry,
+        cache_inputs=cache_inputs,
+        out_dir=out_dir,
+    )
+    return _firmware_build_summary(
+        summary_context,
+        started_at,
+        generated_slcp=out_dir / slcp.name,
+        image=image,
+        metadata_path=metadata_path,
+        cache_manifest=cache_manifest,
+        cache_hit=False,
+    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1895,6 +2300,9 @@ def run_firmware_action(
             action=parsed.action,
             sdk_selection=sdk_selection,
             vcom_metadata=vcom_metadata,
+            application=application,
+            release_config_path=app_config_path,
+            release_config=app_config_context,
         )
         summaries.append(summary)
 
@@ -1921,9 +2329,17 @@ def run_firmware_action(
         summaries.append(summary)
 
     for summary in summaries:
+        cache_state = (
+            "hit"
+            if summary.get("cache_hit")
+            else "stored"
+            if summary.get("cache_manifest")
+            else "not-used"
+        )
         print(
             f"{Path(summary['slcp']).name}: "
             f"action={summary['action']} "
+            f"cache={cache_state} "
             f"out={summary['out_dir']} "
             f"image={summary['image']} "
             f"metadata={summary['metadata']} "

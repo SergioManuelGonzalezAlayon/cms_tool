@@ -767,6 +767,12 @@ build provenance is written to `fw_data.json`; differential builds retain each
 variant's package build number and provenance in its `fw_data.json` and in the
 paired `diff_fw_data.json`.
 
+Firmware artifacts are cached under
+`.fw_build/sisdk/<release>/<build>/firmware/<profile>/<fingerprint>/`. The
+cache manifest records its build inputs and hashes for the firmware files.
+Regular and differential builds share this cache, while keeping their
+`fw_data.json` and `diff_fw_data.json` provenance separate.
+
 ## Firmware Request Preparation
 
 `cms SEND_FW` prepares a `MeasurementRequest` in one of two ways:
@@ -775,14 +781,19 @@ paired `diff_fw_data.json`.
 2. Build a request from command-line arguments, `cms_client_config.json`, and
    `dev_config.json`.
 
-When no explicit image path is supplied, the client discovers built firmware
-under the configured build root. Current discovery looks for:
+When no explicit image path is supplied, the client reads the role and cache
+manifest path from `fw_data.json` under the configured build root, then resolves
+the selected image through that cache manifest. This keeps discovery bound to
+the build selected by that root instead of finding an older image in another
+project output directory.
 
-| Role | Project names searched |
+| Role | Manifest role selected |
 | --- | --- |
-| DUT | `ncp_ble_dut_dcdc`, then `ncp_ble_dut` |
-| Tester | `ncp_ble_tester` |
-| Bootloader | `bootloader-uart-bgapi` |
+| DUT | `dut_dcdc`, then `dut_no_dcdc` |
+| DUT with DCDC | `dut_dcdc` |
+| DUT without DCDC | `dut_no_dcdc` |
+| Tester | `tester` |
+| Bootloader | `bootloader` |
 
 The request includes:
 

@@ -3089,20 +3089,85 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 def _discover_built_firmware(role: str, firmware_cfg: dict[str, Any]) -> Path:
     build_root = Path(str(firmware_cfg.get("build_root", ".fw_build")))
     candidates_by_role = {
-        "dut": ["ncp_ble_dut_dcdc", "ncp_ble_dut"],
-        "dut_dcdc": ["ncp_ble_dut_dcdc"],
-        "dut_no_dcdc": ["ncp_ble_dut"],
-        "tester": ["ncp_ble_tester"],
-        "bootloader": ["bootloader-uart-bgapi"],
+        "dut": ("dut_dcdc", "dut_no_dcdc"),
+        "dut_dcdc": ("dut_dcdc",),
+        "dut_no_dcdc": ("dut_no_dcdc",),
+        "tester": ("tester",),
+        "bootloader": ("bootloader",),
     }
-    for app_name in candidates_by_role[role]:
-        app_dir = build_root / app_name
-        matches = sorted(app_dir.rglob("*.s37")) if app_dir.exists() else []
-        if matches:
-            return matches[0]
-    expected = ", ".join(candidates_by_role[role])
+    requested_roles = candidates_by_role.get(role)
+    if requested_roles is None:
+        raise RuntimeError(f"Unsupported built firmware role: {role}")
+
+    manifest_path = build_root / "fw_data.json"
+    manifest = _read_json_file(manifest_path)
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"Build provenance is invalid: {manifest_path}")
+    firmware = manifest.get("firmware")
+    artifacts = firmware.get("artifacts") if isinstance(firmware, dict) else None
+    if not isinstance(artifacts, list):
+        raise RuntimeError(
+            f"Build provenance is missing firmware artifacts: {manifest_path}. "
+            "Run `cms BUILD` first or pass an explicit firmware image path."
+        )
+
+    missing_paths: list[str] = []
+    for requested_role in requested_roles:
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or str(artifact.get("role", "")) != requested_role:
+                continue
+            image = str(artifact.get("image", ""))
+            if not image:
+                continue
+            image_path = Path(image).expanduser()
+            if not image_path.is_absolute():
+                image_path = build_root / image_path
+
+            cache_manifest_value = str(artifact.get("cache_manifest", ""))
+            if cache_manifest_value:
+                cache_manifest_path = Path(cache_manifest_value).expanduser()
+                if not cache_manifest_path.is_absolute():
+                    cache_manifest_path = build_root / cache_manifest_path
+                cache_manifest = _read_json_file(cache_manifest_path)
+                if not isinstance(cache_manifest, dict):
+                    raise RuntimeError(
+                        f"Firmware cache manifest is invalid: {cache_manifest_path}"
+                    )
+                selected_image = cache_manifest.get("selected_image")
+                if not isinstance(selected_image, dict):
+                    raise RuntimeError(
+                        f"Firmware cache manifest is incomplete: {cache_manifest_path}"
+                    )
+                selected_relative = Path(str(selected_image.get("path", "")))
+                if (
+                    not str(selected_image.get("path", ""))
+                    or selected_relative.is_absolute()
+                    or any(part in {"", ".", ".."} for part in selected_relative.parts)
+                ):
+                    raise RuntimeError(
+                        f"Firmware cache manifest has an unsafe image path: {cache_manifest_path}"
+                    )
+                cache_root = cache_manifest_path.parent.resolve()
+                cached_image_path = (cache_root / selected_relative).resolve()
+                if not cached_image_path.is_relative_to(cache_root):
+                    raise RuntimeError(
+                        f"Firmware cache image escapes its manifest directory: {cache_manifest_path}"
+                    )
+                if image_path.resolve() != cached_image_path:
+                    raise RuntimeError(
+                        "Build provenance image does not match its firmware cache manifest: "
+                        f"{image_path} != {cached_image_path}"
+                    )
+                image_path = cached_image_path
+            if image_path.is_file():
+                return image_path
+            missing_paths.append(str(image_path))
+
+    expected = ", ".join(requested_roles)
+    detail = f" Manifest paths are missing: {', '.join(missing_paths)}." if missing_paths else ""
     raise RuntimeError(
-        f"No built {role} firmware found under {build_root} for {expected}. "
+        f"No built {role} firmware found in {manifest_path} for role(s) {expected}."
+        f"{detail} "
         "Run `cms BUILD` first or pass an explicit firmware image path."
     )
 
