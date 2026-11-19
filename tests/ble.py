@@ -1260,7 +1260,8 @@ def test_PAwR_per(JoulescopeDev,
                   DUTAdvConfig,
                   DUTPAwRStart,
                   TesterScanStart,
-                  TesterScanSync):
+                  TesterScanSync,
+                  Config):
     dut_address = get_device_addr(DUT)
 
     TesterScanStart(
@@ -1324,8 +1325,13 @@ def test_PAwR_per(JoulescopeDev,
         adv_sid=adv_report.adv_sid,
     )
 
+    pawr_cfg = dataclass_from_dict(
+        PAWRConfig, Config.get("pawr", {})
+    )
+
     n_events = 10
-    capture_s = float(advertising_ms_from_units(n_events * DUTAdvConfig.max_interval) / 1000)
+    capture_s = n_events * pawr_cfg.interval / 1000.0
+
     JoulescopeDev.startPowerProfilingSession(capture_s)
 
 
@@ -1335,7 +1341,8 @@ def test_PAwR_obs(JoulescopeDev,
                   TesterAdvConfig,
                   DUTScanStart,
                   DUTScanSync,
-                  TesterPAwRStart):
+                  TesterPAwRStart,
+                  Config):
     tester_address = get_device_addr(Tester)
 
     DUTScanStart(
@@ -1398,6 +1405,11 @@ def test_PAwR_obs(JoulescopeDev,
         adv_sid=adv_report.adv_sid,
     )
 
+    pawr_cfg = dataclass_from_dict(
+        PAWRConfig, Config.get("pawr", {})
+    )
+
     n_events = 10
-    capture_s = float(advertising_ms_from_units(n_events * TesterAdvConfig.max_interval) / 1000)
+    capture_s = n_events * pawr_cfg.interval / 1000.0
+
     JoulescopeDev.startPowerProfilingSession(capture_s)

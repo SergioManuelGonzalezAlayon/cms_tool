@@ -1,5 +1,5 @@
 from collections import deque
-from importlib import import_module
+from importlib import import_module, reload
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 import json
@@ -366,6 +366,7 @@ def ble_support(monkeypatch):
     with monkeypatch.context() as imports:
         imports.setitem(sys.modules, "conftest", support)
         ble = import_module("ble")
+        ble = reload(ble)
     return ble, support
 
 
@@ -398,8 +399,8 @@ def _begin_profile_context(monkeypatch, support, request, js, *, config_data=Non
     ("test_conn_central", 1.0),
     ("test_conn_peripheral", 1.0),
     ("test_scanner", 1.0),
-    ("test_PAwR_per", 2.0),
-    ("test_PAwR_obs", 2.0),
+    ("test_PAwR_per", 2.239875),
+    ("test_PAwR_obs", 2.239875),
 ])
 def test_ble_callers_only_pass_duration_using_existing_capture_context(
     monkeypatch, tmp_path, ble_support, test_name, expected_duration,
@@ -431,6 +432,7 @@ def test_ble_callers_only_pass_duration_using_existing_capture_context(
         "ConnectBLEDevices": MagicMock(return_value=(
             None, None, SimpleNamespace(max_interval=80),
         )),
+        "Config": {"pawr": {"interval": 223.9875}},
     }
     test = getattr(ble, test_name)
     kwargs = {name: values.get(name, MagicMock()) for name in signature(test).parameters}
