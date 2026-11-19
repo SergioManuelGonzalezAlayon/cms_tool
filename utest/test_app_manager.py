@@ -960,11 +960,25 @@ def test_write_build_metadata_records_firmware_and_artifacts(tmp_path: Path) -> 
     hex_image.write_bytes(b"hex")
     map_file.write_bytes(b"map")
     sdk_path = Path(r"C:\sdk\2026.0.0")
+    archive_path = tmp_path / "gecko-sdk.zip"
+    archive_path.write_bytes(b"sdk archive")
+    app_configuration = {
+        "application": "bluetooth_le_app/example/bt_ncp",
+        "device_profile": "dut_dcdc",
+        "board": "BRD4182C_A06",
+        "config_file": "apps/configs/sisdk2026.0.json",
+        "slc_options": ["--with", "bt_ncp:app"],
+        "configuration": {"RADIOPRS_CONFIG": "SL_RAIL_UTIL_RADIO_CONFIG_1"},
+    }
     sdk_selection = app_manager.SDKSelection(
         path=sdk_path,
         version="2026.0.0",
-        source="client_config_package_path",
+        source="artifactory",
         build_number="1357",
+        artifactory_version="2026.0",
+        artifactory_build="1357",
+        archive_path=archive_path,
+        archive_sha256=app_manager._sha256(archive_path),
         commit="sdk-commit",
         sdk_hash="sdk-hash",
         xapi_hash="xapi-hash",
@@ -983,6 +997,7 @@ def test_write_build_metadata_records_firmware_and_artifacts(tmp_path: Path) -> 
         sdk_path=sdk_path,
         runtime_xapi_path=None,
         sdk_selection=sdk_selection,
+        app_configuration=app_configuration,
     )
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -996,18 +1011,19 @@ def test_write_build_metadata_records_firmware_and_artifacts(tmp_path: Path) -> 
         "sdk_path": str(sdk_path.resolve()),
     }
     assert metadata["sdk"] == {
-        "source": "client_config_package_path",
+        "source": "artifactory",
         "version": "2026.0.0",
         "build_number": "1357",
+        "artifactory_version": "2026.0",
+        "artifactory_build": "1357",
+        "archive_path": str(archive_path),
+        "archive_sha256": app_manager._sha256(archive_path),
         "package_path": str(sdk_path.resolve()),
         "commit": "sdk-commit",
         "hash": "sdk-hash",
         "xapi_sha256": "xapi-hash",
-        "artifactory_version": "",
-        "artifactory_build": "",
-        "archive_path": "",
-        "archive_sha256": "",
     }
+    assert metadata["app_configuration"] == app_configuration
     assert {artifact["name"] for artifact in metadata["artifacts"]} == {"demo.s37", "demo.hex", "demo.map"}
 
 
@@ -1041,8 +1057,12 @@ def test_write_fw_data_records_firmware_identity_and_role_hashes(tmp_path: Path)
     sdk_selection = app_manager.SDKSelection(
         path=sdk_path,
         version="2026.0.0",
-        source="slt",
+        source="artifactory",
         build_number="1357",
+        artifactory_version="2026.0",
+        artifactory_build="1357",
+        archive_path=build_root / "sisdk" / "2026.0" / "1357" / "gecko-sdk.zip",
+        archive_sha256="sdk-archive-hash",
         commit="sdk-commit",
         sdk_hash="sdk-hash",
         xapi_path=sdk_path / app_manager.SL_BT_XAPI_PATH,
@@ -1126,17 +1146,17 @@ def test_write_fw_data_records_firmware_identity_and_role_hashes(tmp_path: Path)
         ],
     }
     assert fw_data["sdk"] == {
-        "source": "slt",
+        "source": "artifactory",
         "version": "2026.0.0",
         "build_number": "1357",
+        "artifactory_version": "2026.0",
+        "artifactory_build": "1357",
+        "archive_path": str(build_root / "sisdk" / "2026.0" / "1357" / "gecko-sdk.zip"),
+        "archive_sha256": "sdk-archive-hash",
         "package_path": str(sdk_path.resolve()),
         "commit": "sdk-commit",
         "hash": "sdk-hash",
         "xapi_sha256": app_manager._sha256(runtime_xapi),
-        "artifactory_version": "",
-        "artifactory_build": "",
-        "archive_path": "",
-        "archive_sha256": "",
     }
 
 
@@ -1205,9 +1225,9 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
     target = {"board": "brd4182a", "board_rev": "a06", "device": "EFR32MG22C224F512IM40"}
     roles = sorted(app_manager.REQUIRED_DIFF_FIRMWARE_ROLES)
     selections: dict[str, app_manager.SDKSelection] = {}
-    for variant, version, build_number in (
-        ("version1", "2025.12.3", "1200"),
-        ("version2", "2026.12.0", "1357"),
+    for variant, version, build_number, artifactory_version in (
+        ("version1", "2025.12.3", "1200", "2025.12"),
+        ("version2", "2026.12.0", "1357", "2026.12"),
     ):
         variant_root = build_root / "diff" / variant
         variant_root.mkdir(parents=True)
@@ -1216,8 +1236,10 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
         selections[variant] = app_manager.SDKSelection(
             path=sdk_path,
             version=version,
-            source=f"client_config_diff_{variant}_path",
+            source="artifactory",
             build_number=build_number,
+            artifactory_version=artifactory_version,
+            artifactory_build=build_number,
             commit=f"{variant}-commit",
             sdk_hash=f"{variant}-commit",
             xapi_path=xapi_path,
@@ -1233,7 +1255,12 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
                         "artifacts": [{"role": role} for role in roles],
                     },
                     "build": {"root": str(variant_root)},
-                    "sdk": {"version": version, "build_number": build_number},
+                    "sdk": {
+                        "version": version,
+                        "build_number": build_number,
+                        "artifactory_version": artifactory_version,
+                        "artifactory_build": build_number,
+                    },
                 }
             ),
             encoding="utf-8",
@@ -1256,6 +1283,8 @@ def test_write_diff_fw_data_embeds_hashed_variant_manifests(tmp_path: Path) -> N
     )
     assert manifest["variants"]["version1"]["sdk"]["version"] == "2025.12.3"
     assert manifest["variants"]["version1"]["sdk"]["build_number"] == "1200"
+    assert manifest["variants"]["version1"]["sdk"]["artifactory_build"] == "1200"
+    assert manifest["variants"]["version2"]["manifest"]["sdk"]["build_number"] == "1357"
     assert manifest["variants"]["version2"]["sdk"]["build_number"] == "1357"
 
 

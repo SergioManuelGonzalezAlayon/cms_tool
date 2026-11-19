@@ -70,6 +70,9 @@ def test_pytest_runtime_metadata_contains_measurement_identity(tmp_path, monkeyp
         dut_img=FirmwareImage(name="dut.s37", url="dut.s37", sha256="dut-hash"),
         tester_img=FirmwareImage(name="tester.s37", url="tester.s37", sha256="tester-hash"),
         xapi_file=FirmwareImage(name="sl_bt.xapi", url="sl_bt.xapi", sha256=_XAPI_SHA256),
+        sisdk_version="2026.12.0",
+        sisdk_artifactory_version="2026.12",
+        sisdk_artifactory_build="1357",
     )
     request = MeasurementRequest(
         request_id=identity.measurement_id,
@@ -99,6 +102,9 @@ def test_pytest_runtime_metadata_contains_measurement_identity(tmp_path, monkeyp
         "run_name": "Nightly Beacon Run",
         "created_at": "2026-08-18T09:30:00+00:00",
     }
+    assert metadata["firmware"]["sisdk_version"] == "2026.12.0"
+    assert metadata["firmware"]["sisdk_artifactory_version"] == "2026.12"
+    assert metadata["firmware"]["sisdk_artifactory_build"] == "1357"
     junit_dir = tmp_path / "junit"
     junit_dir.mkdir()
     junit_report = junit_dir / "0001-beacon-default.xml"

@@ -743,6 +743,30 @@ The app manager discovers installed SiSDK versions, resolves the requested SDK,
 trusts it with SLC, generates or upgrades SLCP projects, runs the CMake workflow,
 copies `sl_bt.xapi` into the build runtime directory, and writes build metadata.
 
+### SiSDK Build Selection and Provenance
+
+With `cms BUILD --artifactory`, `artifactory.version` and `artifactory.build`
+provide the configured release and build number. In an interactive terminal,
+the client shows that selection for confirmation. If you choose another build,
+it lists available releases and then the latest ten builds for the selected
+release. When a release is configured without a build number, the latest build
+for that release is resolved before confirmation. Non-interactive runs do not
+prompt and print the selection they use.
+
+Use `--sisdk-version` and `--build-number` (or `-bn`) to override the configured
+Artifactory selection and skip the prompt:
+
+```text
+cms BUILD --artifactory --sisdk-version 2026.12 --build-number 1357
+```
+
+Build metadata records the SDK package version separately from the Artifactory
+release and build, along with the source archive checksum. Per-app metadata
+records the selected app profile and effective device configuration. Regular
+build provenance is written to `fw_data.json`; differential builds retain each
+variant's package build number and provenance in its `fw_data.json` and in the
+paired `diff_fw_data.json`.
+
 ## Firmware Request Preparation
 
 `cms SEND_FW` prepares a `MeasurementRequest` in one of two ways:

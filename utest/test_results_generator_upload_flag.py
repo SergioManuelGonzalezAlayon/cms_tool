@@ -4,6 +4,8 @@ import importlib.util
 
 import pytest
 
+import s3_upload
+
 
 _RESULTS_GENERATOR_PATH = Path(__file__).resolve().parents[1] / "tests" / "results_generator.py"
 _SPEC = importlib.util.spec_from_file_location("results_generator_local_upload_flag", _RESULTS_GENERATOR_PATH)
@@ -89,6 +91,8 @@ def test_result_storage_metadata_uses_config_and_firmware_identity():
             "board_revision": "a01",
             "part_number": "xg22",
             "serial_number": "212300218",
+            "sisdk_artifactory_version": "2026.12",
+            "sisdk_artifactory_build": "1357",
         },
         slcp_meta={"chip_id": "EFR32MG22"},
     )
@@ -105,6 +109,50 @@ def test_result_storage_metadata_uses_config_and_firmware_identity():
         "serial_number": "212300218",
         "test_name": "beacon",
         "config_name": "default",
-        "sisdk_artifactory_version": None,
-        "sisdk_artifactory_build": None,
+        "sisdk_artifactory_version": "2026.12",
+        "sisdk_artifactory_build": "1357",
     }
+
+
+def test_data_lake_partition_includes_artifactory_build_when_available(tmp_path):
+    _, partition = s3_upload._record_upload_location(
+        tmp_path / "beacon_result.json",
+        cms_bench_id="bench-01",
+        sisdk_version="2026.12.0",
+        sisdk_artifactory_build="1357",
+        part_number="EFR32MG22C224F512IM40",
+        board="brd4182a",
+        board_revision="a06",
+        serial_number="",
+        protocol="BLE",
+        application_variant="dcdc",
+        test_case="beacon",
+        measured_at="2026-11-19T12:00:00Z",
+    )
+
+    assert partition == (
+        "cms/bench-01/2026.12.0/1357/efr32mg22c224f512im40/"
+        "brd4182a_a06//ble/dcdc/beacon"
+    )
+
+
+def test_data_lake_partition_omits_absent_artifactory_build(tmp_path):
+    _, partition = s3_upload._record_upload_location(
+        tmp_path / "beacon_result.json",
+        cms_bench_id="bench-01",
+        sisdk_version="2026.12.0",
+        sisdk_artifactory_build="",
+        part_number="EFR32MG22C224F512IM40",
+        board="brd4182a",
+        board_revision="a06",
+        serial_number="",
+        protocol="BLE",
+        application_variant="dcdc",
+        test_case="beacon",
+        measured_at="2026-11-19T12:00:00Z",
+    )
+
+    assert partition == (
+        "cms/bench-01/2026.12.0/efr32mg22c224f512im40/"
+        "brd4182a_a06//ble/dcdc/beacon"
+    )

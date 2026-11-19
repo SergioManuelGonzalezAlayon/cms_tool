@@ -80,6 +80,8 @@ def test_generated_json_declares_current_measurement_result_type(tmp_path, monke
                 "sisdk_name": "com.silabs.sdk.stack.sisdk",
                 "sisdk_version": "2025.12.3",
                 "sisdk_source": "client_config_package_path",
+                "sisdk_artifactory_version": "2025.12",
+                "sisdk_artifactory_build": "1357",
                 "sisdk_commit": "sdk-commit",
                 "sisdk_hash": "sdk-hash",
                 "xapi_file_hash": "xapi-hash",
@@ -102,4 +104,8 @@ def test_generated_json_declares_current_measurement_result_type(tmp_path, monke
     assert payload["dataset"]["sdk_name"] == "com.silabs.sdk.stack.sisdk"
     assert payload["dataset"]["sdk_version"] == "2025.12.3"
     assert payload["firmware"]["dut_sdk_source"] == "client_config_package_path"
+    assert payload["firmware"]["dut_sdk_artifactory_version"] == "2025.12"
+    assert payload["firmware"]["dut_sdk_artifactory_build"] == "1357"
+    assert payload["storage"]["sisdk_artifactory_version"] == "2025.12"
+    assert payload["storage"]["sisdk_artifactory_build"] == "1357"
     assert payload["firmware"]["dut_xapi_sha256"] == "xapi-hash"

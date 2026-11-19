@@ -91,6 +91,7 @@ from cms_variable_filters import (
     validate_variable_filters,
     variable_help_text,
 )
+from apps.sisdk_manager import ArtifactoryError, list_builds, list_sdk_versions
 from utils.config_loader import (
     load_test_config,
     validate_test_config_data,
@@ -2662,6 +2663,187 @@ def _confirm_and_clean_build_root(
     return subprocess.run(command, check=False, cwd=repo_root).returncode
 
 
+def _sisdk_release(version: str) -> str:
+    match = re.fullmatch(r"(\d{4}\.\d+)(?:\.\d+)?", version.strip())
+    return match.group(1) if match else ""
+
+
+def _configured_local_sdk_version(
+    config_path: str | Path,
+    client_config: CMSClientConfig,
+    sdk_package_path: str = "",
+) -> str:
+    target = client_config.target or {}
+    configured_path = sdk_package_path or str(target.get("sisdk_package_path", ""))
+    if configured_path:
+        sdk_path = Path(configured_path).expanduser()
+        if not sdk_path.is_absolute():
+            sdk_path = (Path(config_path).expanduser().resolve().parent / sdk_path).resolve()
+        properties_path = sdk_path / ".properties"
+        if properties_path.is_file():
+            for line in properties_path.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key.strip() == "version" and value.strip():
+                    return value.strip()
+    return str(target.get("sisdk", "")).strip()
+
+
+def _prompt_for_sdk_option(
+    title: str,
+    options: list[str],
+    *,
+    default: str = "",
+) -> str:
+    if not options:
+        raise RuntimeError(f"No options are available for {title}.")
+
+    print(title)
+    for index, option in enumerate(options, start=1):
+        marker = " (default)" if option == default else ""
+        print(f"  {index}. {option}{marker}")
+
+    while True:
+        try:
+            answer = input(f"Select {title.lower()} [1-{len(options)}]: ").strip()
+        except EOFError as error:
+            raise RuntimeError("No SDK selection was received; build cancelled.") from error
+        if not answer and default in options:
+            return default
+        if answer in options:
+            return answer
+        if answer.isdecimal():
+            index = int(answer)
+            if 1 <= index <= len(options):
+                return options[index - 1]
+        print("Please enter one of the listed values or its number.")
+
+
+def _choose_artifactory_sdk_selection(*, default_version: str = "") -> tuple[str, str]:
+    try:
+        versions = list(reversed(list_sdk_versions()))
+    except ArtifactoryError as error:
+        raise RuntimeError(f"Could not list SiSDK releases in Artifactory: {error}") from error
+    if not versions:
+        raise RuntimeError("No SiSDK releases were found in Artifactory.")
+
+    version = _prompt_for_sdk_option(
+        "Available SiSDK versions:",
+        versions,
+        default=default_version if default_version in versions else "",
+    )
+    try:
+        builds = list_builds(version)
+    except ArtifactoryError as error:
+        raise RuntimeError(f"Could not list SiSDK {version} builds in Artifactory: {error}") from error
+    if not builds:
+        raise RuntimeError(f"No builds were found for SiSDK {version} in Artifactory.")
+
+    latest_builds = list(reversed(builds[-10:]))
+    build = _prompt_for_sdk_option(
+        f"Latest builds for SiSDK {version}:",
+        latest_builds,
+    )
+    return version, build
+
+
+def _latest_artifactory_build(version: str) -> str:
+    try:
+        builds = list_builds(version)
+    except ArtifactoryError as error:
+        raise RuntimeError(f"Could not list SiSDK {version} builds in Artifactory: {error}") from error
+    if not builds:
+        raise RuntimeError(f"No builds were found for SiSDK {version} in Artifactory.")
+    return builds[-1]
+
+
+def _confirm_sdk_selection(label: str) -> bool:
+    print(f"SDK selection: {label}")
+    while True:
+        try:
+            answer = input("Use this SDK selection? [Y/n] ").strip().casefold()
+        except EOFError as error:
+            raise RuntimeError("No SDK selection was received; build cancelled.") from error
+        if answer in {"", "y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Please enter Y or N.")
+
+
+def _resolve_single_sdk_selection(
+    args: argparse.Namespace,
+    config_path: str,
+    client_config: CMSClientConfig,
+    *,
+    use_artifactory: bool,
+) -> tuple[bool, str, str]:
+    """Confirm or interactively change the SDK for a non-differential build."""
+
+    artifactory = client_config.artifactory or {}
+    local_version = _configured_local_sdk_version(
+        config_path,
+        client_config,
+        str(getattr(args, "sdk_package_path", "") or ""),
+    )
+    configured_release = str(artifactory.get("version", "") or "").strip()
+    configured_build = str(artifactory.get("build", "") or "").strip()
+    explicit_selection = bool(
+        getattr(args, "sisdk_version", "")
+        or getattr(args, "build_number", "")
+        or getattr(args, "sdk_package_path", "")
+    )
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+
+    if use_artifactory:
+        version = str(getattr(args, "sisdk_version", "") or configured_release).strip()
+        if not version:
+            version = _sisdk_release(local_version)
+        build = str(getattr(args, "build_number", "") or configured_build).strip()
+        if version and not re.fullmatch(r"\d{4}\.\d+", version):
+            raise RuntimeError("SiSDK release must use the format YYYY.MM")
+        if build and not build.isdecimal():
+            raise RuntimeError("Artifactory build number must be numeric")
+
+        if version and not build:
+            build = _latest_artifactory_build(version)
+        if not version:
+            if not interactive:
+                raise RuntimeError(
+                    "No Artifactory release is configured. Set artifactory.version, "
+                    "configure a local SiSDK package, or select a release interactively."
+                )
+            version, build = _choose_artifactory_sdk_selection(
+                default_version=_sisdk_release(local_version)
+            )
+        elif interactive and not explicit_selection:
+            label = f"SiSDK {version}, Artifactory build {build}"
+            if not _confirm_sdk_selection(label):
+                version, build = _choose_artifactory_sdk_selection(default_version=version)
+        return True, version, build
+
+    local_selection_version = str(getattr(args, "sisdk_version", "") or local_version).strip()
+    if interactive and not explicit_selection:
+        label = (
+            f"SiSDK {local_selection_version}, local package "
+            "(no Artifactory build number recorded)"
+            if local_selection_version
+            else "configured local SiSDK package (no Artifactory build number recorded)"
+        )
+        if not _confirm_sdk_selection(label):
+            default_release = configured_release or _sisdk_release(local_version)
+            version, build = _choose_artifactory_sdk_selection(default_version=default_release)
+            return True, version, build
+
+    if local_selection_version:
+        print(
+            f"Using local SiSDK package: version={local_selection_version} "
+            "build=not recorded"
+        )
+    else:
+        print("Using configured local SiSDK package; Artifactory build number is not recorded.")
+    return False, local_selection_version, ""
+
+
 def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
     is_diff = bool(getattr(args, "diff", False))
     use_artifactory = bool(getattr(args, "artifactory", False))
@@ -2676,15 +2858,29 @@ def _run_local_build(args: argparse.Namespace, config_path: str) -> int:
         raise RuntimeError("--sisdkv1/--sisdkv2/--v1build/--v2build require --diff --artifactory")
     if build_number_override and not use_artifactory:
         raise RuntimeError("--build-number can only be used with --artifactory")
+    if use_artifactory and args.sdk_package_path:
+        raise RuntimeError(
+            "cms BUILD --artifactory cannot be combined with --sdk-package-path; "
+            "the Artifactory selection supplies the SDK instead"
+        )
+    if use_artifactory and args.action == "clean":
+        raise RuntimeError("cms BUILD clean does not use --artifactory")
+
+    client_config = load_client_config(config_path)
+    if not is_diff:
+        use_artifactory, selected_version, selected_build = _resolve_single_sdk_selection(
+            args,
+            config_path,
+            client_config,
+            use_artifactory=use_artifactory,
+        )
+        if use_artifactory:
+            args.artifactory = True
+            args.sisdk_version = selected_version
+            args.build_number = selected_build
+            build_number_override = selected_build
+
     if use_artifactory:
-        if args.sdk_package_path:
-            raise RuntimeError(
-                "cms BUILD --artifactory cannot be combined with --sdk-package-path; "
-                "the Artifactory selection supplies the SDK instead"
-            )
-        if args.action == "clean":
-            raise RuntimeError("cms BUILD clean does not use --artifactory")
-        client_config = load_client_config(config_path)
         if is_diff:
             if getattr(args, "sisdk_version", "") or build_number_override:
                 raise RuntimeError(
