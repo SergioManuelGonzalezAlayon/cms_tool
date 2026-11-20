@@ -1403,7 +1403,9 @@ def pair_downloaded_differential_results(
     )
 
 
-def _load_firmware_roles(plan_path: Path) -> dict[tuple[str, str, str, str], PlannedJobIdentity]:
+def _load_firmware_roles(
+    plan_path: Path,
+) -> dict[tuple[str, str, str, str, str], PlannedJobIdentity]:
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -1415,12 +1417,26 @@ def _load_firmware_roles(plan_path: Path) -> dict[tuple[str, str, str, str], Pla
     if not isinstance(jobs, list):
         raise DifferentialPairingError("paired plan must contain a jobs list")
 
-    roles: dict[tuple[str, str, str, str], PlannedJobIdentity] = {}
+    roles: dict[tuple[str, str, str, str, str], PlannedJobIdentity] = {}
     for index, job in enumerate(jobs, start=1):
         if not isinstance(job, dict):
             raise DifferentialPairingError(f"paired plan job {index} must be an object")
         key = _plan_result_key(job, source=f"paired plan job {index}")
         role = _required_text(job, "firmware_role", source=f"paired plan job {index}")
+        if role not in {"dcdc", "no_dcdc"}:
+            raise DifferentialPairingError(
+                f"paired plan job {index} has unsupported firmware role: {role}"
+            )
+        dut_slcp_value = job.get("dut_slcp", "")
+        if not isinstance(dut_slcp_value, str):
+            raise DifferentialPairingError(
+                f"paired plan job {index} has no string 'dut_slcp' field"
+            )
+        dut_slcp = dut_slcp_value.strip()
+        if dut_slcp and _firmware_role_from_slcp(dut_slcp, source=f"paired plan job {index}") != role:
+            raise DifferentialPairingError(
+                f"paired plan job {index} firmware role does not match its DUT application"
+            )
         if key in roles:
             raise DifferentialPairingError(
                 f"paired plan has duplicate raw-result identity: {key}"
@@ -1435,7 +1451,7 @@ def _load_firmware_roles(plan_path: Path) -> dict[tuple[str, str, str, str], Pla
 def _load_variant_results(
     variant: str,
     root: Path,
-    roles: dict[tuple[str, str, str, str], PlannedJobIdentity],
+    roles: dict[tuple[str, str, str, str, str], PlannedJobIdentity],
 ) -> list[VariantResult]:
     if not root.is_dir():
         raise DifferentialPairingError(f"{variant} result root does not exist: {root}")
@@ -1446,7 +1462,31 @@ def _load_variant_results(
         if payload is None:
             continue
         result_key = _result_key(payload, source=str(path))
-        planned_identity = roles.get(result_key)
+        firmware = _required_object(payload, "firmware", source=str(path))
+        dut_slcp = _text_or_empty(firmware, "dut_slcp", source=str(path))
+        if dut_slcp:
+            role = _firmware_role_from_slcp(dut_slcp, source=str(path))
+            declared_role = firmware.get("firmware_role")
+            if declared_role is not None and declared_role != role:
+                raise DifferentialPairingError(
+                    f"{path} firmware role does not match its DUT application"
+                )
+        else:
+            declared_role = firmware.get("firmware_role")
+            if declared_role is not None:
+                if declared_role not in {"dcdc", "no_dcdc"}:
+                    raise DifferentialPairingError(
+                        f"{path} has an unsupported firmware role: {declared_role}"
+                    )
+                role = declared_role
+            else:
+                candidates = [key for key in roles if key[:4] == result_key]
+                if len(candidates) != 1:
+                    raise DifferentialPairingError(
+                        f"{path} is missing DUT application identity for a multi-role paired plan"
+                    )
+                role = candidates[0][4]
+        planned_identity = roles.get((*result_key, role))
         if planned_identity is None:
             raise DifferentialPairingError(
                 f"result does not match a paired-plan job: {path}"
@@ -1459,7 +1499,6 @@ def _load_variant_results(
                 raise DifferentialPairingError(
                     f"{path} partition does not match its paired-plan job"
                 )
-        firmware = _required_object(payload, "firmware", source=str(path))
         parameters = payload.get("parameters")
         if parameters is not None and not isinstance(parameters, dict):
             raise DifferentialPairingError(
@@ -1514,12 +1553,27 @@ def _result_key(payload: dict[str, Any], *, source: str) -> tuple[str, str, str,
     )
 
 
-def _plan_result_key(job: dict[str, Any], *, source: str) -> tuple[str, str, str, str]:
+def _plan_result_key(
+    job: dict[str, Any], *, source: str
+) -> tuple[str, str, str, str, str]:
     return (
         _required_text(job, "feature", source=source),
         _normalised_path(_required_text(job, "config_path", source=source)),
         _required_text(job, "config_hash", source=source),
         _required_text(job, "mode", source=source),
+        _required_text(job, "firmware_role", source=source),
+    )
+
+
+def _firmware_role_from_slcp(value: str, *, source: str) -> str:
+    filename = value.replace("\\", "/").rsplit("/", 1)[-1]
+    project = filename.rsplit(".", 1)[0].lower()
+    if project == "ncp_ble_dut_dcdc":
+        return "dcdc"
+    if project == "ncp_ble_dut":
+        return "no_dcdc"
+    raise DifferentialPairingError(
+        f"{source} uses unsupported DUT application: {value}"
     )
 
 
