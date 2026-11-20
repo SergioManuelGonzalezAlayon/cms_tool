@@ -370,6 +370,47 @@ def ble_support(monkeypatch):
     return ble, support
 
 
+def test_dut_scan_sync_uses_injected_pawr_config(monkeypatch, ble_support):
+    ble, _support = ble_support
+    dut = MagicMock()
+    dut.bt.sync_scanner.set_sync_parameters.return_value = SimpleNamespace(result=0)
+    dut.bt.sync_scanner.open.return_value = SimpleNamespace(result=0, sync=23)
+    dut.bt.pawr_sync.set_sync_subevents.return_value = SimpleNamespace(result=0)
+    opened_event = SimpleNamespace(
+        sync=23,
+        address="target",
+        address_type=0,
+        adv_sid=2,
+    )
+    closed_event = SimpleNamespace(sync=23)
+
+    def check_event(_dut, event_class, event_name, *_args, **_kwargs):
+        if (event_class, event_name) == ("pawr_sync", "opened"):
+            return opened_event
+        return closed_event
+
+    monkeypatch.setattr(ble, "bgapi_check_event", check_event)
+    config = {"sync": {"timeout": 250}, "pawr": {"num_subevents": 1}}
+    pawr_config = ble.PAWRConfigType(num_subevents=3)
+    fixture = ble.DUTScanSync.__wrapped__(dut, config, pawr_config)
+    start = next(fixture)
+
+    assert start(
+        address="target",
+        address_type=0,
+        adv_sid=2,
+        timeout=250,
+        reporting_mode=0,
+    ) == 23
+    dut.bt.pawr_sync.set_sync_subevents.assert_called_once_with(
+        23,
+        bytes((0, 1, 2)),
+    )
+
+    with pytest.raises(StopIteration):
+        next(fixture)
+
+
 def _profile_request(test_name, cfg="custom.json", metadata=None):
     options = {"--cfg": cfg, "--cms-fw-metadata": metadata}
     return SimpleNamespace(
