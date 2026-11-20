@@ -53,6 +53,7 @@ from cms_diff_comparison import (
     prepare_comparison_inputs,
     render_diff_comparison_table,
     write_diff_comparison_report,
+    write_diff_excel_report,
 )
 from cms_protocol import (
     CMS_OBSERVATION_PROTOCOL_VERSION,
@@ -3734,7 +3735,12 @@ def _create_and_render_diff_comparison(
         inputs = prepare_comparison_inputs(pairing)
         report = create_diff_comparison_report(pairing, inputs)
         report_path = write_diff_comparison_report(report, evidence_root / "diff_comparison.json")
+        date =  datetime.today().strftime('%Y_%m_%d_%Hh%Mm%Ss')
         print(f"saved {report_path}")
+        excel_report_path = write_diff_excel_report(
+            report, evidence_root / f"diff_comparison_{date}.xlsx"
+        )
+        print(f"saved {excel_report_path}")
         saved_report = json.loads(report_path.read_text(encoding="utf-8"))
         print(render_diff_comparison_table(saved_report))
     except (DifferentialPairingError, ValueError, OSError) as exc:

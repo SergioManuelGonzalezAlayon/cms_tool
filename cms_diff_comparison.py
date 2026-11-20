@@ -16,6 +16,13 @@ import math
 from pathlib import Path
 from typing import Any
 
+from openpyxl import Workbook, load_workbook
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.filters import AutoFilter
+from openpyxl.worksheet.table import Table, TableStyleInfo
+
 
 class DifferentialPairingError(ValueError):
     """Raised when retained campaign evidence cannot be paired safely."""
@@ -284,7 +291,12 @@ def create_diff_comparison_report(
     *,
     thresholds: PercentageThresholdPolicy = PercentageThresholdPolicy(),
 ) -> dict[str, Any]:
-    """Build the versioned authoritative report for a differential campaign."""
+    """Build the authoritative JSON report from paired measurements and diagnostics.
+
+    ``pairs`` contains matched V1/V2 results for the existing terminal renderer.
+    ``records`` is the normalized per-test collection, including one-sided results,
+    for downstream reports such as Excel.
+    """
 
     metrics_by_identity: dict[PairingIdentity, list[ComparisonMetricInput]] = {}
     for metric in inputs.metrics:
@@ -292,22 +304,28 @@ def create_diff_comparison_report(
 
     diagnostics = list(inputs.diagnostics)
     pairs: list[dict[str, Any]] = []
+    records_with_identity: list[tuple[PairingIdentity, dict[str, Any]]] = []
     for pair in pairing.pairs:
         entries: list[dict[str, Any]] = []
+        record_diagnostics = [
+            diagnostic
+            for diagnostic in inputs.diagnostics
+            if diagnostic.identity == pair.identity
+        ]
         for metric in sorted(metrics_by_identity.get(pair.identity, []), key=lambda item: item.variable):
             percent = _percent_delta(metric.version2_value, metric.version1_value)
             status = _comparison_status(percent, thresholds)
             if percent is None:
-                diagnostics.append(
-                    ComparisonDiagnostic(
-                        code="zero_version1_baseline",
-                        message=(
-                            f"{metric.variable} percentage is unavailable because the version1 value is zero"
-                        ),
-                        variable=metric.variable,
-                        identity=metric.identity,
-                    )
+                diagnostic = ComparisonDiagnostic(
+                    code="zero_version1_baseline",
+                    message=(
+                        f"{metric.variable} percentage is unavailable because the version1 value is zero"
+                    ),
+                    variable=metric.variable,
+                    identity=metric.identity,
                 )
+                diagnostics.append(diagnostic)
+                record_diagnostics.append(diagnostic)
             entries.append(
                 {
                     "variable": metric.variable,
@@ -323,14 +341,56 @@ def create_diff_comparison_report(
                     },
                 }
             )
-        pairs.append(
-            {
-                "identity": _identity_to_dict(pair.identity),
-                "version1": _report_variant_input(pair.version1),
-                "version2": _report_variant_input(pair.version2),
-                "metrics": entries,
-            }
+        differential_status, reason = _classify_differential_record(
+            entries, record_diagnostics
         )
+        record = {
+            "identity": _identity_to_dict(pair.identity),
+            "version1": _report_variant_input(pair.version1),
+            "version2": _report_variant_input(pair.version2),
+            "metrics": entries,
+            "differential_status": differential_status,
+            "reason": reason,
+            "diagnostics": [diagnostic.to_dict() for diagnostic in record_diagnostics],
+        }
+        pairs.append(record)
+        records_with_identity.append((pair.identity, record))
+
+    for variant, unmatched_results in (
+        ("version1", pairing.unmatched_version1),
+        ("version2", pairing.unmatched_version2),
+    ):
+        for result in unmatched_results:
+            record_diagnostics = [
+                diagnostic
+                for diagnostic in inputs.diagnostics
+                if diagnostic.identity == result.identity
+            ]
+            differential_status, reason = _classify_differential_record(
+                [], record_diagnostics
+            )
+            variants = {
+                "version1": _missing_report_variant(),
+                "version2": _missing_report_variant(),
+            }
+            variants[variant] = _report_variant_input(result)
+            record = {
+                "identity": _identity_to_dict(result.identity),
+                "version1": variants["version1"],
+                "version2": variants["version2"],
+                "metrics": [],
+                "differential_status": differential_status,
+                "reason": reason,
+                "diagnostics": [diagnostic.to_dict() for diagnostic in record_diagnostics],
+            }
+            records_with_identity.append((result.identity, record))
+
+    records = [
+        record
+        for _, record in sorted(
+            records_with_identity, key=lambda item: _identity_sort_key(item[0])
+        )
+    ]
 
     return {
         "schema_version": 1,
@@ -341,6 +401,7 @@ def create_diff_comparison_report(
             "failure_percent": thresholds.failure_percent,
         },
         "pairs": pairs,
+        "records": records,
         "diagnostics": [diagnostic.to_dict() for diagnostic in diagnostics],
     }
 
@@ -351,6 +412,317 @@ def write_diff_comparison_report(report: dict[str, Any], output_path: Path) -> P
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return output_path
+
+
+def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
+    """Write a filterable, terminal-style metric table to a single-sheet workbook.
+
+    Each normalized test identity contributes one row per terminal metric. The
+    comparison columns stay together at the left; execution evidence is retained
+    in trailing columns for users who need to audit a result.
+    """
+
+    records = report.get("records")
+    if not isinstance(records, list):
+        raise ValueError("diff comparison report must contain a records list")
+    identity_fields = (
+        "feature",
+        "config_path",
+        "config_hash",
+        "partition",
+        "mode",
+        "board",
+        "device",
+        "firmware_role",
+        "supply_voltage_v",
+    )
+    identity_keys: set[tuple[Any, ...]] = set()
+    row_keys: set[tuple[tuple[Any, ...], str]] = set()
+    headers = (
+        "Test",
+        "DCDC Mode",
+        "Metric",
+        "Version 2",
+        "Version 1",
+        "Δ (V2 − V1)",
+        "Change",
+        "Result",
+        "Test Result",
+        "Setup",
+        "V1 Run",
+        "V2 Run",
+        "Reason",
+    )
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Differential Results"
+    worksheet.append(headers)
+    worksheet.sheet_view.showGridLines = False
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="243746")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    worksheet.row_dimensions[1].height = 30
+
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("identity"), dict):
+            raise ValueError("diff comparison report contains an invalid normalized record")
+        identity = record["identity"]
+        identity_key = tuple(identity.get(field) for field in identity_fields)
+        if identity_key in identity_keys:
+            raise ValueError("diff comparison report contains a duplicate test identity")
+        identity_keys.add(identity_key)
+        variants = {
+            name: record.get(name) if isinstance(record.get(name), dict) else {}
+            for name in ("version1", "version2")
+        }
+        config_path = str(identity.get("config_path") or "")
+        config_name = Path(config_path).name if config_path else "N/A"
+        test_name = str(identity.get("feature") or "Unknown test")
+        if config_name and config_name != "N/A":
+            test_name = f"{test_name} / {config_name}"
+        role = str(identity.get("firmware_role") or "UNKNOWN").upper()
+        run_details: dict[str, str] = {}
+        for variant_name in ("version1", "version2"):
+            variant = variants[variant_name]
+            provenance = variant.get("provenance")
+            if not isinstance(provenance, dict):
+                provenance = {}
+            sdk = provenance.get("sisdk")
+            sdk_version = provenance.get("dut_sdk_version") or provenance.get("sisdk_version")
+            if not sdk_version and isinstance(sdk, dict):
+                sdk_version = sdk.get("version")
+            sdk_build = (
+                provenance.get("dut_sdk_artifactory_build")
+                or provenance.get("sisdk_artifactory_build")
+                or provenance.get("build_number")
+            )
+            run_parts = [f"SiSDK {sdk_version}" if sdk_version else "SiSDK N/A"]
+            if sdk_build:
+                run_parts.append(f"Build {sdk_build}")
+            run_parts.append(str(variant.get("execution_status") or "missing_result"))
+            if variant.get("cms_bench_id"):
+                run_parts.append(f"Bench {variant['cms_bench_id']}")
+            if variant.get("measured_at"):
+                run_parts.append(str(variant["measured_at"]))
+            run_details[variant_name] = " · ".join(run_parts)
+
+        supply_voltage = identity.get("supply_voltage_v")
+        supply_label = "N/A" if supply_voltage is None else f"{supply_voltage} V"
+        setup_parts = [
+            str(identity.get("board") or ""),
+            str(identity.get("device") or ""),
+            supply_label,
+            str(identity.get("partition") or ""),
+            str(identity.get("mode") or ""),
+        ]
+        setup = " · ".join(part for part in setup_parts if part)
+        comparisons = {
+            metric.get("variable"): metric
+            for metric in record.get("metrics", [])
+            if isinstance(metric, dict)
+        }
+        for variable in _TABLE_METRIC_ORDER:
+            row_key = (identity_key, variable)
+            if row_key in row_keys:
+                raise ValueError("diff comparison report contains a duplicate test metric")
+            row_keys.add(row_key)
+
+            observations: dict[str, dict[str, Any]] = {}
+            reasons: list[str] = []
+            record_reason = record.get("reason")
+            if record_reason:
+                reasons.append(str(record_reason))
+            for variant_name, label in (("version1", "V1"), ("version2", "V2")):
+                variant_metrics = variants[variant_name].get("metrics")
+                observation = (
+                    variant_metrics.get(variable)
+                    if isinstance(variant_metrics, dict)
+                    else None
+                )
+                observations[variant_name] = (
+                    observation if isinstance(observation, dict) else {}
+                )
+                if not (
+                    observations[variant_name].get("available")
+                    and observations[variant_name].get("value") is not None
+                ):
+                    reason = (
+                        observations[variant_name].get("availability_reason")
+                    )
+                    reasons.append(f"{label}: {reason or 'metric_value_unavailable'}")
+
+            comparison = comparisons.get(variable, {})
+            metric_status = comparison.get("status") or "UNAVAILABLE"
+            row = [
+                test_name,
+                role,
+                _format_metric_name(variable, include_unit=True),
+                observations["version2"].get("value")
+                if observations["version2"].get("available")
+                and observations["version2"].get("value") is not None
+                else "N/A",
+                observations["version1"].get("value")
+                if observations["version1"].get("available")
+                and observations["version1"].get("value") is not None
+                else "N/A",
+                comparison.get("delta")
+                if comparison.get("delta") is not None
+                else "N/A",
+                comparison.get("percent")
+                if comparison.get("percent") is not None
+                else "N/A",
+                metric_status,
+                record.get("differential_status", "INCOMPLETE"),
+                setup,
+                run_details["version1"],
+                run_details["version2"],
+                "; ".join(dict.fromkeys(reasons)),
+            ]
+            worksheet.append(row)
+            for cell in worksheet[worksheet.max_row]:
+                if isinstance(cell.value, str):
+                    cell.data_type = "s"
+
+    worksheet.freeze_panes = "D2"
+    column_widths = {
+        "A": 32,
+        "B": 13,
+        "C": 22,
+        "D": 15,
+        "E": 15,
+        "F": 17,
+        "G": 12,
+        "H": 13,
+        "I": 16,
+        "J": 30,
+        "K": 36,
+        "L": 36,
+        "M": 42,
+    }
+    for column, width in column_widths.items():
+        worksheet.column_dimensions[column].width = width
+    worksheet.column_dimensions.group("I", "M", outline_level=1, hidden=True)
+    for row in worksheet.iter_rows(min_row=2):
+        worksheet.row_dimensions[row[0].row].height = 22
+        for cell in row:
+            cell.alignment = Alignment(vertical="center")
+    for row in range(2, worksheet.max_row + 1):
+        for column in (4, 5):
+            worksheet.cell(row=row, column=column).number_format = "0.######;-0.######;0"
+        worksheet.cell(row=row, column=6).number_format = "+0.######;-0.######;0"
+        worksheet.cell(row=row, column=7).number_format = '+0.00"%";-0.00"%";0.00"%"'
+
+    table_ref = worksheet.dimensions
+    table = Table(displayName="DifferentialResults", ref=table_ref)
+    table.autoFilter = AutoFilter(ref=table_ref)
+    table.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    worksheet.add_table(table)
+    status_columns = (headers.index("Result") + 1, headers.index("Test Result") + 1)
+    if worksheet.max_row > 1:
+        for column in status_columns:
+            _apply_status_conditional_formatting(worksheet, column)
+
+    if workbook.sheetnames != [worksheet.title]:
+        raise ValueError("diff comparison workbook must contain exactly one worksheet")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(output_path)
+    _validate_diff_excel_workbook(
+        output_path,
+        headers,
+        len(row_keys),
+        status_columns if worksheet.max_row > 1 else (),
+    )
+    return output_path
+
+
+def _apply_status_conditional_formatting(worksheet: Any, column: int) -> None:
+    """Highlight one result column so metric and test outcomes stand out."""
+
+    if worksheet.max_row < 2:
+        return
+    column_letter = get_column_letter(column)
+    cell_range = f"{column_letter}2:{column_letter}{worksheet.max_row}"
+    status_colors = {
+        "PASS": "D9EAD3",
+        "WARNING": "FFF2CC",
+        "FAIL": "F4CCCC",
+        "INCOMPLETE": "FCE5CD",
+        "UNAVAILABLE": "E7E6E6",
+    }
+    for status, color in status_colors.items():
+        worksheet.conditional_formatting.add(
+            cell_range,
+            FormulaRule(
+                formula=[f'{column_letter}2="{status}"'],
+                stopIfTrue=True,
+                fill=PatternFill(fill_type="solid", fgColor=color),
+            ),
+        )
+
+
+def _validate_diff_excel_workbook(
+    output_path: Path,
+    expected_headers: tuple[str, ...],
+    expected_row_count: int,
+    expected_status_columns: tuple[int, ...],
+) -> None:
+    """Check the saved workbook's table shape, row count, filters, and highlights."""
+
+    workbook = load_workbook(output_path, data_only=True)
+    try:
+        if workbook.sheetnames != ["Differential Results"]:
+            raise ValueError("saved diff comparison workbook must contain exactly one worksheet")
+        worksheet = workbook["Differential Results"]
+        if worksheet.max_row != expected_row_count + 1:
+            raise ValueError("saved diff comparison workbook has an unexpected data row count")
+        if worksheet.max_column != len(expected_headers):
+            raise ValueError("saved diff comparison workbook has an unexpected column count")
+        actual_headers = tuple(
+            worksheet.cell(row=1, column=column).value
+            for column in range(1, len(expected_headers) + 1)
+        )
+        if actual_headers != expected_headers:
+            raise ValueError("saved diff comparison workbook headers do not match the report")
+        if "DifferentialResults" not in worksheet.tables:
+            raise ValueError("saved diff comparison workbook is missing its results table")
+        table = worksheet.tables["DifferentialResults"]
+        if table.ref != worksheet.dimensions:
+            raise ValueError("saved diff comparison table does not cover the full report range")
+        if table.autoFilter is None or table.autoFilter.ref != worksheet.dimensions:
+            raise ValueError("saved diff comparison table is missing its full-range filter")
+        if worksheet.freeze_panes != "D2":
+            raise ValueError("saved diff comparison workbook is missing frozen headers and identifiers")
+        saved_row_keys: set[tuple[Any, ...]] = set()
+        for row in worksheet.iter_rows(min_row=2, max_col=10, values_only=True):
+            row_key = (row[0], row[1], row[2], row[9])
+            if row_key in saved_row_keys:
+                raise ValueError("saved diff comparison workbook contains a duplicate test metric")
+            saved_row_keys.add(row_key)
+        if len(worksheet.conditional_formatting) != len(expected_status_columns):
+            raise ValueError("saved diff comparison workbook is missing result highlighting")
+        for column in expected_status_columns:
+            column_letter = get_column_letter(column)
+            expected_range = f"{column_letter}2:{column_letter}{worksheet.max_row}"
+            matching_ranges = [
+                cell_range
+                for cell_range in worksheet.conditional_formatting
+                if str(cell_range.sqref) == expected_range
+            ]
+            if len(matching_ranges) != 1:
+                raise ValueError("saved diff comparison workbook has an unexpected highlight range")
+            rules = worksheet.conditional_formatting[matching_ranges[0]]
+            if len(rules) != 5:
+                raise ValueError("saved diff comparison workbook has incomplete status highlights")
+    finally:
+        workbook.close()
 
 
 def render_diff_comparison_table(report: dict[str, Any]) -> str:
@@ -544,10 +916,131 @@ def _identity_to_dict(identity: PairingIdentity) -> dict[str, Any]:
 
 
 def _report_variant_input(result: VariantResult) -> dict[str, Any]:
+    """Extract a present variant's timing, bench, and firmware report metadata."""
+
+    test_run = result.payload.get("test_run")
+    if not isinstance(test_run, dict):
+        test_run = {}
+    storage = result.payload.get("storage")
+    if not isinstance(storage, dict):
+        storage = {}
     return {
         "artifact_path": result.path.as_posix(),
+        "execution_status": test_run.get("status"),
+        "measured_at": test_run.get("measured_at"),
+        "cms_bench_id": storage.get("cms_bench_id"),
         "provenance": result.payload.get("firmware", {}),
+        "metrics": _report_variant_metrics(result),
     }
+
+
+def _report_variant_metrics(result: VariantResult) -> dict[str, dict[str, Any]]:
+    """Return each available metric value and an explicit reason when it is absent."""
+
+    payload = result.payload
+    result_metric = payload.get("result_metric") if isinstance(payload, dict) else None
+    observations: dict[str, dict[str, Any]] = {}
+    summary_metrics = {
+        "sleep_current_ma": ("Interval", "i_mean_ma"),
+        "event_energy_nj": ("Event", "e_mean_nj"),
+        "interval_energy_nj": ("Interval", "e_mean_nj"),
+    }
+
+    for variable in _METRIC_FIELDS:
+        value: float | None = None
+        try:
+            if not isinstance(payload, dict):
+                reason = "invalid_result_payload"
+            elif not isinstance(result_metric, dict):
+                reason = "missing_result_metric"
+            else:
+                reason = _metric_omission_reason(payload, variable)
+                if reason is None:
+                    if variable in summary_metrics:
+                        meas_type, field = summary_metrics[variable]
+                        value = _summary_metric(payload, meas_type, field)
+                    else:
+                        value = _optional_current(result_metric, variable)
+                    if value is None:
+                        reason = "null_metric"
+        except ResultMetricParseError as exc:
+            reason = str(exc)
+
+        if reason is None:
+            observations[variable] = {
+                "value": value,
+                "available": True,
+                "availability_reason": None,
+            }
+            continue
+
+        if reason == "marked_unavailable" and isinstance(result_metric, dict):
+            metric_status = result_metric.get("metric_status")
+            if isinstance(metric_status, dict):
+                status = metric_status.get(variable)
+                if isinstance(status, str) and status:
+                    reason = status
+        observations[variable] = {
+            "value": None,
+            "available": False,
+            "availability_reason": reason,
+        }
+
+    return observations
+
+
+def _missing_report_variant() -> dict[str, Any]:
+    """Return missing-result metadata and mark every metric unavailable."""
+
+    return {
+        "artifact_path": None,
+        "execution_status": "missing_result",
+        "measured_at": None,
+        "cms_bench_id": None,
+        "provenance": {},
+        "metrics": {
+            variable: {
+                "value": None,
+                "available": False,
+                "availability_reason": "missing_result",
+            }
+            for variable in _METRIC_FIELDS
+        },
+    }
+
+
+def _classify_differential_record(
+    metrics: list[dict[str, Any]], diagnostics: list[ComparisonDiagnostic]
+) -> tuple[str, str | None]:
+    """Return a test-level status and reason from its metric results and diagnostics.
+
+    A failing metric takes precedence; otherwise diagnostics or an empty metric set
+    make the record INCOMPLETE. A record with comparable, non-failing metrics is PASS.
+    """
+
+    failing_metrics = [
+        metric
+        for metric in metrics
+        if metric.get("status") == ComparisonStatus.FAIL.value
+    ]
+    if failing_metrics:
+        reasons = []
+        for metric in failing_metrics:
+            percent = metric.get("percent")
+            rendered_percent = (
+                "unavailable" if percent is None else f"{percent:+.2f}%"
+            )
+            reasons.append(f"{metric['variable']} regression ({rendered_percent})")
+        return "FAIL", "; ".join(reasons)
+
+    if diagnostics:
+        reason_messages = list(
+            dict.fromkeys(diagnostic.message for diagnostic in diagnostics)
+        )
+        return "INCOMPLETE", "; ".join(reason_messages)
+    if not metrics:
+        return "INCOMPLETE", "No comparable metrics are available."
+    return "PASS", None
 
 
 def _extract_or_diagnose(
@@ -580,7 +1073,9 @@ def _metric_omission_reason(payload: dict[str, Any], variable: str) -> str | Non
             return f"missing_{meas_type.lower()}_summary"
         return "null_metric" if summary.get(field) is None else None
 
-    result_metric = payload["result_metric"]
+    result_metric = payload.get("result_metric")
+    if not isinstance(result_metric, dict):
+        return "missing_result_metric"
     if variable not in result_metric:
         return "missing_metric"
     metric_status = result_metric.get("metric_status", {})
