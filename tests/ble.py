@@ -8,6 +8,7 @@ from bgapi.bglib import BGLib
 from bgapi.serialconnector import SerialConnector
 from joulescope_interface import JoulescopeDev, JoulescopeUsbReset
 from utils.bgapi_utils import *
+from utils.bgapi_utils import PAWRConfig as PAWRConfigType
 from conftest import *
 
 # TODO - BGAPI device interfaces in pytest so that we can use the HWMux thingy
@@ -407,11 +408,16 @@ def DUTScanStart(DUT,
 
 
 @pytest.fixture
+def PAWRConfig(Config) -> PAWRConfigType:
+    return dataclass_from_dict(PAWRConfigType, Config.get("pawr", {}))
+
+
+@pytest.fixture
 def DUTPAwRStart(DUT,
                  DUTAdvConfig,
-                 Config):
+                 PAWRConfig: PAWRConfigType):
     started = False
-    pawr_cfg = dataclass_from_dict(PAWRConfig, Config.get("pawr", {}))
+    pawr_cfg = PAWRConfig
 
     def _start(*, flags=0):
         nonlocal started
@@ -473,7 +479,7 @@ def DUTPAwRStart(DUT,
 
 
 @pytest.fixture
-def DUTScanSync(DUT, Config):
+def DUTScanSync(DUT, Config, PAWRConfig: PAWRConfigType):
     """Configure DUT PAwR synchronization with a specific advertiser."""
     started = False
     sync_handle = None
@@ -532,6 +538,16 @@ def DUTScanSync(DUT, Config):
             log.info("DUT PAwR sync established via subevent reports")
 
         started = True
+        sync_subevents = bytes(range(PAWRConfig.num_subevents))
+        if not sync_subevents:
+            raise ValueError("PAwR observer requires at least one configured subevent")
+        rsp = DUT.bt.pawr_sync.set_sync_subevents(sync_handle, sync_subevents)
+        assert rsp.result == 0
+        log.info(
+            "DUT PAwR sync subevents selected: sync=%s subevents=%s",
+            sync_handle,
+            list(sync_subevents),
+        )
         return sync_handle
 
     yield _start
@@ -770,9 +786,9 @@ def TesterScanSync(Tester):
 @pytest.fixture
 def TesterPAwRStart(Tester,
                     TesterAdvConfig,
-                    Config):
+                    PAWRConfig: PAWRConfigType):
     started = False
-    pawr_cfg = dataclass_from_dict(PAWRConfig, Config.get("pawr", {}))
+    pawr_cfg = PAWRConfig
 
     def _start(*, flags=0):
         nonlocal started
@@ -1261,7 +1277,7 @@ def test_PAwR_per(JoulescopeDev,
                   DUTPAwRStart,
                   TesterScanStart,
                   TesterScanSync,
-                  Config):
+                  PAWRConfig: PAWRConfigType):
     dut_address = get_device_addr(DUT)
 
     TesterScanStart(
@@ -1325,11 +1341,7 @@ def test_PAwR_per(JoulescopeDev,
         adv_sid=adv_report.adv_sid,
     )
 
-    pawr_cfg = dataclass_from_dict(
-        PAWRConfig, Config.get("pawr", {})
-    )
-
-    capture_s = BLE_EVENT_NUM * pawr_cfg.interval / 1000.0
+    capture_s = BLE_EVENT_NUM * PAWRConfig.interval / 1000.0
 
     JoulescopeDev.startPowerProfilingSession(capture_s)
 
@@ -1341,7 +1353,7 @@ def test_PAwR_obs(JoulescopeDev,
                   DUTScanStart,
                   DUTScanSync,
                   TesterPAwRStart,
-                  Config):
+                  PAWRConfig: PAWRConfigType):
     tester_address = get_device_addr(Tester)
 
     DUTScanStart(
@@ -1404,10 +1416,6 @@ def test_PAwR_obs(JoulescopeDev,
         adv_sid=adv_report.adv_sid,
     )
 
-    pawr_cfg = dataclass_from_dict(
-        PAWRConfig, Config.get("pawr", {})
-    )
-
-    capture_s = BLE_EVENT_NUM * pawr_cfg.interval / 1000.0
+    capture_s = BLE_EVENT_NUM * PAWRConfig.interval / 1000.0
 
     JoulescopeDev.startPowerProfilingSession(capture_s)
