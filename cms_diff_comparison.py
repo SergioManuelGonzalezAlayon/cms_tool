@@ -725,7 +725,7 @@ def _validate_diff_excel_workbook(
         workbook.close()
 
 
-def render_diff_comparison_table(report: dict[str, Any]) -> str:
+def _render_legacy_diff_comparison_table(report: dict[str, Any]) -> str:
     """Render a terminal-friendly differential comparison table from a JSON report."""
 
     pairs = report.get("pairs")
@@ -773,6 +773,229 @@ def render_diff_comparison_table(report: dict[str, Any]) -> str:
             )
         )
     return "\n".join(tables).rstrip() if tables else "No comparable metrics."
+
+
+def _normalized_differential_summary(records: list[dict[str, Any]]) -> str:
+    """Count test-level outcomes from the same records rendered above."""
+
+    counts = {"PASS": 0, "FAIL": 0, "INCOMPLETE": 0}
+    for record in records:
+        counts[_normalized_record_status(record)] += 1
+    return (
+        "Differential summary: "
+        f"Passed {counts['PASS']} | Failed {counts['FAIL']} | "
+        f"Incomplete {counts['INCOMPLETE']}"
+    )
+
+
+def _normalized_record_status(record: dict[str, Any]) -> str:
+    """Treat absent or unknown test-level classifications as incomplete."""
+
+    status = record.get("differential_status")
+    if isinstance(status, str) and status in {"PASS", "FAIL", "INCOMPLETE"}:
+        return status
+    return "INCOMPLETE"
+
+
+def render_diff_comparison_table(report: dict[str, Any]) -> str:
+    """Render normalized differential records, including incomplete tests."""
+
+    records = report.get("records")
+    if not isinstance(records, list):
+        # Preserve support for comparison JSON written before normalized records
+        # were added to the report schema.
+        return _render_legacy_diff_comparison_table(report)
+
+    tables: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("diff comparison report record must be an object")
+        identity = record.get("identity")
+        metrics = record.get("metrics")
+        if not isinstance(identity, dict) or not isinstance(metrics, list):
+            raise ValueError("diff comparison report record has invalid identity or metrics")
+
+        comparisons = {
+            str(metric.get("variable")): metric
+            for metric in metrics
+            if isinstance(metric, dict) and str(metric.get("variable", ""))
+        }
+        variants = {
+            name: record.get(name) if isinstance(record.get(name), dict) else {}
+            for name in ("version1", "version2")
+        }
+        table_rows: list[tuple[str, ...]] = []
+        for variable in _TABLE_METRIC_ORDER:
+            comparison = comparisons.get(variable, {})
+            version2_value, version2_reason = _normalized_metric_observation(
+                variants["version2"], variable, comparison, "version2", "V2"
+            )
+            version1_value, version1_reason = _normalized_metric_observation(
+                variants["version1"], variable, comparison, "version1", "V1"
+            )
+            reasons = [
+                reason
+                for reason in (version1_reason, version2_reason)
+                if reason
+            ]
+            table_rows.append(
+                (
+                    _format_metric_name(variable, include_unit=True),
+                    version2_value,
+                    version1_value,
+                    _format_number(comparison.get("delta"), signed=True),
+                    _format_percent(comparison.get("percent")),
+                    _format_status(str(comparison.get("status", "UNAVAILABLE"))),
+                    "; ".join(dict.fromkeys(reasons)),
+                )
+            )
+
+        tables.extend(
+            (
+                _normalized_table_title(identity),
+                _normalized_identity_setup(identity),
+                _normalized_variant_run_line(record, "version1"),
+                _normalized_variant_run_line(record, "version2"),
+                f"Differential result: {_normalized_record_status(record)}",
+            )
+        )
+        if record.get("reason"):
+            tables.append(f"Reason: {record['reason']}")
+
+        version2_header = _normalized_sdk_column_label(record, "version2", "Version 2")
+        version1_header = _normalized_sdk_column_label(record, "version1", "Version 1")
+        tables.extend(
+            (
+                _render_terminal_table(
+                    (
+                        "Metric",
+                        version2_header,
+                        version1_header,
+                        "Delta (V2 - V1)",
+                        "Change",
+                        "Result",
+                        "Reason",
+                    ),
+                    table_rows,
+                ),
+                "",
+            )
+        )
+
+    summary = _normalized_differential_summary(records)
+    if not tables:
+        return f"No comparable metrics.\n\n{summary}"
+    tables.append(summary)
+    return "\n".join(tables).rstrip()
+
+
+def _normalized_table_title(identity: dict[str, Any]) -> str:
+    """Show the logical test identity and its DCDC firmware mode."""
+
+    role = str(identity.get("firmware_role") or "unknown").upper()
+    title = (
+        f"### {identity.get('feature', 'unknown feature')} | "
+        f"{identity.get('config_path', 'unknown config')} | DCDC mode: {role}"
+    )
+    if identity.get("config_hash"):
+        title += f" | Config hash: {identity['config_hash']}"
+    return title
+
+
+def _normalized_identity_setup(identity: dict[str, Any]) -> str:
+    """Render board and test setup identity retained in the normalized record."""
+
+    setup_fields = (
+        ("Board", identity.get("board")),
+        ("Device", identity.get("device")),
+        (
+            "Supply voltage",
+            None
+            if identity.get("supply_voltage_v") is None
+            else f"{identity['supply_voltage_v']} V",
+        ),
+        ("Partition", identity.get("partition")),
+        ("Run mode", identity.get("mode")),
+    )
+    details = [f"{label}: {value}" for label, value in setup_fields if value not in (None, "")]
+    return "Setup: " + (" | ".join(details) if details else "N/A")
+
+
+def _normalized_metric_observation(
+    variant: dict[str, Any],
+    variable: str,
+    comparison: dict[str, Any],
+    comparison_field: str,
+    label: str,
+) -> tuple[str, str | None]:
+    """Return one side's display value and its availability reason."""
+
+    observations = variant.get("metrics")
+    if isinstance(observations, dict) and variable in observations:
+        observation = observations[variable]
+        if isinstance(observation, dict):
+            value = observation.get("value")
+            if (
+                observation.get("available") is True
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            ):
+                return _format_number(value), None
+            reason = observation.get("availability_reason") or "metric_value_unavailable"
+            return "N/A", f"{label}: {reason}"
+        return "N/A", f"{label}: invalid_metric_observation"
+
+    # Older normalized schemas kept side values only on comparable metrics.
+    value = comparison.get(comparison_field)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _format_number(value), None
+    return "N/A", None
+
+
+def _normalized_sdk_column_label(
+    record: dict[str, Any], variant_name: str, fallback: str
+) -> str:
+    variant = record.get(variant_name)
+    if not isinstance(variant, dict):
+        return fallback
+    provenance = variant.get("provenance")
+    if not isinstance(provenance, dict):
+        return fallback
+    sisdk = (
+        provenance.get("dut_sdk_version")
+        or provenance.get("sisdk_version")
+        or provenance.get("sdk_version")
+    )
+    if not sisdk and isinstance(provenance.get("sisdk"), dict):
+        sisdk = provenance["sisdk"].get("version")
+    return f"SiSDK {sisdk}" if isinstance(sisdk, str) and sisdk else fallback
+
+
+def _normalized_variant_run_line(record: dict[str, Any], variant_name: str) -> str:
+    """Show each version's SDK provenance, execution status, Bench, and time."""
+
+    variant = record.get(variant_name)
+    if not isinstance(variant, dict):
+        variant = {}
+    provenance = variant.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+
+    details = [_normalized_sdk_column_label(record, variant_name, "SiSDK N/A")]
+    sdk_build = (
+        provenance.get("dut_sdk_artifactory_build")
+        or provenance.get("sisdk_artifactory_build")
+        or provenance.get("build_number")
+    )
+    if sdk_build:
+        details.append(f"Build {sdk_build}")
+    details.append(f"status {variant.get('execution_status') or 'unknown'}")
+    if variant.get("cms_bench_id"):
+        details.append(f"CMS Bench {variant['cms_bench_id']}")
+    if variant.get("measured_at"):
+        details.append(f"measured {variant['measured_at']}")
+    label = "V1" if variant_name == "version1" else "V2"
+    return f"{label} run: " + " | ".join(details)
 
 
 def _table_title(identity: dict[str, Any]) -> str:
