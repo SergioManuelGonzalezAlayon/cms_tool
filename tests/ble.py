@@ -486,7 +486,7 @@ def DUTScanSync(DUT, Config):
             ).strip().upper()
             reporting_mode = getattr(
                 DUT.bt.sync,
-                f"REPORTING_MODE_{configured_mode}",
+                f"REPORTING_MODE_REPORT_{configured_mode}",
             )
 
         rsp = DUT.bt.sync_scanner.set_sync_parameters(skip, timeout, reporting_mode)
