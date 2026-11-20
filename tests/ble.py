@@ -16,6 +16,7 @@ MAX_TEST_RETRY_WAIT = 1.0
 DUT_OPEN_RETRIES = 5
 DUT_OPEN_RETRY_SLEEP_S = 1.0
 DEVICE_OPEN_RETRIES = 5
+BLE_EVENT_NUM = 11
 log = logging.getLogger(__name__)
 
 
@@ -1025,7 +1026,6 @@ def test_legacy_beacon(JoulescopeDev,
                 raise
             sleep(MAX_TEST_RETRY_WAIT)
 
-    BLE_EVENT_NUM = 10
     capture_s = float(advertising_ms_from_units(BLE_EVENT_NUM * DUTLegAdvConfig.max_interval) / 1000)
     log.info(
         "Processing Joulescope profile: %.3f s (%d non-connectable legacy advertising events)",
@@ -1066,7 +1066,6 @@ def test_beacon(JoulescopeDev,
             if attempt == MAX_TEST_RETRIES - 1:
                 raise
             sleep(MAX_TEST_RETRY_WAIT)
-    BLE_EVENT_NUM = 10
     capture_s = float(advertising_ms_from_units(BLE_EVENT_NUM * DUTAdvConfig.max_interval) / 1000)
     log.info(
         "Running Validation streaming session: %.3f s (%d non-connectable extended advertising events)",
@@ -1108,7 +1107,6 @@ def test_legacy_conn_adv(JoulescopeDev,
                 raise
             sleep(MAX_TEST_RETRY_WAIT)
 
-    BLE_EVENT_NUM = 10
     capture_s = float(advertising_ms_from_units(BLE_EVENT_NUM * DUTLegAdvConfig.max_interval) / 1000)
     JoulescopeDev.startPowerProfilingSession(capture_s)
 
@@ -1145,7 +1143,6 @@ def test_conn_adv(JoulescopeDev,
                 raise
             sleep(MAX_TEST_RETRY_WAIT)
 
-    BLE_EVENT_NUM = 10
     capture_s = float(advertising_ms_from_units(BLE_EVENT_NUM * DUTAdvConfig.max_interval) / 1000)
     log.info(
         "Processing Joulescope profile: %.3f s (%d connectable extended advertising events)",
@@ -1169,7 +1166,6 @@ def test_conn_central(JoulescopeDev,
         restart_advertising=TesterAdvStart.restart,
     )
 
-    BLE_EVENT_NUM = 10
     capture_s = float(connection_ms_from_units(BLE_EVENT_NUM * conn_params.max_interval) / 1000)
     log.info(f"Processing connection profile for {capture_s}s")
     JoulescopeDev.startPowerProfilingSession(capture_s)
@@ -1190,7 +1186,6 @@ def test_conn_peripheral(JoulescopeDev,
         restart_advertising=DUTAdvStart.restart,
     )
 
-    BLE_EVENT_NUM = 10
     capture_s = float(connection_ms_from_units(BLE_EVENT_NUM * conn_params.max_interval) / 1000)
     log.info(f"Processing connection profile for {capture_s}s")
     JoulescopeDev.startPowerProfilingSession(capture_s)
@@ -1256,7 +1251,6 @@ def test_scanner(JoulescopeDev,
     )
     log.info("Scanner test expected advertisement received")
 
-    BLE_EVENT_NUM = 10
     capture_s = float(advertising_ms_from_units(BLE_EVENT_NUM * scan_config.interval) / 1000)
     JoulescopeDev.startPowerProfilingSession(capture_s)
 
@@ -1335,7 +1329,6 @@ def test_PAwR_per(JoulescopeDev,
         PAWRConfig, Config.get("pawr", {})
     )
 
-    BLE_EVENT_NUM = 10
     capture_s = BLE_EVENT_NUM * pawr_cfg.interval / 1000.0
 
     JoulescopeDev.startPowerProfilingSession(capture_s)
@@ -1415,7 +1408,6 @@ def test_PAwR_obs(JoulescopeDev,
         PAWRConfig, Config.get("pawr", {})
     )
 
-    BLE_EVENT_NUM = 10
     capture_s = BLE_EVENT_NUM * pawr_cfg.interval / 1000.0
 
     JoulescopeDev.startPowerProfilingSession(capture_s)
