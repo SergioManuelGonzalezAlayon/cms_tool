@@ -212,6 +212,19 @@ def HWInit(request: pytest.FixtureRequest) -> None:
         text=True,
     )
 
+    # After each AEM voltage configuration, the device must be calibrated once
+    # more
+    log.info(
+        "Calibrating AEM on Tester: serial=%s voltage=%s V",
+        tester_sn,
+        supply_v,
+    )
+    subprocess.run(
+        [exe, "aem", "calibrate", "-s", str(tester_sn), str(supply_v)],
+        check=True,
+        text=True,
+    )
+
 
 @pytest.fixture(autouse=True)
 def ResultGeneratorFixture(request: pytest.FixtureRequest) -> ResultGenerator:
