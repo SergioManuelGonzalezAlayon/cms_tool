@@ -365,3 +365,147 @@ def test_renders_requested_markdown_table_from_report_only(tmp_path: Path) -> No
                 ],
             }
         )
+
+
+def _normalized_report_record(
+    feature: str,
+    status: str | None,
+    *,
+    reason: str | None = None,
+    firmware_role: str = "dcdc",
+    version2_missing: bool = False,
+) -> dict:
+    version1_value = 1.0
+    version2_value = None if version2_missing else (1.02 if status == "FAIL" else 1.01)
+
+    def variant(name: str, value: float | None, *, missing: bool = False) -> dict:
+        version = "2026.6.1" if name == "version1" else "2026.6.2"
+        build = "101" if name == "version1" else "202"
+        avg_available = value is not None
+        return {
+            "execution_status": "missing_result" if missing else "analyzed",
+            "measured_at": f"2026-11-20T10:0{'1' if name == 'version1' else '2'}:00Z",
+            "cms_bench_id": f"BENCH-{build}",
+            "provenance": {
+                "dut_sdk_version": version,
+                "dut_sdk_artifactory_build": build,
+            },
+            "metrics": {
+                "avg_current_ma": {
+                    "value": value,
+                    "available": avg_available,
+                    "availability_reason": None if avg_available else "missing_result",
+                },
+                "peak_current_ma": {
+                    "value": None,
+                    "available": False,
+                    "availability_reason": "not_measured" if not missing else "missing_result",
+                },
+            },
+        }
+
+    version1 = variant("version1", version1_value)
+    version2 = variant("version2", version2_value, missing=version2_missing)
+    comparisons = []
+    if version2_value is not None:
+        delta = version2_value - version1_value
+        percent = delta / version1_value * 100
+        comparisons.append(
+            {
+                "variable": "avg_current_ma",
+                "version1": version1_value,
+                "version2": version2_value,
+                "delta": delta,
+                "percent": percent,
+                "status": "FAIL" if percent >= 2 else "PASS",
+            }
+        )
+
+    return {
+        "identity": {
+            "feature": feature,
+            "config_path": f"tests/configs/ble/{feature}/default.json",
+            "config_hash": f"sha-{feature}",
+            "partition": firmware_role,
+            "mode": "default",
+            "board": "BRD4182A",
+            "device": "EFR32MG22",
+            "firmware_role": firmware_role,
+            "supply_voltage_v": 3.3,
+        },
+        "version1": version1,
+        "version2": version2,
+        "metrics": comparisons,
+        "differential_status": status,
+        "reason": reason,
+    }
+
+
+def test_renders_normalized_record_metadata_metrics_and_reasons() -> None:
+    report = {
+        "records": [
+            _normalized_report_record(
+                "beacon",
+                "FAIL",
+                reason="avg_current_ma regression (+2.00%)",
+            ),
+            _normalized_report_record(
+                "connection",
+                "INCOMPLETE",
+                reason="no version2 result has the same stable identity",
+                firmware_role="no_dcdc",
+                version2_missing=True,
+            ),
+        ]
+    }
+
+    output = render_diff_comparison_table(report)
+
+    assert "DCDC mode: DCDC" in output
+    assert "DCDC mode: NO_DCDC" in output
+    assert "Config hash: sha-beacon" in output
+    assert "Board: BRD4182A" in output
+    assert "SiSDK 2026.6.1" in output
+    assert "Build 101" in output
+    assert "CMS Bench BENCH-101" in output
+    assert "status analyzed" in output
+    assert "Differential result: FAIL" in output
+    assert "avg_current_ma regression (+2.00%)" in output
+    assert "+0.02" in output
+    assert "+2.00%" in output
+    assert "Differential result: INCOMPLETE" in output
+    assert "no version2 result has the same stable identity" in output
+    assert "V2: missing_result" in output
+
+
+def test_renders_final_summary_from_normalized_test_statuses() -> None:
+    report = {
+        "records": [
+            _normalized_report_record("pass_case", "PASS"),
+            _normalized_report_record(
+                "fail_case", "FAIL", reason="metric regression"
+            ),
+            _normalized_report_record(
+                "incomplete_case",
+                "INCOMPLETE",
+                reason="missing version2 result",
+                version2_missing=True,
+            ),
+            _normalized_report_record(
+                "unknown_case", None, reason="classification not recorded"
+            ),
+        ]
+    }
+
+    output = render_diff_comparison_table(report)
+
+    assert output.endswith(
+        "Differential summary: Passed 1 | Failed 1 | Incomplete 2"
+    )
+    assert "Differential result: INCOMPLETE" in output
+
+    empty_output = render_diff_comparison_table({"records": []})
+    assert empty_output == (
+        "No comparable metrics.\n\n"
+        "Differential summary: Passed 0 | Failed 0 | Incomplete 0"
+    )
