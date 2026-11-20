@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +37,11 @@ RESULTS_DIR = REPO_ROOT / "artifacts" / "orchestrator"
 DEFAULT_RESULTS_LOG = RESULTS_DIR / "results.jsonl"
 TEST_RETRY_COUNT = 3
 CANCELLATION_EXIT_CODE = 130
+DUT_MODE_PROJECTS = {
+    "dcdc": "ncp_ble_dut_dcdc",
+    "no_dcdc": "ncp_ble_dut",
+}
+DUT_MODE_BY_PROJECT = {project: mode for mode, project in DUT_MODE_PROJECTS.items()}
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,7 @@ class Job:
     tester_slcp: str
     board: str
     supply_v: float | int | str
+    firmware_role: str = ""
     dut_image: str = ""
     tester_image: str = ""
     dut_image_sha256: str = ""
@@ -67,7 +73,8 @@ class Job:
 
     @property
     def job_id(self) -> str:
-        return f"{self.nodeid}|{self.cfg_arg}"
+        identity = f"{self.nodeid}|{self.cfg_arg}"
+        return f"{identity}|{self.firmware_role}" if self.firmware_role else identity
 
 
 def load_json(path: Path) -> dict:
@@ -226,6 +233,15 @@ def build_jobs(
             hw = config.get("hw", {})
             dut_slcp = str(cms_firmware.get("dut_slcp") or firmware.get("dut_slcp", ""))
             tester_slcp = str(cms_firmware.get("tester_slcp") or firmware.get("tester_slcp", ""))
+            firmware_role = dut_firmware_role(dut_slcp)
+            dut_variants = cms_firmware.get("dut_variants", {})
+            variant_metadata = (
+                dut_variants.get(firmware_role, {})
+                if firmware_role and isinstance(dut_variants, dict)
+                else {}
+            )
+            if not isinstance(variant_metadata, dict):
+                variant_metadata = {}
             config_hash = sha256_file(config_path)
             if (
                 requested_config_hash
@@ -249,9 +265,15 @@ def build_jobs(
                     tester_slcp=tester_slcp,
                     board=str(cms_firmware.get("board") or firmware.get("board", "")),
                     supply_v=hw.get("supply_v", ""),
-                    dut_image=str(cms_firmware.get("dut_image", "")),
+                    firmware_role=firmware_role,
+                    dut_image=str(
+                        variant_metadata.get("image") or cms_firmware.get("dut_image", "")
+                    ),
                     tester_image=str(cms_firmware.get("tester_image", "")),
-                    dut_image_sha256=str(cms_firmware.get("dut_image_sha256", "")),
+                    dut_image_sha256=str(
+                        variant_metadata.get("sha256")
+                        or cms_firmware.get("dut_image_sha256", "")
+                    ),
                     tester_image_sha256=str(cms_firmware.get("tester_image_sha256", "")),
                     cms_fw_metadata=cms_metadata_path,
                     config_hash=config_hash,
@@ -264,6 +286,62 @@ def build_jobs(
                 )
             )
     return sorted(jobs, key=job_sort_key)
+
+
+def dut_firmware_role(dut_slcp: str) -> str:
+    """Return the supported differential role for a DUT application path."""
+
+    filename = str(dut_slcp).replace("\\", "/").rsplit("/", 1)[-1]
+    project = filename.rsplit(".", 1)[0].lower()
+    return DUT_MODE_BY_PROJECT.get(project, "")
+
+
+def expand_default_dut_variants(jobs: list[Job]) -> list[Job]:
+    """Add one default BLE job for each supported DUT application mode."""
+
+    expanded: list[Job] = []
+    for job in jobs:
+        role = job.firmware_role or dut_firmware_role(job.dut_slcp)
+        if job.suite != "ble" or job.mode != "default" or role not in DUT_MODE_PROJECTS:
+            expanded.append(replace(job, firmware_role=role))
+            continue
+
+        dut_slcp = job.dut_slcp.replace("\\", "/")
+        dut_prefix = dut_slcp.rsplit("/", 1)[0] if "/" in dut_slcp else ""
+        cms_variants = {}
+        if job.cms_fw_metadata:
+            cms_variants = cms_firmware_metadata(job.cms_fw_metadata).get("dut_variants", {})
+            if not isinstance(cms_variants, dict):
+                cms_variants = {}
+            missing_modes = [
+                mode
+                for mode in DUT_MODE_PROJECTS
+                if not isinstance(cms_variants.get(mode), dict)
+                or not cms_variants[mode].get("image")
+                or not cms_variants[mode].get("sha256")
+            ]
+            if missing_modes:
+                raise ValueError(
+                    "CMS firmware metadata is missing default DUT variant image/hash data: "
+                    + ", ".join(missing_modes)
+                )
+        for mode, project in DUT_MODE_PROJECTS.items():
+            variant_slcp = f"{dut_prefix}/{project}.slcp" if dut_prefix else f"{project}.slcp"
+            variant_metadata = cms_variants.get(mode, {})
+            if not isinstance(variant_metadata, dict):
+                variant_metadata = {}
+            expanded.append(
+                replace(
+                    job,
+                    dut_slcp=variant_slcp,
+                    firmware_role=mode,
+                    dut_image=str(variant_metadata.get("image") or job.dut_image),
+                    dut_image_sha256=str(
+                        variant_metadata.get("sha256") or job.dut_image_sha256
+                    ),
+                )
+            )
+    return sorted(expanded, key=job_sort_key)
 
 
 def validate_variable_filters_for_targets(
@@ -313,6 +391,7 @@ def voltage_sort_value(value):
 def job_sort_key(job: Job):
     return (
         job.suite,
+        job.firmware_role,
         job.feature,
         job.dut_slcp,
         job.tester_slcp,
@@ -387,6 +466,8 @@ def result_artifact_paths(job: Job) -> dict[str, Path]:
     else:
         output_dir = artifact_root / job.suite / job.feature / "one_factor"
     artifact_stem = f"{_artifact_component(job.feature)}_{_artifact_component(Path(job.cfg_arg).stem)}"
+    if job.firmware_role:
+        artifact_stem += f"_{_artifact_component(job.firmware_role)}"
     return {
         "result_json": output_dir / f"{artifact_stem}_result.json",
         "upload_status": output_dir / f"{artifact_stem}_upload_status.json",
@@ -572,6 +653,11 @@ def load_job_plan(plan_path: Path) -> list[Job]:
                 VariableFilter(name=str(item["name"]), value=str(item["value"]))
                 for item in record.get("variable_filters", [])
             )
+            dut_slcp = str(record["dut_slcp"])
+            firmware_role = str(record.get("firmware_role", ""))
+            declared_role = dut_firmware_role(dut_slcp)
+            if firmware_role and declared_role and firmware_role != declared_role:
+                raise ValueError("job firmware_role does not match dut_slcp")
             job = Job(
                 suite=str(record["suite"]),
                 feature=str(record["feature"]),
@@ -580,10 +666,11 @@ def load_job_plan(plan_path: Path) -> list[Job]:
                 cfg_arg=str(record["cfg_arg"]),
                 mode=str(record["mode"]),
                 partition=str(record["partition"]),
-                dut_slcp=str(record["dut_slcp"]),
+                dut_slcp=dut_slcp,
                 tester_slcp=str(record["tester_slcp"]),
                 board=str(record["board"]),
                 supply_v=record["supply_v"],
+                firmware_role=firmware_role,
                 config_hash=str(record["config_hash"]),
                 requested_config_hash=str(record.get("requested_config_hash", "")),
                 variant=str(record.get("variant", "")),
@@ -684,10 +771,11 @@ def print_plan(jobs: list[Job], *, colors: ColorFormatter | None = None) -> None
     print(f"{colors.color('Planned jobs', 'heading')}: {len(jobs)}")
     last_group = None
     for index, job in enumerate(jobs, start=1):
-        group = (job.feature, job.dut_slcp, job.partition, job.supply_v)
+        group = (job.feature, job.dut_slcp, job.firmware_role, job.partition, job.supply_v)
         if group != last_group:
             print(
                 f"\n{colors.color(f'[{job.feature}]', 'heading')} dut={job.dut_slcp or '-'} "
+                f"role={job.firmware_role or '-'} "
                 f"tester={job.tester_slcp or '-'} board={job.board or '-'} "
                 f"partition={job.partition or '-'} v={job.supply_v}"
             )
@@ -738,6 +826,8 @@ def run_job(
         "log_cli=true",
         "--log-cli-level=INFO",
     ]
+    if job.firmware_role:
+        cmd.extend(["--cms-dut-role", job.firmware_role])
     if include_junit_logs:
         cmd.extend(["-o", "junit_logging=all"])
     cmd.extend(pytest_args)
@@ -959,6 +1049,11 @@ def main(argv: list[str] | None = None) -> int:
             cms_metadata_path=parsed.cms_fw_metadata,
             variable_filters=variable_filters,
         )
+        try:
+            jobs = expand_default_dut_variants(jobs)
+        except ValueError as exc:
+            print(colors.color(str(exc), "failed"))
+            return 2
     if not jobs:
         if variable_filters:
             filters_text = ", ".join(f"{item.name}={item.value}" for item in variable_filters)

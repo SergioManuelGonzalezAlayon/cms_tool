@@ -214,6 +214,14 @@ def _result_phy(test_name: str, advertiser: dict, scanner: dict, connection: dic
     return advertiser.get("phy") or connection.get("phy") or scanner.get("phy")
 
 
+def _dut_firmware_role(firmware: dict) -> str | None:
+    slcp_name = str(firmware.get("dut_slcp", "")).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return {
+        "ncp_ble_dut_dcdc.slcp": "dcdc",
+        "ncp_ble_dut.slcp": "no_dcdc",
+    }.get(slcp_name)
+
+
 def _upload_application_variant(firmware: dict) -> str:
     application_variants = {
         "ncp_ble_dut_dcdc.slcp": "dcdc",
@@ -655,6 +663,7 @@ def write_result_json(
         },
         "firmware": {
             "dut_slcp": firmware.get("dut_slcp"),
+            "firmware_role": _dut_firmware_role(firmware),
             "tester_slcp": firmware.get("tester_slcp"),
             "board": firmware.get("board"),
             "board_revision": storage["board_revision"],

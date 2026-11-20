@@ -3747,8 +3747,6 @@ def _create_and_render_diff_comparison(
         _print_cli_error(f"differential comparison data is invalid: {exc}")
         return CMSCLIExitCode.COMPARISON_DATA_FAILURE
 
-    if report["diagnostics"]:
-        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
     statuses = {
         metric.get("status")
         for pair in report["pairs"]
@@ -3756,6 +3754,8 @@ def _create_and_render_diff_comparison(
     }
     if ComparisonStatus.FAIL.value in statuses:
         return CMSCLIExitCode.THRESHOLD_REGRESSION
+    if report["diagnostics"]:
+        return CMSCLIExitCode.COMPARISON_DATA_FAILURE
     return CMSCLIExitCode.SUCCESS
 
 

@@ -823,7 +823,13 @@ class CMSBench:
 
         if request.differential_firmware is None:
             raise RuntimeError("differential plan requires differential firmware")
-        from test_orchestrator import CONFIG_ROOT, build_job_plan, build_jobs
+        from test_orchestrator import (
+            CONFIG_ROOT,
+            build_job_plan,
+            build_jobs,
+            dut_firmware_role,
+            expand_default_dut_variants,
+        )
 
         feature = request.selector.feature.strip()
         if not feature:
@@ -860,6 +866,7 @@ class CMSBench:
             )
             snapshot_hash = _sha256_file(snapshot_path)
             firmware_data = custom_data.get("firmware", {})
+            custom_dut_slcp = str(firmware_data.get("dut_slcp") or jobs[0].dut_slcp)
             jobs = [
                 replace(
                     job,
@@ -867,23 +874,29 @@ class CMSBench:
                     cfg_arg=str(snapshot_path),
                     config_hash=snapshot_hash,
                     mode="one_factor",
-                    dut_slcp=str(firmware_data.get("dut_slcp") or job.dut_slcp),
+                    dut_slcp=custom_dut_slcp,
                     tester_slcp=str(firmware_data.get("tester_slcp") or job.tester_slcp),
                     board=str(firmware_data.get("board") or job.board),
                     supply_v=custom_data.get("hw", {}).get("supply_v", ""),
+                    firmware_role=dut_firmware_role(custom_dut_slcp),
                 )
-                for job in jobs
+                for job in jobs[:1]
             ]
             custom_snapshot = {
                 "path": str(snapshot_path),
                 "sha256": snapshot_hash,
             }
+        elif config == "default":
+            jobs = expand_default_dut_variants(jobs)
         plan = build_job_plan(jobs)
         for job_record in plan["jobs"]:
             dut_project = Path(str(job_record["dut_slcp"])).stem
-            job_record["firmware_role"] = (
-                "dcdc" if dut_project == "ncp_ble_dut_dcdc" else "no_dcdc"
-            )
+            firmware_role = dut_firmware_role(str(job_record["dut_slcp"]))
+            if not firmware_role:
+                raise RuntimeError(
+                    f"differential job selects unsupported DUT application: {dut_project}"
+                )
+            job_record["firmware_role"] = firmware_role
         plan["scope"] = (
             "all_default_features"
             if feature == "all"
@@ -1644,7 +1657,12 @@ def _write_custom_config_job_plan(
     metadata_path: Path,
     results_log: Path,
 ) -> Path:
-    from test_orchestrator import CONFIG_ROOT, build_job_plan, build_jobs
+    from test_orchestrator import (
+        CONFIG_ROOT,
+        build_job_plan,
+        build_jobs,
+        dut_firmware_role,
+    )
 
     feature = session.request.selector.feature
     jobs = build_jobs(
@@ -1658,12 +1676,16 @@ def _write_custom_config_job_plan(
     if len(jobs) != 1:
         raise RuntimeError(f"CUSTOM config selected {len(jobs)} jobs; expected exactly one")
     config_data = session.request.selector.custom_config_data or {}
+    firmware_data = config_data.get("firmware", {})
+    dut_slcp = str(firmware_data.get("dut_slcp") or jobs[0].dut_slcp)
     snapshot_path = session.runtime_dir / "custom_config_snapshot.json"
     job = replace(
         jobs[0],
         config_path=snapshot_path,
         cfg_arg=str(snapshot_path.resolve()),
         mode="one_factor",
+        dut_slcp=dut_slcp,
+        firmware_role=dut_firmware_role(dut_slcp),
         supply_v=config_data.get("hw", {}).get("supply_v", ""),
         config_hash=_sha256_text_file_lf_normalized(snapshot_path),
     )
