@@ -18,10 +18,8 @@ from typing import Any
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.filters import AutoFilter
-from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 class DifferentialPairingError(ValueError):
@@ -415,11 +413,11 @@ def write_diff_comparison_report(report: dict[str, Any], output_path: Path) -> P
 
 
 def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
-    """Write a filterable, terminal-style metric table to a single-sheet workbook.
+    """Write a grouped metric report to a single-sheet workbook.
 
-    Each normalized test identity contributes one row per terminal metric. The
-    comparison columns stay together at the left; execution evidence is retained
-    in trailing columns for users who need to audit a result.
+    Each normalized test identity contributes one row per terminal metric. Test
+    and firmware-role labels are merged across their metric rows; execution
+    evidence is retained in trailing, hidden columns for audit purposes.
     """
 
     records = report.get("records")
@@ -436,8 +434,14 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         "firmware_role",
         "supply_voltage_v",
     )
+    test_group_fields = tuple(
+        field for field in identity_fields if field != "firmware_role"
+    )
     identity_keys: set[tuple[Any, ...]] = set()
     row_keys: set[tuple[tuple[Any, ...], str]] = set()
+    mode_ranges: list[tuple[int, int]] = []
+    expected_merged_ranges: list[str] = []
+    test_group_rows: dict[tuple[Any, ...], tuple[int, int]] = {}
     headers = (
         "Test",
         "DCDC Mode",
@@ -465,6 +469,7 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     worksheet.row_dimensions[1].height = 30
 
+    valid_records: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     for record in records:
         if not isinstance(record, dict) or not isinstance(record.get("identity"), dict):
             raise ValueError("diff comparison report contains an invalid normalized record")
@@ -473,6 +478,19 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         if identity_key in identity_keys:
             raise ValueError("diff comparison report contains a duplicate test identity")
         identity_keys.add(identity_key)
+        test_group_key = tuple(identity.get(field) for field in test_group_fields)
+        valid_records.append((test_group_key, record))
+
+    valid_records.sort(
+        key=lambda item: (
+            tuple(str(value or "") for value in item[0]),
+            str(item[1]["identity"].get("firmware_role") or "").upper(),
+        )
+    )
+
+    for test_group_key, record in valid_records:
+        identity = record["identity"]
+        identity_key = tuple(identity.get(field) for field in identity_fields)
         variants = {
             name: record.get(name) if isinstance(record.get(name), dict) else {}
             for name in ("version1", "version2")
@@ -523,6 +541,7 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
             for metric in record.get("metrics", [])
             if isinstance(metric, dict)
         }
+        record_start_row = worksheet.max_row + 1
         for variable in _TABLE_METRIC_ORDER:
             row_key = (identity_key, variable)
             if row_key in row_keys:
@@ -581,9 +600,52 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
                 "; ".join(dict.fromkeys(reasons)),
             ]
             worksheet.append(row)
+            row_fill = PatternFill(
+                fill_type="solid",
+                fgColor="EAF1F8" if (worksheet.max_row % 2) == 0 else "FFFFFF",
+            )
             for cell in worksheet[worksheet.max_row]:
                 if isinstance(cell.value, str):
                     cell.data_type = "s"
+                cell.fill = row_fill
+                cell.border = Border(bottom=Side(style="thin", color="B4C7E7"))
+
+        record_end_row = worksheet.max_row
+        mode_ranges.append((record_start_row, record_end_row))
+        previous_range = test_group_rows.get(test_group_key)
+        if previous_range is None:
+            test_group_rows[test_group_key] = (record_start_row, record_end_row)
+        else:
+            test_group_rows[test_group_key] = (previous_range[0], record_end_row)
+
+    group_fill = PatternFill(fill_type="solid", fgColor="D9E5F2")
+    for start_row, end_row in mode_ranges:
+        for row_number in range(start_row, end_row + 1):
+            worksheet.cell(row=row_number, column=2).fill = group_fill
+        worksheet.cell(row=start_row, column=2).alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+        worksheet.merge_cells(
+            start_row=start_row,
+            start_column=2,
+            end_row=end_row,
+            end_column=2,
+        )
+        expected_merged_ranges.append(f"B{start_row}:B{end_row}")
+
+    for start_row, end_row in test_group_rows.values():
+        for row_number in range(start_row, end_row + 1):
+            worksheet.cell(row=row_number, column=1).fill = group_fill
+        worksheet.cell(row=start_row, column=1).alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+        worksheet.merge_cells(
+            start_row=start_row,
+            start_column=1,
+            end_row=end_row,
+            end_column=1,
+        )
+        expected_merged_ranges.append(f"A{start_row}:A{end_row}")
 
     worksheet.freeze_panes = "D2"
     column_widths = {
@@ -608,23 +670,20 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         worksheet.row_dimensions[row[0].row].height = 22
         for cell in row:
             cell.alignment = Alignment(vertical="center")
+    for start_row, end_row in mode_ranges:
+        worksheet.cell(row=start_row, column=2).alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
+    for start_row, end_row in test_group_rows.values():
+        worksheet.cell(row=start_row, column=1).alignment = Alignment(
+            horizontal="center", vertical="center", wrap_text=True
+        )
     for row in range(2, worksheet.max_row + 1):
         for column in (4, 5):
             worksheet.cell(row=row, column=column).number_format = "0.######;-0.######;0"
         worksheet.cell(row=row, column=6).number_format = "+0.######;-0.######;0"
         worksheet.cell(row=row, column=7).number_format = '+0.00"%";-0.00"%";0.00"%"'
 
-    table_ref = worksheet.dimensions
-    table = Table(displayName="DifferentialResults", ref=table_ref)
-    table.autoFilter = AutoFilter(ref=table_ref)
-    table.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium2",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
-    worksheet.add_table(table)
     status_columns = (headers.index("Result") + 1, headers.index("Test Result") + 1)
     if worksheet.max_row > 1:
         for column in status_columns:
@@ -639,6 +698,7 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         headers,
         len(row_keys),
         status_columns if worksheet.max_row > 1 else (),
+        tuple(sorted(expected_merged_ranges)),
     )
     return output_path
 
@@ -651,19 +711,20 @@ def _apply_status_conditional_formatting(worksheet: Any, column: int) -> None:
     column_letter = get_column_letter(column)
     cell_range = f"{column_letter}2:{column_letter}{worksheet.max_row}"
     status_colors = {
-        "PASS": "D9EAD3",
-        "WARNING": "FFF2CC",
-        "FAIL": "F4CCCC",
-        "INCOMPLETE": "FCE5CD",
-        "UNAVAILABLE": "E7E6E6",
+        "PASS": ("D9EAD3", "008000"),
+        "WARNING": ("FFF2CC", "C65911"),
+        "FAIL": ("F4CCCC", "FF0000"),
+        "INCOMPLETE": ("FCE5CD", "C65911"),
+        "UNAVAILABLE": ("FCE4D6", "C65911"),
     }
-    for status, color in status_colors.items():
+    for status, (fill_color, font_color) in status_colors.items():
         worksheet.conditional_formatting.add(
             cell_range,
             FormulaRule(
                 formula=[f'{column_letter}2="{status}"'],
                 stopIfTrue=True,
-                fill=PatternFill(fill_type="solid", fgColor=color),
+                fill=PatternFill(fill_type="solid", fgColor=fill_color),
+                font=Font(color=font_color),
             ),
         )
 
@@ -673,8 +734,9 @@ def _validate_diff_excel_workbook(
     expected_headers: tuple[str, ...],
     expected_row_count: int,
     expected_status_columns: tuple[int, ...],
+    expected_merged_ranges: tuple[str, ...],
 ) -> None:
-    """Check the saved workbook's table shape, row count, filters, and highlights."""
+    """Check the saved workbook's grouped layout, row count, and highlights."""
 
     workbook = load_workbook(output_path, data_only=True)
     try:
@@ -691,21 +753,18 @@ def _validate_diff_excel_workbook(
         )
         if actual_headers != expected_headers:
             raise ValueError("saved diff comparison workbook headers do not match the report")
-        if "DifferentialResults" not in worksheet.tables:
-            raise ValueError("saved diff comparison workbook is missing its results table")
-        table = worksheet.tables["DifferentialResults"]
-        if table.ref != worksheet.dimensions:
-            raise ValueError("saved diff comparison table does not cover the full report range")
-        if table.autoFilter is None or table.autoFilter.ref != worksheet.dimensions:
-            raise ValueError("saved diff comparison table is missing its full-range filter")
+        if worksheet.tables:
+            raise ValueError("saved diff comparison workbook must use a grouped worksheet range")
         if worksheet.freeze_panes != "D2":
             raise ValueError("saved diff comparison workbook is missing frozen headers and identifiers")
-        saved_row_keys: set[tuple[Any, ...]] = set()
-        for row in worksheet.iter_rows(min_row=2, max_col=10, values_only=True):
-            row_key = (row[0], row[1], row[2], row[9])
-            if row_key in saved_row_keys:
-                raise ValueError("saved diff comparison workbook contains a duplicate test metric")
-            saved_row_keys.add(row_key)
+        actual_merged_ranges = tuple(sorted(str(rng) for rng in worksheet.merged_cells.ranges))
+        if actual_merged_ranges != expected_merged_ranges:
+            raise ValueError("saved diff comparison workbook has unexpected test and mode groups")
+        if any(
+            worksheet.cell(row=row, column=3).value is None
+            for row in range(2, worksheet.max_row + 1)
+        ):
+            raise ValueError("saved diff comparison workbook contains a row without a metric")
         if len(worksheet.conditional_formatting) != len(expected_status_columns):
             raise ValueError("saved diff comparison workbook is missing result highlighting")
         for column in expected_status_columns:
