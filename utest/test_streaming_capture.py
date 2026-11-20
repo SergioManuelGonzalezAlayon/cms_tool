@@ -392,15 +392,16 @@ def _begin_profile_context(monkeypatch, support, request, js, *, config_data=Non
 
 
 @pytest.mark.parametrize(("test_name", "expected_duration"), [
-    ("test_legacy_beacon", 2.0),
-    ("test_beacon", 2.0),
-    ("test_legacy_conn_adv", 2.0),
-    ("test_conn_adv", 2.0),
-    ("test_conn_central", 1.0),
-    ("test_conn_peripheral", 1.0),
-    ("test_scanner", 1.0),
-    ("test_PAwR_per", 2.239875),
-    ("test_PAwR_obs", 2.239875),
+    # Eleven events provide ten complete intervals for each profile.
+    ("test_legacy_beacon", 2.2),
+    ("test_beacon", 2.2),
+    ("test_legacy_conn_adv", 2.2),
+    ("test_conn_adv", 2.2),
+    ("test_conn_central", 1.1),
+    ("test_conn_peripheral", 1.1),
+    ("test_scanner", 1.1),
+    ("test_PAwR_per", 2.4638625),
+    ("test_PAwR_obs", 2.4638625),
 ])
 def test_ble_callers_only_pass_duration_using_existing_capture_context(
     monkeypatch, tmp_path, ble_support, test_name, expected_duration,
@@ -445,7 +446,9 @@ def test_ble_callers_only_pass_duration_using_existing_capture_context(
     assert js.streaming_profile_config is None
     assert "StreamingProfileConfig" not in signature(test).parameters
     js.capture.assert_not_called()
-    js.startPowerProfilingSession.assert_called_once_with(expected_duration)
+    js.startPowerProfilingSession.assert_called_once()
+    assert js.startPowerProfilingSession.call_args.args[0] == pytest.approx(expected_duration)
+    assert not js.startPowerProfilingSession.call_args.kwargs
     feature = test_name.removeprefix("test_")
     assert isinstance(profile_config, StreamingProfileConfig)
     assert analysis.voltage_override == 3.0

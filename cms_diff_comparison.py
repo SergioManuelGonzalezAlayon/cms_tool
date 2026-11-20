@@ -1294,7 +1294,9 @@ def _metric_omission_reason(payload: dict[str, Any], variable: str) -> str | Non
         summary = _summary_entry(payload, meas_type)
         if summary is None:
             return f"missing_{meas_type.lower()}_summary"
-        return "null_metric" if summary.get(field) is None else None
+        if field not in summary:
+            return "missing_metric"
+        return "null_metric" if summary[field] is None else None
 
     result_metric = payload.get("result_metric")
     if not isinstance(result_metric, dict):
@@ -1463,7 +1465,11 @@ def _load_variant_results(
             continue
         result_key = _result_key(payload, source=str(path))
         firmware = _required_object(payload, "firmware", source=str(path))
-        dut_slcp = _text_or_empty(firmware, "dut_slcp", source=str(path))
+        dut_slcp = (
+            _text_or_empty(firmware, "dut_slcp", source=str(path))
+            if "dut_slcp" in firmware
+            else ""
+        )
         if dut_slcp:
             role = _firmware_role_from_slcp(dut_slcp, source=str(path))
             declared_role = firmware.get("firmware_role")
