@@ -332,6 +332,7 @@ def create_diff_comparison_report(
                     "delta": metric.version2_value - metric.version1_value,
                     "percent": percent,
                     "status": status.value,
+                    "reason": _comparison_reason(percent, status),
                     "thresholds": {
                         "basis": "percent_regression",
                         "warning_percent": thresholds.warning_percent,
@@ -499,7 +500,7 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         config_name = Path(config_path).name if config_path else "N/A"
         test_name = str(identity.get("feature") or "Unknown test")
         if config_name and config_name != "N/A":
-            test_name = f"{test_name} / {config_name}"
+            test_name = f"{test_name}"
         role = str(identity.get("firmware_role") or "UNKNOWN").upper()
         run_details: dict[str, str] = {}
         for variant_name in ("version1", "version2"):
@@ -551,7 +552,11 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
             observations: dict[str, dict[str, Any]] = {}
             reasons: list[str] = []
             record_reason = record.get("reason")
-            if record_reason:
+            comparison = comparisons.get(variable, {})
+            metric_reason = comparison.get("reason")
+            if metric_reason:
+                reasons.append(str(metric_reason))
+            elif record.get("differential_status") == "INCOMPLETE" and record_reason:
                 reasons.append(str(record_reason))
             for variant_name, label in (("version1", "V1"), ("version2", "V2")):
                 variant_metrics = variants[variant_name].get("metrics")
@@ -572,7 +577,6 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
                     )
                     reasons.append(f"{label}: {reason or 'metric_value_unavailable'}")
 
-            comparison = comparisons.get(variable, {})
             metric_status = comparison.get("status") or "UNAVAILABLE"
             row = [
                 test_name,
@@ -892,7 +896,7 @@ def render_diff_comparison_table(report: dict[str, Any]) -> str:
             version1_value, version1_reason = _normalized_metric_observation(
                 variants["version1"], variable, comparison, "version1", "V1"
             )
-            reasons = [
+            reasons = ([str(comparison["reason"])] if comparison.get("reason") else []) + [
                 reason
                 for reason in (version1_reason, version2_reason)
                 if reason
@@ -1176,11 +1180,25 @@ def _comparison_status(
 ) -> ComparisonStatus:
     if percent is None:
         return ComparisonStatus.UNAVAILABLE
+    if abs(percent) >= 10:
+        return ComparisonStatus.FAIL
     if percent >= thresholds.failure_percent:
         return ComparisonStatus.FAIL
     if percent >= thresholds.warning_percent:
         return ComparisonStatus.WARNING
     return ComparisonStatus.PASS
+
+
+def _comparison_reason(percent: float | None, status: ComparisonStatus) -> str | None:
+    if percent is None or status is ComparisonStatus.UNAVAILABLE:
+        return None
+    if abs(percent) >= 10:
+        return "Requires investigation. Power consumption range too large."
+    if status is ComparisonStatus.PASS:
+        return "Performance increased" if percent < 0 else "Within acceptable range"
+    if percent >= 5:
+        return "Power consumption critically increased"
+    return "Power consumption increased"
 
 
 def _identity_to_dict(identity: PairingIdentity) -> dict[str, Any]:
@@ -1306,14 +1324,12 @@ def _classify_differential_record(
         if metric.get("status") == ComparisonStatus.FAIL.value
     ]
     if failing_metrics:
-        reasons = []
-        for metric in failing_metrics:
-            percent = metric.get("percent")
-            rendered_percent = (
-                "unavailable" if percent is None else f"{percent:+.2f}%"
-            )
-            reasons.append(f"{metric['variable']} regression ({rendered_percent})")
-        return "FAIL", "; ".join(reasons)
+        reasons = list(dict.fromkeys(
+            str(metric["reason"])
+            for metric in failing_metrics
+            if metric.get("reason")
+        ))
+        return "FAIL", "; ".join(reasons) or "Power consumption increased"
 
     if diagnostics:
         reason_messages = list(
@@ -1322,7 +1338,12 @@ def _classify_differential_record(
         return "INCOMPLETE", "; ".join(reason_messages)
     if not metrics:
         return "INCOMPLETE", "No comparable metrics are available."
-    return "PASS", None
+    reasons = list(dict.fromkeys(
+        str(metric["reason"])
+        for metric in metrics
+        if metric.get("reason")
+    ))
+    return "PASS", "; ".join(reasons) if reasons else None
 
 
 def _extract_or_diagnose(

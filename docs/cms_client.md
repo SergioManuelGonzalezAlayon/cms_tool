@@ -998,8 +998,8 @@ distinguish a completed test failure from communication or protocol failures.
 | 5 | `CONNECTION_FAILURE` | The daemon is unreachable or a request timed out |
 | 6 | `PROTOCOL_MISMATCH` | The daemon protocol/version or response shape is incompatible |
 | 7 | `CLIENT_ERROR` | Another daemon, client, configuration, or operational error occurred, including an interrupted run after daemon restart |
-| 8 | `COMPARISON_DATA_FAILURE` | Differential evidence is missing, invalid, or contains comparison diagnostics |
-| 9 | `THRESHOLD_REGRESSION` | Differential comparison completed and exceeded a configured regression threshold |
+| 8 | `COMPARISON_DATA_FAILURE` | Differential evidence is missing, invalid, or contains unresolved comparison diagnostics, with no threshold regression reported |
+| 9 | `THRESHOLD_REGRESSION` | Differential comparison completed and exceeded a configured regression threshold; this takes precedence over comparison diagnostics |
 
 Errors are written to stderr. In particular, exit code 1 is reserved for a
 real completed test failure; daemon HTTP errors do not masquerade as failed

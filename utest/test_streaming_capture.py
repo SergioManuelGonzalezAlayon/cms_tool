@@ -608,10 +608,20 @@ def test_successful_session_teardown_writes_cms_result_json(
     assert payload["dataset"]["sdk_version"] == "test-sdk"
     assert payload["storage"]["cms_bench_id"] == "software-bench"
     metrics = payload["result_metric"]
-    assert metrics["avg_current_ma"] is None
-    assert metrics["peak_current_ma"] is None
-    assert metrics["metric_status"]["avg_current_ma"] == "unavailable_from_streaming_result"
-    assert metrics["metric_status"]["peak_current_ma"] == "unavailable_from_streaming_result"
+    assert metrics["avg_current_ma"] == pytest.approx(
+        result.event_stats["current"]["mean"]
+    )
+    assert metrics["peak_current_ma"] == pytest.approx(
+        result.event_stats["max_current"]["mean"]
+    )
+    assert (
+        metrics["metric_status"]["avg_current_ma"]
+        == "measured_from_streaming_event_current_mean"
+    )
+    assert (
+        metrics["metric_status"]["peak_current_ma"]
+        == "measured_from_streaming_event_max_current_mean"
+    )
     assert metrics["rx_current_ma"] is not None
     assert metrics["tx_current_ma"] is not None
     event_summary = next(row for row in payload["result_summary"] if row["meas_type"] == "Event")

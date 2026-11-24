@@ -506,6 +506,14 @@ def _select_plot_window(
 
 def _read_streaming_reports(result: ProfileResult) -> tuple[list[dict], list[dict]]:
     summary = []
+    streaming_stats_by_type = {
+        "Event": result.event_stats,
+        "Interval": result.interval_stats,
+        **{
+            f"Subevent_{label}": stats
+            for label, stats in result.subevent_stats.items()
+        },
+    }
     summary_columns = {
         "i_mean_ma": "I_mean_mA", "i_std_ma": "I_std_mA",
         "t_mean_us": "t_mean_us", "t_std_us": "t_std_us",
@@ -513,14 +521,18 @@ def _read_streaming_reports(result: ProfileResult) -> tuple[list[dict], list[dic
     }
     with Path(result.consolidated_csv).open(newline="", encoding="utf-8-sig") as handle:
         for row in csv.DictReader(handle):
-            summary.append({
+            summary_row = {
                 "meas_type": row["meas_type"],
                 "count": int(row["count"]) if row["count"] else None,
                 **{
                     target: float(row[source]) if row[source] else None
                     for target, source in summary_columns.items()
                 },
-            })
+            }
+            streaming_stats = streaming_stats_by_type.get(row["meas_type"])
+            if streaming_stats is not None:
+                summary_row["statistics"] = streaming_stats
+            summary.append(summary_row)
     windows = []
     with Path(result.deep_dive_csv).open(newline="", encoding="utf-8-sig") as handle:
         for row in csv.DictReader(handle):
@@ -597,7 +609,8 @@ def write_result_json(
 
     if streaming_result is not None:
         result_summary, window_rows = _read_streaming_reports(streaming_result)
-        avg_current_ma = peak_current_ma = None
+        avg_current_ma = streaming_result.event_stats["current"]["mean"]
+        peak_current_ma = streaming_result.event_stats["max_current"]["mean"]
         subevent_stats = streaming_result.subevent_stats
     else:
         avg_current_ma = float(sum(profile["current"]["samples"]) / len(profile["current"]["samples"]) * 1e3)
@@ -700,11 +713,11 @@ def write_result_json(
             "cpu_current_ma": None,
             "metric_status": {
                 "avg_current_ma": (
-                    "unavailable_from_streaming_result" if streaming_result is not None
+                    "measured_from_streaming_event_current_mean" if streaming_result is not None
                     else "measured_from_global_capture"
                 ),
                 "peak_current_ma": (
-                    "unavailable_from_streaming_result" if streaming_result is not None
+                    "measured_from_streaming_event_max_current_mean" if streaming_result is not None
                     else "measured_from_capture_peak"
                 ),
                 "rx_current_ma": "derived_from_analyzer_label" if rx_current_ma is not None else "unavailable",
