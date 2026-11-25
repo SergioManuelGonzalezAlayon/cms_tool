@@ -47,6 +47,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="DUT firmware role selected by the CMS job plan.",
     )
     parser.addoption(
+        "--cms-sample-index",
+        type=int,
+        default=0,
+        help="sample number selected by the CMS differential job plan.",
+    )
+    parser.addoption(
         "--upload-results-to-database",
         action="store_true",
         default=False,
@@ -228,9 +234,14 @@ def HWInit(request: pytest.FixtureRequest) -> None:
 
 @pytest.fixture(autouse=True)
 def ResultGeneratorFixture(request: pytest.FixtureRequest) -> ResultGenerator:
-    upload_flag = bool(request.config.getoption("--upload-results-to-database"))
+    if request.config.getoption("--upload-results-to-database"):
+        upload_override = True
+    elif request.config.getoption("--cms-fw-metadata"):
+        upload_override = False
+    else:
+        upload_override = None
     return ResultGenerator(
-        upload_results_to_database=True if upload_flag else None,
+        upload_results_to_database=upload_override,
         retain_captures_for_debug=bool(request.config.getoption("--cms-debug")),
     )
 
@@ -258,6 +269,13 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixt
     dut_role = request.config.getoption("--cms-dut-role")
     if dut_role:
         config_name = f"{config_name}_{dut_role}"
+    sample_index = request.config.getoption("--cms-sample-index")
+    if sample_index is None:
+        sample_index = 0
+    if sample_index < 0:
+        pytest.fail("CMS sample index must be non-negative")
+    if sample_index:
+        config_name = f"{config_name}_sample_{sample_index:03d}"
     config_path = _test_config_path(request)
     config_data = request.getfixturevalue("Config") if "Config" in request.fixturenames else {}
 
@@ -279,6 +297,7 @@ def JoulescopeCaptureContext(request: pytest.FixtureRequest, ResultGeneratorFixt
         config_path=config_path,
         config_data=config_data,
         supply_v=supply_v,
+        sample_index=sample_index,
     )
     metadata_path = request.config.getoption("--cms-fw-metadata")
     output_root = (

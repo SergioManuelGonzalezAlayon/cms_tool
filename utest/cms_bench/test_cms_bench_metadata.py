@@ -464,6 +464,26 @@ def test_bench_runs_default_config_without_exact_config_override(tmp_path, monke
     assert "--cfg" not in captured["command"]
 
 
+def test_default_bench_preserves_database_upload_opt_in(tmp_path, monkeypatch):
+    session = _session(tmp_path)
+    session.request.upload_results_to_database = True
+    captured = {}
+
+    def fake_run_managed_process(command, **kwargs):
+        captured["command"] = command
+        return cms_bench.subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cms_bench, "_run_managed_process", fake_run_managed_process)
+
+    cms_bench._run_test_orchestrator(
+        session,
+        tmp_path / "orchestrator_results.jsonl",
+        tmp_path / "cms_fw_metadata.json",
+    )
+
+    assert "--upload-results-to-database" in captured["command"]
+
+
 def test_bench_runs_all_features_from_the_ble_config_root(tmp_path, monkeypatch):
     session = _session(tmp_path, feature="all")
     captured = {}

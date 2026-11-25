@@ -11,7 +11,7 @@ from cms_protocol import (
     SuiteSelector,
     VariableFilter,
 )
-from cmsd import CMSDaemon
+from cmsd import CMSDaemon, _should_upload_results_to_database
 
 
 class _DormantThread:
@@ -34,6 +34,13 @@ def _staged_request() -> MeasurementRequest:
             tester_img=FirmwareImage(name="tester.s37", url="tester.s37"),
         ),
     )
+
+
+def test_database_upload_policy_excludes_differential_and_debug_modes():
+    assert not _should_upload_results_to_database(MeasurementMode.DIFF)
+    assert not _should_upload_results_to_database(MeasurementMode.DEBUG)
+    assert _should_upload_results_to_database(MeasurementMode.DEFAULT)
+    assert _should_upload_results_to_database(MeasurementMode.FULL_SWEEP)
 
 
 def test_staged_executions_get_unique_daemon_identities(monkeypatch):

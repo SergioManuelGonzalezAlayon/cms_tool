@@ -27,6 +27,7 @@ class ResultContext:
     config_data: dict = field(default_factory=dict)
     supply_v: float | None = None
     campaign_id: str | None = None
+    sample_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -567,6 +568,7 @@ def write_result_json(
     measured_at: str,
     campaign_id: str,
     supply_v: float | None,
+    sample_index: int = 0,
     retain_capture: bool = False,
     streaming_result: ProfileResult | None = None,
 ) -> Path:
@@ -729,6 +731,8 @@ def write_result_json(
         "test_result_window": window_rows,
         "artifact_ref": artifact_refs,
     }
+    if sample_index:
+        record["test_run"]["sample_index"] = sample_index
     result_json_path.write_text(json.dumps(_json_ready(record), indent=2) + "\n", encoding="utf-8")
     return result_json_path
 
@@ -761,12 +765,14 @@ class ResultGenerator:
         config_path: Path,
         config_data: dict,
         supply_v: float | None,
+        sample_index: int = 0,
     ) -> None:
         self.context.test_name = test_name
         self.context.config_name = config_name
         self.context.config_path = config_path
         self.context.config_data = config_data
         self.context.supply_v = supply_v
+        self.context.sample_index = sample_index
 
     def build_streaming_profile_config(
         self, *, output_root: Path = Path("artifacts"),
@@ -830,6 +836,7 @@ class ResultGenerator:
                 measured_at=effective_measured_at,
                 campaign_id=self.context.campaign_id,
                 supply_v=self.context.supply_v,
+                sample_index=self.context.sample_index,
                 retain_capture=self.retain_captures_for_debug,
                 streaming_result=streaming_result,
             )

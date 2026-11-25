@@ -123,7 +123,7 @@ LIVE_RUNTIME_ARTIFACT_NAMES = frozenset(
 
 def _should_upload_results_to_database(mode: MeasurementMode | str) -> bool:
     measurement_mode = mode if isinstance(mode, MeasurementMode) else MeasurementMode(str(mode))
-    return measurement_mode is not MeasurementMode.DEBUG
+    return measurement_mode not in {MeasurementMode.DEBUG, MeasurementMode.DIFF}
 
 
 def _default_runtime_root() -> Path:
@@ -1804,6 +1804,7 @@ class CMSDaemon:
         mode: str,
         feature: str,
         config: str = "default",
+        samples: int = 1,
         config_hash: str = "",
         custom_config_data: dict[str, Any] | None = None,
         custom_config_set_data: list[dict[str, Any]] | None = None,
@@ -1813,6 +1814,24 @@ class CMSDaemon:
         debug_artifact_streaming: bool = False,
     ) -> MeasurementResult:
         """Start a test in the background using the current staged firmware."""
+
+        if type(samples) is not int or samples < 1:
+            return _staged_test_failure("samples must be a positive integer")
+        if mode != MeasurementMode.DIFF.value and samples != 1:
+            return _staged_test_failure("samples are only supported with diff mode")
+        if mode == MeasurementMode.DIFF.value:
+            if config != "default":
+                return _staged_test_failure(
+                    "differential sampling only supports the default config"
+                )
+            if variable_filters:
+                return _staged_test_failure(
+                    "differential sampling does not support variable filters"
+                )
+            if custom_config_data is not None or custom_config_set_data is not None:
+                return _staged_test_failure(
+                    "differential sampling does not support custom configs"
+                )
 
         is_custom_config = config.strip().lower().replace("\\", "/") in {
             "custom",
@@ -1886,6 +1905,7 @@ class CMSDaemon:
         request.selector.custom_config_data = custom_config_data
         request.selector.custom_config_set_data = custom_config_set_data
         request.selector.variable_filters = variable_filters
+        request.samples = samples
         request.upload_results_to_database = _should_upload_results_to_database(request.mode)
         request.debug_artifact_streaming = debug_artifact_streaming
         request.identity = None
@@ -2539,6 +2559,7 @@ class CMSDaemon:
                 mode=str(request.get("mode", "default")),
                 feature=str(request.get("feature", "")),
                 config=str(request.get("config", "default")),
+                samples=request.get("samples", 1),
                 config_hash=str(request.get("config_hash", "")),
                 custom_config_data=request.get("custom_config_data"),
                 custom_config_set_data=request.get("custom_config_set_data"),

@@ -338,6 +338,11 @@ class MeasurementRequest:
     debug_artifact_streaming: bool = False
     identity: MeasurementIdentity | None = None
     differential_firmware: DifferentialFirmwareData | None = None
+    samples: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.samples) is not int or self.samples < 1:
+            raise ValueError("samples must be a positive integer")
 
 
 @dataclass(slots=True)
@@ -949,6 +954,7 @@ def measurement_request_to_dict(request: MeasurementRequest) -> dict[str, Any]:
         "requested_by": request.requested_by,
         "upload_results_to_database": request.upload_results_to_database,
         "debug_artifact_streaming": request.debug_artifact_streaming,
+        "samples": request.samples,
     }
     if request.selector.custom_config_data is not None:
         payload["selector"]["custom_config_data"] = request.selector.custom_config_data
@@ -1004,6 +1010,7 @@ def measurement_request_from_dict(data: dict[str, Any]) -> MeasurementRequest:
             if data.get("differential_firmware") is not None
             else None
         ),
+        samples=data.get("samples", 1),
     )
 
 

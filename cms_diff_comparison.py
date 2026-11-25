@@ -8,12 +8,14 @@ DUT firmware role for every raw measurement result.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 import json
 import math
 from pathlib import Path
+import statistics
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
@@ -68,6 +70,9 @@ class VariantResult:
     path: Path
     identity: PairingIdentity
     payload: dict[str, Any]
+    sample_count: int | None = None
+    sample_statistics: tuple[tuple[str, SampleStatistics], ...] = ()
+    sample_metric_issues: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +107,18 @@ class MeasurementMetrics:
 
 
 @dataclass(frozen=True, slots=True)
+class SampleStatistics:
+    """Descriptive statistics for one metric across repeated measurements."""
+
+    count: int
+    mean: float
+    median: float
+    standard_deviation: float | None
+    minimum: float
+    maximum: float
+
+
+@dataclass(frozen=True, slots=True)
 class ComparisonMetricInput:
     """One metric with valid values available from both firmware variants."""
 
@@ -109,6 +126,8 @@ class ComparisonMetricInput:
     variable: str
     version1_value: float
     version2_value: float
+    version1_statistics: SampleStatistics | None = None
+    version2_statistics: SampleStatistics | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +204,12 @@ _TABLE_METRIC_ORDER = (
     "interval_energy_nj",
 )
 
+_SAMPLED_SUMMARY_METRICS = {
+    "sleep_current_ma": ("Interval", "i_mean_ma"),
+    "event_energy_nj": ("Event", "e_mean_nj"),
+    "interval_energy_nj": ("Interval", "e_mean_nj"),
+}
+
 _METRIC_UNITS = {
     "avg_current_ma": "mA",
     "peak_current_ma": "mA",
@@ -221,6 +246,128 @@ def extract_measurement_metrics(payload: dict[str, Any]) -> MeasurementMetrics:
     )
 
 
+def summarize_sample_values(values: Iterable[int | float]) -> SampleStatistics:
+    """Summarize finite numeric samples using sample standard deviation.
+
+    Standard deviation is ``None`` for a single value because sample
+    dispersion cannot be estimated from one measurement.
+    """
+
+    samples = tuple(values)
+    if not samples:
+        raise ResultMetricParseError("sample metric must contain at least one value")
+
+    numeric_values: list[float] = []
+    for index, value in enumerate(samples, start=1):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ResultMetricParseError(f"sample metric value {index} must be numeric")
+        try:
+            numeric_value = float(value)
+        except (OverflowError, ValueError) as exc:
+            raise ResultMetricParseError(
+                f"sample metric value {index} must be finite"
+            ) from exc
+        if not math.isfinite(numeric_value):
+            raise ResultMetricParseError(f"sample metric value {index} must be finite")
+        numeric_values.append(numeric_value)
+
+    return SampleStatistics(
+        count=len(numeric_values),
+        mean=statistics.fmean(numeric_values),
+        median=statistics.median(numeric_values),
+        standard_deviation=(
+            statistics.stdev(numeric_values) if len(numeric_values) > 1 else None
+        ),
+        minimum=min(numeric_values),
+        maximum=max(numeric_values),
+    )
+
+
+def _sample_statistics_to_dict(summary: SampleStatistics | None) -> dict[str, Any] | None:
+    if summary is None:
+        return None
+    return {
+        "count": summary.count,
+        "mean": summary.mean,
+        "median": summary.median,
+        "standard_deviation": summary.standard_deviation,
+        "minimum": summary.minimum,
+        "maximum": summary.maximum,
+    }
+
+
+def _aggregate_sample_results(
+    results: list[VariantResult], sample_count: int
+) -> list[VariantResult]:
+    """Aggregate the result-summary metrics for each validated sample identity."""
+
+    grouped: dict[PairingIdentity, list[VariantResult]] = {}
+    for result in results:
+        grouped.setdefault(result.identity, []).append(result)
+
+    aggregated: list[VariantResult] = []
+    for identity, samples in grouped.items():
+        if len(samples) != sample_count:
+            raise DifferentialPairingError(
+                f"{samples[0].variant} sample set has {len(samples)} results for "
+                f"identity {identity}; expected {sample_count}"
+            )
+        ordered_samples = sorted(samples, key=_sample_result_index)
+        statistics_by_metric: dict[str, SampleStatistics] = {}
+        issues_by_metric: dict[str, str] = {}
+        for variable, (meas_type, field) in _SAMPLED_SUMMARY_METRICS.items():
+            values: list[float] = []
+            issues: list[str] = []
+            for result in ordered_samples:
+                try:
+                    summary = _summary_entry(result.payload, meas_type)
+                    if summary is None:
+                        issues.append(f"missing_{meas_type.lower()}_summary")
+                    elif field not in summary:
+                        issues.append("missing_metric")
+                    else:
+                        value = _optional_number(summary, field)
+                        if value is None:
+                            issues.append("null_metric")
+                        else:
+                            values.append(value)
+                except ResultMetricParseError as exc:
+                    issues.append(str(exc))
+
+            if len(values) == sample_count:
+                try:
+                    statistics_by_metric[variable] = summarize_sample_values(values)
+                    continue
+                except ResultMetricParseError as exc:
+                    issues.append(str(exc))
+
+            if len(values) == 0 and issues and len(set(issues)) == 1:
+                issues_by_metric[variable] = issues[0]
+            else:
+                issues_by_metric[variable] = "incomplete_sample_metric_set"
+
+        ordered_first = ordered_samples[0]
+        aggregated.append(
+            replace(
+                ordered_first,
+                sample_count=sample_count,
+                sample_statistics=tuple(statistics_by_metric.items()),
+                sample_metric_issues=tuple(issues_by_metric.items()),
+            )
+        )
+    return aggregated
+
+
+def _sample_result_index(result: VariantResult) -> int:
+    test_run = result.payload.get("test_run")
+    if not isinstance(test_run, dict):
+        raise DifferentialPairingError(f"{result.path} has no test_run object")
+    sample_index = test_run.get("sample_index")
+    if type(sample_index) is not int or sample_index < 1:
+        raise DifferentialPairingError(f"{result.path} has an invalid sample_index")
+    return sample_index
+
+
 def prepare_comparison_inputs(pairing: PairingResult) -> ComparisonInputs:
     """Keep only comparable metrics and retain deterministic omission reasons."""
 
@@ -246,6 +393,55 @@ def prepare_comparison_inputs(pairing: PairingResult) -> ComparisonInputs:
 
     metrics: list[ComparisonMetricInput] = []
     for pair in pairing.pairs:
+        if pair.version1.sample_count is not None or pair.version2.sample_count is not None:
+            version1_statistics = dict(pair.version1.sample_statistics)
+            version2_statistics = dict(pair.version2.sample_statistics)
+            version1_issues = dict(pair.version1.sample_metric_issues)
+            version2_issues = dict(pair.version2.sample_metric_issues)
+            for variable in _SAMPLED_SUMMARY_METRICS:
+                first = version1_statistics.get(variable)
+                second = version2_statistics.get(variable)
+                first_issue = version1_issues.get(variable)
+                second_issue = version2_issues.get(variable)
+                if (
+                    variable in {"event_energy_nj", "interval_energy_nj"}
+                    and first is None
+                    and second is None
+                    and first_issue == second_issue
+                    and first_issue is not None
+                    and first_issue.startswith("missing_")
+                ):
+                    continue
+                if first is None:
+                    diagnostics.append(
+                        _omission_diagnostic(
+                            pair.version1,
+                            variable,
+                            first_issue or "missing_sample_statistics",
+                        )
+                    )
+                if second is None:
+                    diagnostics.append(
+                        _omission_diagnostic(
+                            pair.version2,
+                            variable,
+                            second_issue or "missing_sample_statistics",
+                        )
+                    )
+                if first is None or second is None:
+                    continue
+                metrics.append(
+                    ComparisonMetricInput(
+                        identity=pair.identity,
+                        variable=variable,
+                        version1_value=first.mean,
+                        version2_value=second.mean,
+                        version1_statistics=first,
+                        version2_statistics=second,
+                    )
+                )
+            continue
+
         version1_metrics = _extract_or_diagnose(pair.version1, diagnostics)
         version2_metrics = _extract_or_diagnose(pair.version2, diagnostics)
         if version1_metrics is None or version2_metrics is None:
@@ -338,6 +534,19 @@ def create_diff_comparison_report(
                         "warning_percent": thresholds.warning_percent,
                         "failure_percent": thresholds.failure_percent,
                     },
+                    **(
+                        {
+                            "version1_statistics": _sample_statistics_to_dict(
+                                metric.version1_statistics
+                            ),
+                            "version2_statistics": _sample_statistics_to_dict(
+                                metric.version2_statistics
+                            ),
+                        }
+                        if metric.version1_statistics is not None
+                        and metric.version2_statistics is not None
+                        else {}
+                    ),
                 }
             )
         differential_status, reason = _classify_differential_record(
@@ -542,8 +751,16 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
             for metric in record.get("metrics", [])
             if isinstance(metric, dict)
         }
+        sampled_record = any(
+            variant.get("sample_count") is not None for variant in variants.values()
+        )
         record_start_row = worksheet.max_row + 1
-        for variable in _TABLE_METRIC_ORDER:
+        metric_order = (
+            tuple(_SAMPLED_SUMMARY_METRICS)
+            if sampled_record
+            else _TABLE_METRIC_ORDER
+        )
+        for variable in metric_order:
             row_key = (identity_key, variable)
             if row_key in row_keys:
                 raise ValueError("diff comparison report contains a duplicate test metric")
@@ -669,7 +886,7 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
     }
     for column, width in column_widths.items():
         worksheet.column_dimensions[column].width = width
-    worksheet.column_dimensions.group("I", "M", outline_level=1, hidden=True)
+    worksheet.column_dimensions.group("I", "L", outline_level=1, hidden=True)
     for row in worksheet.iter_rows(min_row=2):
         worksheet.row_dimensions[row[0].row].height = 22
         for cell in row:
@@ -887,8 +1104,14 @@ def render_diff_comparison_table(report: dict[str, Any]) -> str:
             name: record.get(name) if isinstance(record.get(name), dict) else {}
             for name in ("version1", "version2")
         }
+        sampled = any(variant.get("sample_count") is not None for variant in variants.values())
         table_rows: list[tuple[str, ...]] = []
-        for variable in _TABLE_METRIC_ORDER:
+        metric_order = (
+            tuple(_SAMPLED_SUMMARY_METRICS)
+            if sampled
+            else _TABLE_METRIC_ORDER
+        )
+        for variable in metric_order:
             comparison = comparisons.get(variable, {})
             version2_value, version2_reason = _normalized_metric_observation(
                 variants["version2"], variable, comparison, "version2", "V2"
@@ -924,21 +1147,21 @@ def render_diff_comparison_table(report: dict[str, Any]) -> str:
         )
         if record.get("reason"):
             tables.append(f"Reason: {record['reason']}")
-
         version2_header = _normalized_sdk_column_label(record, "version2", "Version 2")
         version1_header = _normalized_sdk_column_label(record, "version1", "Version 1")
+        headers = (
+            "Metric",
+            version2_header,
+            version1_header,
+            "Delta (V2 - V1)",
+            "Change",
+            "Result",
+            "Reason",
+        )
         tables.extend(
             (
                 _render_terminal_table(
-                    (
-                        "Metric",
-                        version2_header,
-                        version1_header,
-                        "Delta (V2 - V1)",
-                        "Change",
-                        "Result",
-                        "Reason",
-                    ),
+                    headers,
                     table_rows,
                 ),
                 "",
@@ -1230,6 +1453,11 @@ def _report_variant_input(result: VariantResult) -> dict[str, Any]:
         "measured_at": test_run.get("measured_at"),
         "cms_bench_id": storage.get("cms_bench_id"),
         "provenance": result.payload.get("firmware", {}),
+        **(
+            {"sample_count": result.sample_count}
+            if result.sample_count is not None
+            else {}
+        ),
         "metrics": _report_variant_metrics(result),
     }
 
@@ -1238,6 +1466,28 @@ def _report_variant_metrics(result: VariantResult) -> dict[str, dict[str, Any]]:
     """Return each available metric value and an explicit reason when it is absent."""
 
     payload = result.payload
+    if result.sample_count is not None:
+        statistics_by_metric = dict(result.sample_statistics)
+        issues_by_metric = dict(result.sample_metric_issues)
+        observations: dict[str, dict[str, Any]] = {}
+        for variable in _SAMPLED_SUMMARY_METRICS:
+            summary = statistics_by_metric.get(variable)
+            if summary is not None:
+                observations[variable] = {
+                    "value": summary.mean,
+                    "available": True,
+                    "availability_reason": None,
+                }
+            else:
+                observations[variable] = {
+                    "value": None,
+                    "available": False,
+                    "availability_reason": issues_by_metric.get(
+                        variable, "missing_sample_statistics"
+                    ),
+                }
+        return observations
+
     result_metric = payload.get("result_metric") if isinstance(payload, dict) else None
     observations: dict[str, dict[str, Any]] = {}
     summary_metrics = {
@@ -1455,9 +1705,19 @@ def pair_downloaded_differential_results(
     result filenames and their modification times are deliberately ignored.
     """
 
-    roles = _load_firmware_roles(paired_plan_path)
-    version1_results = _load_variant_results("version1", version1_root, roles)
-    version2_results = _load_variant_results("version2", version2_root, roles)
+    plan = _load_paired_plan(paired_plan_path)
+    _validate_differential_sample_sets(plan, version1_root, version2_root)
+    roles = _load_firmware_roles(paired_plan_path, plan=plan)
+    sample_count = plan["samples"] if "samples" in plan else None
+    version1_results = _load_variant_results(
+        "version1", version1_root, roles, sample_count=sample_count
+    )
+    version2_results = _load_variant_results(
+        "version2", version2_root, roles, sample_count=sample_count
+    )
+    if "samples" in plan:
+        version1_results = _aggregate_sample_results(version1_results, sample_count)
+        version2_results = _aggregate_sample_results(version2_results, sample_count)
     _raise_for_duplicate_identities(version1_results, "version1")
     _raise_for_duplicate_identities(version2_results, "version2")
 
@@ -1485,21 +1745,204 @@ def pair_downloaded_differential_results(
     )
 
 
-def _load_firmware_roles(
-    plan_path: Path,
-) -> dict[tuple[str, str, str, str, str], PlannedJobIdentity]:
+def _load_paired_plan(plan_path: Path) -> dict[str, Any]:
     try:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise DifferentialPairingError(f"cannot read paired plan: {plan_path}") from exc
     except json.JSONDecodeError as exc:
         raise DifferentialPairingError(f"paired plan is not valid JSON: {plan_path}") from exc
+    if not isinstance(plan, dict):
+        raise DifferentialPairingError("paired plan must be a JSON object")
+    return plan
 
-    jobs = plan.get("jobs") if isinstance(plan, dict) else None
+
+def _validate_differential_sample_sets(
+    plan: dict[str, Any],
+    version1_root: Path,
+    version2_root: Path,
+) -> None:
+    """Validate repeated differential samples before the single-result pairing path."""
+
+    if "samples" not in plan:
+        return
+    sample_count = plan.get("samples")
+    if type(sample_count) is not int or sample_count < 1:
+        raise DifferentialPairingError("paired plan samples must be a positive integer")
+    selector = plan.get("selector")
+    if not isinstance(selector, dict) or selector.get("config") != "default":
+        raise DifferentialPairingError("sampled differential plans must select the default config")
+    variable_filters = plan.get("variable_filters", [])
+    if variable_filters != []:
+        raise DifferentialPairingError("sampled differential plans cannot use variable filters")
+
+    jobs = plan.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        raise DifferentialPairingError("sampled paired plan must contain jobs")
+
+    expected: dict[tuple[str, str, str, str, str], dict[int, tuple[str, str, str, float | None]]] = {}
+    metadata_by_identity: dict[tuple[str, str, str, str, str], tuple[str, str, str, float | None]] = {}
+    role_sets: dict[tuple[str, str, str, str], set[str]] = {}
+    for index, job in enumerate(jobs, start=1):
+        source = f"paired plan job {index}"
+        if not isinstance(job, dict):
+            raise DifferentialPairingError(f"{source} must be an object")
+        identity = _plan_result_key(job, source=source)
+        role = identity[4]
+        if role not in {"dcdc", "no_dcdc"}:
+            raise DifferentialPairingError(f"{source} has unsupported firmware role: {role}")
+        dut_slcp = _required_text(job, "dut_slcp", source=source)
+        if _firmware_role_from_slcp(dut_slcp, source=source) != role:
+            raise DifferentialPairingError(f"{source} firmware role does not match its DUT application")
+        sample_index = job.get("sample_index")
+        if type(sample_index) is not int or not 1 <= sample_index <= sample_count:
+            raise DifferentialPairingError(
+                f"{source} sample_index must be between 1 and {sample_count}"
+            )
+        supply_value = job.get("supply_v")
+        if supply_value in (None, ""):
+            planned_supply = None
+        elif isinstance(supply_value, bool):
+            raise DifferentialPairingError(f"{source} supply_v must be numeric")
+        else:
+            try:
+                planned_supply = float(supply_value)
+            except (TypeError, ValueError) as exc:
+                raise DifferentialPairingError(f"{source} supply_v must be numeric") from exc
+            if not math.isfinite(planned_supply):
+                raise DifferentialPairingError(f"{source} supply_v must be finite")
+        metadata = (
+            _text_or_empty(job, "partition", source=source),
+            _text_or_empty(job, "board", source=source),
+            dut_slcp,
+            planned_supply,
+        )
+        previous_metadata = metadata_by_identity.setdefault(identity, metadata)
+        if previous_metadata != metadata:
+            raise DifferentialPairingError(
+                f"sample jobs disagree on configuration or firmware metadata: {identity}"
+            )
+        samples_for_identity = expected.setdefault(identity, {})
+        if sample_index in samples_for_identity:
+            raise DifferentialPairingError(
+                f"paired plan repeats sample {sample_index} for identity: {identity}"
+            )
+        samples_for_identity[sample_index] = metadata
+        role_sets.setdefault(identity[:4], set()).add(role)
+
+    wanted_samples = set(range(1, sample_count + 1))
+    for identity, samples_for_identity in expected.items():
+        observed_samples = set(samples_for_identity)
+        if observed_samples != wanted_samples:
+            missing = sorted(wanted_samples - observed_samples)
+            raise DifferentialPairingError(
+                f"paired plan sample set is incomplete for {identity}; missing samples {missing}"
+            )
+    for config_identity, roles in role_sets.items():
+        if roles != {"dcdc", "no_dcdc"}:
+            raise DifferentialPairingError(
+                f"sampled paired plan must include DCDC and NO_DCDC jobs for {config_identity}"
+            )
+
+    observed: dict[str, dict[tuple[str, str, str, str, str], set[int]]] = {
+        "version1": {},
+        "version2": {},
+    }
+    sdk_versions: dict[str, set[str]] = {"version1": set(), "version2": set()}
+    environments: dict[
+        tuple[str, str, str, str, str], tuple[str, str, float | None]
+    ] = {}
+    for variant, root in (("version1", version1_root), ("version2", version2_root)):
+        if not root.is_dir():
+            raise DifferentialPairingError(f"{variant} result root does not exist: {root}")
+        seen = observed[variant]
+        for path in sorted(root.rglob("*.json")):
+            payload = _load_result_payload(path)
+            if payload is None:
+                continue
+            result_key = _result_key(payload, source=str(path))
+            test_run = _required_object(payload, "test_run", source=str(path))
+            dataset = _required_object(payload, "dataset", source=str(path))
+            firmware = _required_object(payload, "firmware", source=str(path))
+            dut_slcp = _required_text(firmware, "dut_slcp", source=str(path))
+            role = _firmware_role_from_slcp(dut_slcp, source=str(path))
+            declared_role = firmware.get("firmware_role")
+            if declared_role is not None and declared_role != role:
+                raise DifferentialPairingError(f"{path} firmware role does not match its DUT application")
+            identity = (*result_key, role)
+            planned_metadata = metadata_by_identity.get(identity)
+            if planned_metadata is None:
+                raise DifferentialPairingError(f"sample result does not match a paired-plan job: {path}")
+            sample_index = test_run.get("sample_index")
+            if type(sample_index) is not int or sample_index not in expected[identity]:
+                raise DifferentialPairingError(f"{path} has an unexpected or missing sample_index")
+            samples_for_identity = seen.setdefault(identity, set())
+            if sample_index in samples_for_identity:
+                raise DifferentialPairingError(
+                    f"{variant} has duplicate sample {sample_index} for identity: {identity}"
+                )
+            samples_for_identity.add(sample_index)
+
+            partition, planned_board, _, planned_supply = planned_metadata
+            observed_partition = _text_or_empty(dataset, "partition", source=str(path))
+            if observed_partition != partition:
+                raise DifferentialPairingError(f"{path} partition does not match its paired-plan job")
+            board = _required_text(firmware, "board", source=str(path))
+            device = _required_text(firmware, "device", source=str(path))
+            if planned_board and board != planned_board:
+                raise DifferentialPairingError(f"{path} board does not match its paired-plan job")
+            parameters = payload.get("parameters")
+            if not isinstance(parameters, dict):
+                raise DifferentialPairingError(f"{path} has no object field 'parameters'")
+            supply = _optional_supply_voltage(parameters, source=str(path))
+            if planned_supply is not None and (
+                supply is None or not math.isclose(supply, planned_supply, rel_tol=0.0, abs_tol=1e-9)
+            ):
+                raise DifferentialPairingError(f"{path} supply voltage does not match its paired-plan job")
+            environment = (board, device, supply)
+            previous_environment = environments.setdefault(identity, environment)
+            if previous_environment != environment:
+                raise DifferentialPairingError(
+                    f"sample results disagree on board, device, or supply voltage for {identity}"
+                )
+
+            result_variant = _required_text(firmware, "variant", source=str(path))
+            if result_variant != variant:
+                raise DifferentialPairingError(
+                    f"{path} firmware variant is {result_variant!r}; expected {variant!r}"
+                )
+            firmware_sdk = _required_text(firmware, "dut_sdk_version", source=str(path))
+            dataset_sdk = _required_text(dataset, "sdk_version", source=str(path))
+            if firmware_sdk != dataset_sdk:
+                raise DifferentialPairingError(f"{path} SDK version fields disagree")
+            sdk_versions[variant].add(firmware_sdk)
+
+        for identity, sample_jobs in expected.items():
+            actual_samples = seen.get(identity, set())
+            expected_samples = set(sample_jobs)
+            if actual_samples != expected_samples:
+                missing = sorted(expected_samples - actual_samples)
+                raise DifferentialPairingError(
+                    f"{variant} sample set is incomplete for {identity}; missing samples {missing}"
+                )
+        if len(sdk_versions[variant]) != 1:
+            raise DifferentialPairingError(
+                f"{variant} samples do not resolve to one consistent SDK version"
+            )
+
+
+def _load_firmware_roles(
+    plan_path: Path,
+    *,
+    plan: dict[str, Any] | None = None,
+) -> dict[tuple[str, ...], PlannedJobIdentity]:
+    plan = plan if plan is not None else _load_paired_plan(plan_path)
+
+    jobs = plan.get("jobs")
     if not isinstance(jobs, list):
         raise DifferentialPairingError("paired plan must contain a jobs list")
 
-    roles: dict[tuple[str, str, str, str, str], PlannedJobIdentity] = {}
+    roles: dict[tuple[str, ...], PlannedJobIdentity] = {}
     for index, job in enumerate(jobs, start=1):
         if not isinstance(job, dict):
             raise DifferentialPairingError(f"paired plan job {index} must be an object")
@@ -1519,11 +1962,20 @@ def _load_firmware_roles(
             raise DifferentialPairingError(
                 f"paired plan job {index} firmware role does not match its DUT application"
             )
-        if key in roles:
+        if "samples" in plan:
+            sample_index = job.get("sample_index")
+            if type(sample_index) is not int or sample_index < 1:
+                raise DifferentialPairingError(
+                    f"paired plan job {index} has an invalid sample_index"
+                )
+            lookup_key = (*key, sample_index)
+        else:
+            lookup_key = key
+        if lookup_key in roles:
             raise DifferentialPairingError(
-                f"paired plan has duplicate raw-result identity: {key}"
+                f"paired plan has duplicate raw-result identity: {lookup_key}"
             )
-        roles[key] = PlannedJobIdentity(
+        roles[lookup_key] = PlannedJobIdentity(
             partition=_text_or_empty(job, "partition", source=f"paired plan job {index}"),
             firmware_role=role,
         )
@@ -1533,7 +1985,9 @@ def _load_firmware_roles(
 def _load_variant_results(
     variant: str,
     root: Path,
-    roles: dict[tuple[str, str, str, str, str], PlannedJobIdentity],
+    roles: dict[tuple[str, ...], PlannedJobIdentity],
+    *,
+    sample_count: int | None = None,
 ) -> list[VariantResult]:
     if not root.is_dir():
         raise DifferentialPairingError(f"{variant} result root does not exist: {root}")
@@ -1544,6 +1998,12 @@ def _load_variant_results(
         if payload is None:
             continue
         result_key = _result_key(payload, source=str(path))
+        test_run = _required_object(payload, "test_run", source=str(path))
+        sample_index = test_run.get("sample_index") if sample_count is not None else None
+        if sample_count is not None and (
+            type(sample_index) is not int or not 1 <= sample_index <= sample_count
+        ):
+            raise DifferentialPairingError(f"{path} has an unexpected or missing sample_index")
         firmware = _required_object(payload, "firmware", source=str(path))
         dut_slcp = (
             _text_or_empty(firmware, "dut_slcp", source=str(path))
@@ -1566,13 +2026,24 @@ def _load_variant_results(
                     )
                 role = declared_role
             else:
-                candidates = [key for key in roles if key[:4] == result_key]
-                if len(candidates) != 1:
+                candidates = [
+                    key
+                    for key in roles
+                    if key[:4] == result_key
+                    and (sample_count is None or key[-1] == sample_index)
+                ]
+                candidate_roles = {key[4] for key in candidates}
+                if len(candidate_roles) != 1:
                     raise DifferentialPairingError(
                         f"{path} is missing DUT application identity for a multi-role paired plan"
                     )
-                role = candidates[0][4]
-        planned_identity = roles.get((*result_key, role))
+                role = next(iter(candidate_roles))
+        planned_key = (
+            (*result_key, role, sample_index)
+            if sample_count is not None
+            else (*result_key, role)
+        )
+        planned_identity = roles.get(planned_key)
         if planned_identity is None:
             raise DifferentialPairingError(
                 f"result does not match a paired-plan job: {path}"

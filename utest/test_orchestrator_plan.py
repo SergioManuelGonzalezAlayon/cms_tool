@@ -1188,7 +1188,7 @@ def test_cms_orchestrator_rejects_forwarded_pytest_cfg(tmp_path, monkeypatch, ca
     assert "CMS orchestrator runs must use --exact-config" in output
 
 
-def test_cms_orchestrator_keeps_variant_identity_out_of_pytest_arguments() -> None:
+def test_cms_orchestrator_suppresses_database_upload_for_paired_variants() -> None:
     parsed, _ = orchestrator.parse_args_with_pytest(
         [
             "--cms-runtime-config",
@@ -1197,6 +1197,7 @@ def test_cms_orchestrator_keeps_variant_identity_out_of_pytest_arguments() -> No
             "cms_fw_metadata.json",
             "--variant",
             "version1",
+            "--upload-results-to-database",
         ]
     )
 
@@ -1205,4 +1206,14 @@ def test_cms_orchestrator_keeps_variant_identity_out_of_pytest_arguments() -> No
         "cms_bench_runtime.json",
         "--cms-fw-metadata",
         "cms_fw_metadata.json",
+    ]
+
+
+def test_cms_orchestrator_forwards_database_upload_opt_in_for_ordinary_runs() -> None:
+    parsed, _ = orchestrator.parse_args_with_pytest(
+        ["--upload-results-to-database"]
+    )
+
+    assert orchestrator.cms_pytest_args(parsed) == [
+        "--upload-results-to-database"
     ]

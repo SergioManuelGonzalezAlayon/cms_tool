@@ -13,6 +13,14 @@ assert _SPEC is not None and _SPEC.loader is not None
 results_generator = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(results_generator)
 
+_TESTS_CONFTEST_PATH = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
+_CONFTEST_SPEC = importlib.util.spec_from_file_location(
+    "current_measurement_tests_conftest_upload_flag", _TESTS_CONFTEST_PATH
+)
+assert _CONFTEST_SPEC is not None and _CONFTEST_SPEC.loader is not None
+tests_conftest = importlib.util.module_from_spec(_CONFTEST_SPEC)
+_CONFTEST_SPEC.loader.exec_module(tests_conftest)
+
 
 def test_result_generator_uses_correct_upload_env_var(monkeypatch):
     monkeypatch.delenv("CURRRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE", raising=False)
@@ -38,6 +46,31 @@ def test_explicit_upload_flag_overrides_env(monkeypatch):
     generator = results_generator.ResultGenerator(upload_results_to_database=False)
 
     assert generator.upload_results_to_database is False
+
+
+def test_cms_pytest_fixture_disables_environment_upload_without_opt_in(monkeypatch):
+    monkeypatch.setenv("CURRENT_MEASUREMENT_UPLOAD_RESULTS_TO_DATABASE", "1")
+    captured = {}
+
+    class CapturingResultGenerator:
+        def __init__(self, *, upload_results_to_database, retain_captures_for_debug):
+            captured["upload_results_to_database"] = upload_results_to_database
+
+    class RequestConfig:
+        def getoption(self, option):
+            return {
+                "--upload-results-to-database": False,
+                "--cms-fw-metadata": "cms_fw_metadata.json",
+                "--cms-debug": False,
+            }[option]
+
+    class Request:
+        config = RequestConfig()
+
+    monkeypatch.setattr(tests_conftest, "ResultGenerator", CapturingResultGenerator)
+    tests_conftest.ResultGeneratorFixture.__wrapped__(Request())
+
+    assert captured["upload_results_to_database"] is False
 
 
 def test_result_generator_records_upload_phase_failure(tmp_path, monkeypatch):

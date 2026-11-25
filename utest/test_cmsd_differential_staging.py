@@ -276,12 +276,14 @@ def test_diff_test_uses_the_current_differential_stage_without_a_staging_id(
     result = daemon.start_staged_test(
         mode="diff",
         feature="beacon",
+        upload_results_to_database=True,
     )
 
     assert result.state.value == "accepted"
     assert captured["kwargs"]["differential_staging"].runtime_dir == runtime_dir
     assert captured["kwargs"]["staged_runtime_dir"] == runtime_dir
     assert captured["args"][0].differential_firmware is not None
+    assert captured["args"][0].upload_results_to_database is False
     plan = json.loads(
         (runtime_dir / "firmware" / "paired_default_plan.json").read_text(encoding="utf-8")
     )

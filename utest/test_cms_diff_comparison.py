@@ -7,11 +7,13 @@ from cms_diff_comparison import (
     DifferentialPairingError,
     PercentageThresholdPolicy,
     ResultMetricParseError,
+    SampleStatistics,
     create_diff_comparison_report,
     extract_measurement_metrics,
     pair_downloaded_differential_results,
     prepare_comparison_inputs,
     render_diff_comparison_table,
+    summarize_sample_values,
     write_diff_comparison_report,
 )
 
@@ -55,6 +57,123 @@ def _write_result(root: Path, filename: str, *, config_hash: str = "config-sha25
         encoding="utf-8",
     )
     return path
+
+
+def _write_sampled_plan(
+    path: Path,
+    *,
+    samples: int = 2,
+    roles: tuple[str, ...] = ("dcdc", "no_dcdc"),
+) -> None:
+    jobs = []
+    dut_projects = {
+        "dcdc": "ncp_ble_dut_dcdc",
+        "no_dcdc": "ncp_ble_dut",
+    }
+    for role in roles:
+        for sample_index in range(1, samples + 1):
+            jobs.append(
+                {
+                    "feature": "beacon",
+                    "config_path": "tests/configs/ble/beacon/default.json",
+                    "config_hash": "config-sha256",
+                    "partition": "",
+                    "mode": "default",
+                    "board": "brd4182a",
+                    "supply_v": 3.3,
+                    "dut_slcp": f"apps/{dut_projects[role]}/{dut_projects[role]}.slcp",
+                    "firmware_role": role,
+                    "sample_index": sample_index,
+                }
+            )
+    path.write_text(
+        json.dumps(
+            {
+                "samples": samples,
+                "selector": {"config": "default"},
+                "variable_filters": [],
+                "jobs": jobs,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_sampled_result(
+    root: Path,
+    *,
+    variant: str,
+    role: str,
+    sample_index: int,
+    sdk_version: str | None = None,
+    filename: str | None = None,
+) -> Path:
+    dut_project = "ncp_ble_dut_dcdc" if role == "dcdc" else "ncp_ble_dut"
+    sdk_version = sdk_version or ("2025.12.0" if variant == "version1" else "2026.6.0")
+    path = root / (filename or f"{role}_sample_{sample_index:03d}.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scale = 1.0 if variant == "version1" else 1.1
+    interval_current = float(sample_index * 2 - 1) * scale
+    event_energy = float(10 + (sample_index - 1) * 4) * scale
+    interval_energy = float(20 + (sample_index - 1) * 4) * scale
+    path.write_text(
+        json.dumps(
+            {
+                "test_run": {
+                    "test_name": "beacon",
+                    "config_path": "tests\\configs\\ble\\beacon\\default.json",
+                    "config_hash": "config-sha256",
+                    "sample_index": sample_index,
+                },
+                "dataset": {
+                    "mode": "default",
+                    "partition": "",
+                    "sdk_version": sdk_version,
+                },
+                "firmware": {
+                    "board": "brd4182a",
+                    "device": "EFR32MG22",
+                    "dut_slcp": f"apps/{dut_project}/{dut_project}.slcp",
+                    "firmware_role": role,
+                    "variant": variant,
+                    "dut_sdk_version": sdk_version,
+                },
+                "parameters": {"supply_voltage_v": 3.3},
+                "result_summary": [
+                    {"meas_type": "Event", "e_mean_nj": event_energy},
+                    {
+                        "meas_type": "Interval",
+                        "i_mean_ma": interval_current,
+                        "e_mean_nj": interval_energy,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_sampled_campaign(
+    tmp_path: Path,
+    *,
+    samples: int = 2,
+    roles: tuple[str, ...] = ("dcdc", "no_dcdc"),
+) -> tuple[Path, Path, Path]:
+    version1_root = tmp_path / "results" / "version1"
+    version2_root = tmp_path / "results" / "version2"
+    plan_path = tmp_path / "paired_default_plan.json"
+    _write_sampled_plan(plan_path, samples=samples, roles=roles)
+    for variant, root in (("version1", version1_root), ("version2", version2_root)):
+        for role in roles:
+            for sample_index in range(1, samples + 1):
+                _write_sampled_result(
+                    root,
+                    variant=variant,
+                    role=role,
+                    sample_index=sample_index,
+                )
+    return version1_root, version2_root, plan_path
 
 
 def test_pairs_version1_and_version2_by_stable_identity_not_filename_or_order(tmp_path: Path) -> None:
@@ -139,6 +258,198 @@ def test_rejects_duplicate_variant_results_for_one_stable_identity(tmp_path: Pat
         pair_downloaded_differential_results(version1_root, version2_root, plan_path)
 
 
+def test_pairs_complete_single_sample_dcdc_and_no_dcdc_sets(tmp_path: Path) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=1)
+
+    pairing = pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+    assert {pair.identity.firmware_role for pair in pairing.pairs} == {"dcdc", "no_dcdc"}
+    assert len(pairing.pairs) == 2
+
+
+def test_aggregates_samples_and_reports_statistics(tmp_path: Path) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+
+    pairing = pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+    inputs = prepare_comparison_inputs(pairing)
+    report = create_diff_comparison_report(pairing, inputs)
+
+    dcdc_pair = next(pair for pair in pairing.pairs if pair.identity.firmware_role == "dcdc")
+    dcdc_metrics = {
+        metric.variable: metric
+        for metric in inputs.metrics
+        if metric.identity.firmware_role == "dcdc"
+    }
+    sleep = dcdc_metrics["sleep_current_ma"]
+    assert dcdc_pair.version1.sample_count == 2
+    assert sleep.version1_value == pytest.approx(2.0)
+    assert sleep.version2_value == pytest.approx(2.2)
+    assert sleep.version1_statistics == SampleStatistics(
+        count=2,
+        mean=2.0,
+        median=2.0,
+        standard_deviation=pytest.approx(2**0.5),
+        minimum=1.0,
+        maximum=3.0,
+    )
+
+    dcdc_report = next(
+        record for record in report["records"]
+        if record["identity"]["firmware_role"] == "dcdc"
+    )
+    sleep_report = next(
+        metric for metric in dcdc_report["metrics"]
+        if metric["variable"] == "sleep_current_ma"
+    )
+    assert sleep_report["version1"] == pytest.approx(2.0)
+    assert sleep_report["version2"] == pytest.approx(2.2)
+    assert sleep_report["percent"] == pytest.approx(10.0)
+    assert sleep_report["version1_statistics"] == {
+        "count": 2,
+        "mean": 2.0,
+        "median": 2.0,
+        "standard_deviation": pytest.approx(2**0.5),
+        "minimum": 1.0,
+        "maximum": 3.0,
+    }
+    assert dcdc_report["version1"]["sample_count"] == 2
+
+    terminal = render_diff_comparison_table(report)
+    assert "2.2" in terminal
+
+
+def test_incomplete_sample_metric_cannot_be_classified_pass(tmp_path: Path) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+    for sample_index in (1, 2):
+        sample_path = version2_root / f"dcdc_sample_{sample_index:03d}.json"
+        sample_payload = json.loads(sample_path.read_text(encoding="utf-8"))
+        sample_offset = sample_index - 1
+        event = next(
+            entry for entry in sample_payload["result_summary"]
+            if entry["meas_type"] == "Event"
+        )
+        interval = next(
+            entry for entry in sample_payload["result_summary"]
+            if entry["meas_type"] == "Interval"
+        )
+        event["e_mean_nj"] = float(10 + sample_offset * 4)
+        interval["e_mean_nj"] = float(20 + sample_offset * 4)
+        if sample_index == 2:
+            del interval["i_mean_ma"]
+        sample_path.write_text(json.dumps(sample_payload), encoding="utf-8")
+
+    pairing = pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+    report = create_diff_comparison_report(pairing, prepare_comparison_inputs(pairing))
+    dcdc_report = next(
+        record for record in report["records"]
+        if record["identity"]["firmware_role"] == "dcdc"
+    )
+
+    assert dcdc_report["differential_status"] == "INCOMPLETE"
+    assert "sleep_current_ma" not in {
+        metric["variable"] for metric in dcdc_report["metrics"]
+    }
+    version2_sleep = dcdc_report["version2"]["metrics"]["sleep_current_ma"]
+    assert version2_sleep["available"] is False
+    assert version2_sleep["availability_reason"] == "incomplete_sample_metric_set"
+
+
+def test_rejects_incomplete_sample_set(tmp_path: Path) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+    (version2_root / "no_dcdc_sample_002.json").unlink()
+
+    with pytest.raises(
+        DifferentialPairingError,
+        match="version2 sample set is incomplete.*missing samples \\[2\\]",
+    ):
+        pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+
+def test_rejects_duplicate_sample_identity(tmp_path: Path) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+    duplicate = version1_root / "duplicate_sample.json"
+    duplicate.write_text(
+        (version1_root / "dcdc_sample_001.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DifferentialPairingError, match="duplicate sample 1"):
+        pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+
+def test_rejects_inconsistent_sdk_versions_within_one_variant(tmp_path: Path) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+    path = version1_root / "dcdc_sample_002.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["dataset"]["sdk_version"] = "unexpected-sdk"
+    payload["firmware"]["dut_sdk_version"] = "unexpected-sdk"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(DifferentialPairingError, match="one consistent SDK version"):
+        pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+
+def test_rejects_result_with_wrong_firmware_variant(tmp_path: Path) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+    path = version2_root / "dcdc_sample_001.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["firmware"]["variant"] = "version1"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(DifferentialPairingError, match="expected 'version2'"):
+        pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "message"),
+    [
+        ("test_run", "sample_index", 0, "unexpected or missing sample_index"),
+        ("dataset", "partition", "unexpected", "partition does not match"),
+        ("firmware", "firmware_role", "no_dcdc", "firmware role does not match"),
+        ("firmware", "board", "different-board", "board does not match"),
+        ("firmware", "device", "EFR32MG24", "disagree on board, device"),
+        ("parameters", "supply_voltage_v", 1.55, "supply voltage does not match"),
+    ],
+)
+def test_rejects_inconsistent_sample_identity_and_hardware_metadata(
+    tmp_path: Path,
+    section: str,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+    path = version1_root / "dcdc_sample_001.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload[section][field] = value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(DifferentialPairingError, match=message):
+        pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+
+def test_rejects_result_with_unplanned_configuration_hash(tmp_path: Path) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+    path = version1_root / "no_dcdc_sample_001.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["test_run"]["config_hash"] = "different-config-sha256"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(DifferentialPairingError, match="does not match a paired-plan job"):
+        pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+
+def test_rejects_sampled_plan_missing_one_dut_mode(tmp_path: Path) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(
+        tmp_path,
+        samples=2,
+        roles=("dcdc",),
+    )
+
+    with pytest.raises(DifferentialPairingError, match="include DCDC and NO_DCDC"):
+        pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+
 def test_extracts_current_metrics_and_interval_sleep_current() -> None:
     metrics = extract_measurement_metrics(
         {
@@ -194,6 +505,48 @@ def test_rejects_malformed_metric_values_and_ambiguous_interval_summary() -> Non
                 }
             }
         )
+
+
+def test_summarizes_repeated_metric_values() -> None:
+    summary = summarize_sample_values([1, 3, 5])
+
+    assert summary == SampleStatistics(
+        count=3,
+        mean=3.0,
+        median=3.0,
+        standard_deviation=2.0,
+        minimum=1.0,
+        maximum=5.0,
+    )
+
+
+def test_single_sample_has_no_sample_standard_deviation() -> None:
+    summary = summarize_sample_values([2.5])
+
+    assert summary == SampleStatistics(
+        count=1,
+        mean=2.5,
+        median=2.5,
+        standard_deviation=None,
+        minimum=2.5,
+        maximum=2.5,
+    )
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ([], "at least one value"),
+        ([True], "must be numeric"),
+        ([1.0, float("nan")], "must be finite"),
+        ([float("inf")], "must be finite"),
+    ],
+)
+def test_rejects_empty_or_invalid_sample_values(
+    values: list[object], message: str
+) -> None:
+    with pytest.raises(ResultMetricParseError, match=message):
+        summarize_sample_values(values)
 
 
 def test_prepares_only_available_metrics_and_preserves_json_ready_omission_reasons(tmp_path: Path) -> None:

@@ -823,6 +823,8 @@ class CMSBench:
 
         if request.differential_firmware is None:
             raise RuntimeError("differential plan requires differential firmware")
+        if type(request.samples) is not int or request.samples < 1:
+            raise RuntimeError("differential sample count must be a positive integer")
         from test_orchestrator import (
             CONFIG_ROOT,
             build_job_plan,
@@ -835,59 +837,79 @@ class CMSBench:
         if not feature:
             raise RuntimeError("differential test feature is required")
         config = request.selector.config.strip() or "default"
-        if feature == "all" and config != "default":
-            raise RuntimeError("differential --feature all only supports the default config")
+        if request.samples > 1 and config != "default":
+            raise RuntimeError("differential sampling only supports the default config")
+        if request.selector.variable_filters:
+            raise RuntimeError("differential sampling does not support variable filters")
+        has_custom_config = (
+            request.selector.custom_config_data is not None
+            or request.selector.custom_config_set_data is not None
+        )
+        if request.samples > 1 and has_custom_config:
+            raise RuntimeError("differential sampling does not support custom configs")
+        if has_custom_config and not _is_mutable_custom_config_name(config):
+            raise RuntimeError("custom config data requires config=custom")
+        if config != "default":
+            if not _is_mutable_custom_config_name(config) or request.samples != 1:
+                raise RuntimeError("differential sampling only supports the default config")
+            if request.selector.custom_config_set_data is not None:
+                raise RuntimeError("differential custom config sets are not supported")
+            jobs = build_jobs(
+                [CONFIG_ROOT / "ble"],
+                mode="default",
+                feature_filters={feature},
+                partition_filters=set(),
+                exact_config="default",
+            )
+            if len(jobs) != 1:
+                raise RuntimeError(f"CUSTOM config selected {len(jobs)} jobs; expected exactly one")
+            config_data = request.selector.custom_config_data or {}
+            firmware_data = config_data.get("firmware", {})
+            dut_slcp = str(firmware_data.get("dut_slcp") or jobs[0].dut_slcp)
+            snapshot_path = runtime_dir / "firmware" / "custom_config_snapshot.json"
+            _write_custom_config_snapshot(snapshot_path, request.selector.custom_config_data)
+            job = replace(
+                jobs[0],
+                config_path=snapshot_path,
+                cfg_arg=str(snapshot_path.resolve()),
+                mode="one_factor",
+                dut_slcp=dut_slcp,
+                firmware_role=dut_firmware_role(dut_slcp),
+                supply_v=config_data.get("hw", {}).get("supply_v", ""),
+                config_hash=hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+            )
+            if not job.firmware_role:
+                raise RuntimeError(f"CUSTOM config selects unsupported DUT application: {dut_slcp}")
+            plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
+            plan = build_job_plan([job])
+            plan["scope"] = "feature_default"
+            plan["selector"] = {
+                "feature": feature,
+                "config": config,
+                "config_hash": request.selector.config_hash,
+            }
+            plan["custom_config_snapshot"] = {
+                "path": str(snapshot_path),
+                "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
+            }
+            plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+            return plan_path
         feature_filters = set() if feature == "all" else {feature}
-        custom_config = _is_mutable_custom_config_name(config)
-        exact_config = "default" if custom_config else "" if config == "default" else config
         jobs = build_jobs(
             [CONFIG_ROOT / "ble"],
-            mode="all" if exact_config else "default",
+            mode="default",
             feature_filters=feature_filters,
             partition_filters=set(),
-            exact_config=exact_config,
         )
         if not jobs:
             raise RuntimeError("differential selected zero jobs")
         plan_path = runtime_dir / "firmware" / "paired_default_plan.json"
-        custom_snapshot: dict[str, str] | None = None
-        if custom_config:
-            custom_data = request.selector.custom_config_data
-            if not isinstance(custom_data, dict):
-                raise RuntimeError(
-                    "CUSTOM tests require the local custom.json payload from the CMS Client"
-                )
-            validate_test_config_data(custom_data)
-            snapshot_path = plan_path.with_name("custom_config_snapshot.json")
-            snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-            snapshot_path.write_text(
-                json.dumps(custom_data, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            snapshot_hash = _sha256_file(snapshot_path)
-            firmware_data = custom_data.get("firmware", {})
-            custom_dut_slcp = str(firmware_data.get("dut_slcp") or jobs[0].dut_slcp)
-            jobs = [
-                replace(
-                    job,
-                    config_path=snapshot_path,
-                    cfg_arg=str(snapshot_path),
-                    config_hash=snapshot_hash,
-                    mode="one_factor",
-                    dut_slcp=custom_dut_slcp,
-                    tester_slcp=str(firmware_data.get("tester_slcp") or job.tester_slcp),
-                    board=str(firmware_data.get("board") or job.board),
-                    supply_v=custom_data.get("hw", {}).get("supply_v", ""),
-                    firmware_role=dut_firmware_role(custom_dut_slcp),
-                )
-                for job in jobs[:1]
-            ]
-            custom_snapshot = {
-                "path": str(snapshot_path),
-                "sha256": snapshot_hash,
-            }
-        elif config == "default":
-            jobs = expand_default_dut_variants(jobs)
+        jobs = expand_default_dut_variants(jobs)
+        jobs = [
+            replace(job, sample_index=sample_index)
+            for job in jobs
+            for sample_index in range(1, request.samples + 1)
+        ]
         plan = build_job_plan(jobs)
         for job_record in plan["jobs"]:
             dut_project = Path(str(job_record["dut_slcp"])).stem
@@ -901,16 +923,13 @@ class CMSBench:
             "all_default_features"
             if feature == "all"
             else "feature_default"
-            if config == "default"
-            else "feature_exact_config"
         )
+        plan["samples"] = request.samples
         plan["selector"] = {
             "feature": feature,
             "config": config,
             "config_hash": request.selector.config_hash,
         }
-        if custom_snapshot is not None:
-            plan["custom_config_snapshot"] = custom_snapshot
         plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
         return plan_path
 

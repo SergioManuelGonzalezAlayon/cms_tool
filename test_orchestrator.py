@@ -70,11 +70,21 @@ class Job:
     measurement_created_at: str = ""
     variant: str = ""
     variable_filters: tuple[VariableFilter, ...] = ()
+    sample_index: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.sample_index) is not int or self.sample_index < 0:
+            raise ValueError("sample_index must be a non-negative integer")
 
     @property
     def job_id(self) -> str:
         identity = f"{self.nodeid}|{self.cfg_arg}"
-        return f"{identity}|{self.firmware_role}" if self.firmware_role else identity
+        parts = [identity]
+        if self.firmware_role:
+            parts.append(self.firmware_role)
+        if self.sample_index:
+            parts.append(f"sample-{self.sample_index:03d}")
+        return "|".join(parts)
 
 
 def load_json(path: Path) -> dict:
@@ -468,6 +478,8 @@ def result_artifact_paths(job: Job) -> dict[str, Path]:
     artifact_stem = f"{_artifact_component(job.feature)}_{_artifact_component(Path(job.cfg_arg).stem)}"
     if job.firmware_role:
         artifact_stem += f"_{_artifact_component(job.firmware_role)}"
+    if job.sample_index:
+        artifact_stem += f"_sample_{job.sample_index:03d}"
     return {
         "result_json": output_dir / f"{artifact_stem}_result.json",
         "upload_status": output_dir / f"{artifact_stem}_upload_status.json",
@@ -632,7 +644,7 @@ def write_job_plan(results_log: Path, jobs: list[Job]) -> Path:
     return plan_path
 
 
-def load_job_plan(plan_path: Path) -> list[Job]:
+def load_job_plan(plan_path: Path, *, cms_metadata_path: str = "") -> list[Job]:
     """Load a previously frozen job plan without rediscovering configuration files."""
     try:
         payload = load_json(plan_path)
@@ -655,6 +667,9 @@ def load_job_plan(plan_path: Path) -> list[Job]:
             )
             dut_slcp = str(record["dut_slcp"])
             firmware_role = str(record.get("firmware_role", ""))
+            sample_index = record.get("sample_index", 0)
+            if type(sample_index) is not int or sample_index < 0:
+                raise ValueError("job sample_index must be a non-negative integer")
             declared_role = dut_firmware_role(dut_slcp)
             if firmware_role and declared_role and firmware_role != declared_role:
                 raise ValueError("job firmware_role does not match dut_slcp")
@@ -671,10 +686,12 @@ def load_job_plan(plan_path: Path) -> list[Job]:
                 board=str(record["board"]),
                 supply_v=record["supply_v"],
                 firmware_role=firmware_role,
+                cms_fw_metadata=cms_metadata_path,
                 config_hash=str(record["config_hash"]),
                 requested_config_hash=str(record.get("requested_config_hash", "")),
                 variant=str(record.get("variant", "")),
                 variable_filters=filters,
+                sample_index=sample_index,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(f"job plan contains an invalid job at ordinal {ordinal}") from exc
@@ -828,6 +845,8 @@ def run_job(
     ]
     if job.firmware_role:
         cmd.extend(["--cms-dut-role", job.firmware_role])
+    if job.sample_index:
+        cmd.extend(["--cms-sample-index", str(job.sample_index)])
     if include_junit_logs:
         cmd.extend(["-o", "junit_logging=all"])
     cmd.extend(pytest_args)
@@ -989,7 +1008,7 @@ def cms_pytest_args(parsed: argparse.Namespace) -> list[str]:
         args.extend(["--cms-runtime-config", parsed.cms_runtime_config])
     if parsed.cms_fw_metadata:
         args.extend(["--cms-fw-metadata", parsed.cms_fw_metadata])
-    if parsed.upload_results_to_database:
+    if parsed.upload_results_to_database and not parsed.variant:
         args.append("--upload-results-to-database")
     if parsed.debug:
         args.append("--cms-debug")
@@ -1035,7 +1054,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if parsed.job_plan:
         try:
-            jobs = load_job_plan(Path(parsed.job_plan))
+            jobs = load_job_plan(
+                Path(parsed.job_plan),
+                cms_metadata_path=parsed.cms_fw_metadata,
+            )
         except ValueError as exc:
             print(colors.color(str(exc), "failed"))
             return 2

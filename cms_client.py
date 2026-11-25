@@ -706,8 +706,21 @@ class CMSClient:
         upload_results_to_database: bool = True,
         debug_artifact_streaming: bool = False,
         custom_config_set_data: list[dict[str, Any]] | None = None,
+        samples: int = 1,
     ) -> MeasurementResult:
         """Start a remote test using the most recently staged firmware."""
+
+        if type(samples) is not int or samples < 1:
+            raise ValueError("samples must be a positive integer")
+        if mode is not MeasurementMode.DIFF and samples != 1:
+            raise ValueError("--samples is only supported with --mode diff")
+        if mode is MeasurementMode.DIFF:
+            if config != "default":
+                raise ValueError("differential sampling only supports the default config")
+            if variable_filters:
+                raise ValueError("differential sampling does not support variable filters")
+            if custom_config_set_data is not None:
+                raise ValueError("differential sampling does not support custom config sets")
 
         config_hash = ""
         custom_config_data = None
@@ -742,6 +755,7 @@ class CMSClient:
             "run_name": run_name,
             "upload_results_to_database": upload_results_to_database,
             "debug_artifact_streaming": debug_artifact_streaming,
+            "samples": samples,
         }
         if custom_config_data is not None:
             request["custom_config_data"] = custom_config_data
@@ -1675,6 +1689,13 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     test.add_argument("--config-name", default="default", help="test config")
     test.add_argument(
+        "--samples",
+        type=int,
+        default=None,
+        metavar="N",
+        help="number of measurements per differential job (positive integer; default: 1)",
+    )
+    test.add_argument(
         "--variable",
         action="append",
         default=[],
@@ -2212,7 +2233,17 @@ def _main(argv: list[str] | None = None) -> int:
 
     if args.command in {"test", "TEST"}:
         _print_explicit_endpoint_selection(args, client)
+        if args.samples is not None:
+            if args.samples < 1:
+                raise RuntimeError("--samples must be a positive integer")
+            if args.mode != MeasurementMode.DIFF.value:
+                raise RuntimeError("--samples is only supported with --mode diff")
         variable_filters = parse_variable_filters(args.variable)
+        if args.mode == MeasurementMode.DIFF.value:
+            if args.config_name != "default":
+                raise RuntimeError("differential sampling only supports the default config")
+            if variable_filters:
+                raise RuntimeError("differential sampling does not support variable filters")
         if args.feature == "all" and args.config_name != "default":
             raise RuntimeError("--feature all only supports the default config")
         if args.feature == "all" and variable_filters:
@@ -3667,6 +3698,7 @@ def _run_test_feature(
         upload_results_to_database=args.upload_results_to_database,
         debug_artifact_streaming=args.debug,
         custom_config_set_data=getattr(args, "custom_config_set_data", None),
+        samples=getattr(args, "samples", None) or 1,
     )
     record_last_measurement(
         args.config,
