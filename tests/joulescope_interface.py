@@ -60,7 +60,7 @@ def build_single_pattern_analyzer(
     min_thd_duration_end_us: int = 250,
     min_window_duration_us: int = 500,
     profile_name: str = "current_profile",
-    unique_subwindow_labels: bool = False,
+    unique_subwindow_labels: bool = True,
     unique_first_last_subwindows: bool = True,
     zscore_threshold: float = 3,
 ) -> SinglePatternCurrentProfileAnalyzer:
