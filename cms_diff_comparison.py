@@ -623,7 +623,7 @@ def write_diff_comparison_report(report: dict[str, Any], output_path: Path) -> P
 
 
 def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
-    """Write a grouped metric report to a single-sheet workbook.
+    """Write grouped results and the corresponding SiSDK metadata sheets.
 
     Each normalized test identity contributes one row per terminal metric. Test
     and firmware-role labels are merged across their metric rows; execution
@@ -678,6 +678,7 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         cell.fill = PatternFill(fill_type="solid", fgColor="243746")
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     worksheet.row_dimensions[1].height = 30
+    sdk_sheets: dict[str, dict[str, Any]] = {}
 
     valid_records: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     for record in records:
@@ -712,11 +713,46 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
             test_name = f"{test_name}"
         role = str(identity.get("firmware_role") or "UNKNOWN").upper()
         run_details: dict[str, str] = {}
+        run_sheets: dict[str, str] = {}
         for variant_name in ("version1", "version2"):
             variant = variants[variant_name]
             provenance = variant.get("provenance")
             if not isinstance(provenance, dict):
                 provenance = {}
+            metadata = provenance.get("sisdk_metadata")
+            if isinstance(metadata, dict) and metadata.get("status") == "complete":
+                version = str(metadata.get("version") or "")
+                build = str(metadata.get("build_number") or "")
+                libraries = metadata.get("libraries")
+                if version and build.isdecimal() and isinstance(libraries, list):
+                    sheet_name = f"SiSDK_{version}_{build}"
+                    if len(sheet_name) > 31 or any(c in sheet_name for c in '[]:*?/\\'):
+                        raise ValueError(f"invalid SiSDK metadata sheet name: {sheet_name}")
+                    if sheet_name in sdk_sheets and (
+                        sdk_sheets[sheet_name].get("libraries") != libraries
+                        or sdk_sheets[sheet_name].get("conan_lock", {}).get("sha256")
+                        != metadata.get("conan_lock", {}).get("sha256")
+                    ):
+                        raise ValueError(f"conflicting metadata for {sheet_name}")
+                    if sheet_name not in sdk_sheets:
+                        sdk_sheets[sheet_name] = metadata
+                        sdk_sheet = workbook.create_sheet(sheet_name)
+                        sdk_sheet.append(["SiSDK version", version])
+                        sdk_sheet.append(["Build", build])
+                        sdk_sheet.append(["Lockfile source", metadata.get("conan_lock", {}).get("source", "")])
+                        sdk_sheet.append(["Lockfile SHA-256", metadata.get("conan_lock", {}).get("sha256", "")])
+                        sdk_sheet.append(["Library", "Version and channel", "Revision", "Timestamp"])
+                        for entry in libraries:
+                            if not isinstance(entry, str):
+                                raise ValueError(f"invalid lockfile entry for {sheet_name}")
+                            reference, separator, revision_time = entry.partition("#")
+                            library, _, package_version = reference.partition("/")
+                            revision, _, timestamp = revision_time.partition("%")
+                            sdk_sheet.append([library, package_version, revision if separator else "", timestamp])
+                        sdk_sheet.freeze_panes = "A6"
+                        for column, width in {"A": 36, "B": 40, "C": 46, "D": 22}.items():
+                            sdk_sheet.column_dimensions[column].width = width
+                    run_sheets[variant_name] = sheet_name
             sdk = provenance.get("sisdk")
             sdk_version = provenance.get("dut_sdk_version") or provenance.get("sisdk_version")
             if not sdk_version and isinstance(sdk, dict):
@@ -727,6 +763,12 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
                 or provenance.get("build_number")
             )
             run_parts = [f"SiSDK {sdk_version}" if sdk_version else "SiSDK N/A"]
+            if isinstance(metadata, dict):
+                sdk_version = metadata.get("version") or sdk_version
+                sdk_build = metadata.get("build_number") or sdk_build
+                run_parts = [f"SiSDK {sdk_version}" if sdk_version else "SiSDK N/A"]
+            if variant_name not in run_sheets:
+                run_parts.append("metadata unavailable")
             if sdk_build:
                 run_parts.append(f"Build {sdk_build}")
             run_parts.append(str(variant.get("execution_status") or "missing_result"))
@@ -821,6 +863,11 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
                 "; ".join(dict.fromkeys(reasons)),
             ]
             worksheet.append(row)
+            for variant_name, column in (("version1", 11), ("version2", 12)):
+                if variant_name in run_sheets:
+                    cell = worksheet.cell(row=worksheet.max_row, column=column)
+                    cell.hyperlink = f"#'{run_sheets[variant_name]}'!A1"
+                    cell.font = Font(color="0563C1", underline="single")
             row_fill = PatternFill(
                 fill_type="solid",
                 fgColor="EAF1F8" if (worksheet.max_row % 2) == 0 else "FFFFFF",
@@ -886,7 +933,7 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
     }
     for column, width in column_widths.items():
         worksheet.column_dimensions[column].width = width
-    worksheet.column_dimensions.group("I", "L", outline_level=1, hidden=True)
+    worksheet.column_dimensions.group("I", "J", outline_level=1, hidden=True)
     for row in worksheet.iter_rows(min_row=2):
         worksheet.row_dimensions[row[0].row].height = 22
         for cell in row:
@@ -910,8 +957,6 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         for column in status_columns:
             _apply_status_conditional_formatting(worksheet, column)
 
-    if workbook.sheetnames != [worksheet.title]:
-        raise ValueError("diff comparison workbook must contain exactly one worksheet")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(output_path)
     _validate_diff_excel_workbook(
@@ -961,8 +1006,8 @@ def _validate_diff_excel_workbook(
 
     workbook = load_workbook(output_path, data_only=True)
     try:
-        if workbook.sheetnames != ["Differential Results"]:
-            raise ValueError("saved diff comparison workbook must contain exactly one worksheet")
+        if not workbook.sheetnames or workbook.sheetnames[0] != "Differential Results":
+            raise ValueError("saved diff comparison workbook is missing results worksheet")
         worksheet = workbook["Differential Results"]
         if worksheet.max_row != expected_row_count + 1:
             raise ValueError("saved diff comparison workbook has an unexpected data row count")

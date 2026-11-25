@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 from cms_diff_comparison import (
     DifferentialPairingError,
@@ -15,7 +16,30 @@ from cms_diff_comparison import (
     render_diff_comparison_table,
     summarize_sample_values,
     write_diff_comparison_report,
+    write_diff_excel_report,
 )
+
+
+def test_workbook_links_each_result_side_to_its_sdk_metadata(tmp_path: Path) -> None:
+    record = _normalized_report_record("beacon", "PASS")
+    for side, version, build, revision in (("version1", "2026.6.1", "101", "aaaa"),
+                                           ("version2", "2026.6.2", "202", "bbbb")):
+        record[side]["provenance"]["sisdk_metadata"] = {
+            "status": "complete", "version": version, "build_number": build,
+            "libraries": [f"bluetooth/1.0@silabs/release#{revision}%123"],
+            "conan_lock": {"source": "artifactory", "sha256": revision},
+        }
+    output = write_diff_excel_report({"records": [record]}, tmp_path / "report.xlsx")
+    workbook = load_workbook(output)
+    try:
+        assert workbook.sheetnames == ["Differential Results", "SiSDK_2026.6.1_101", "SiSDK_2026.6.2_202"]
+        assert workbook["SiSDK_2026.6.1_101"]["C6"].value == "aaaa"
+        assert workbook["SiSDK_2026.6.2_202"]["C6"].value == "bbbb"
+        results = workbook["Differential Results"]
+        assert "SiSDK_2026.6.1_101" in results["K2"].hyperlink.target
+        assert "SiSDK_2026.6.2_202" in results["L2"].hyperlink.target
+    finally:
+        workbook.close()
 
 
 def _write_plan(path: Path, *, role: str = "dcdc", partition: str = "") -> None:
