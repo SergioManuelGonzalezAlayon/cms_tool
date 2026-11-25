@@ -284,6 +284,7 @@ class FirmwareData:
     sisdk_artifactory_build: str = ""
     sisdk_commit: str = ""
     sisdk_hash: str = ""
+    sisdk_metadata: dict[str, Any] = field(default_factory=dict)
     role_images: tuple[FirmwareRoleImage, ...] = ()
     vcom: dict[str, Any] = field(default_factory=dict)
 
@@ -832,6 +833,7 @@ def firmware_data_to_dict(firmware: FirmwareData) -> dict[str, Any]:
         "sisdk_artifactory_build": firmware.sisdk_artifactory_build,
         "sisdk_commit": firmware.sisdk_commit,
         "sisdk_hash": firmware.sisdk_hash,
+        "sisdk_metadata": firmware.sisdk_metadata,
     }
     if firmware.role_images:
         payload["role_images"] = [
@@ -889,6 +891,7 @@ def firmware_data_from_dict(data: dict[str, Any]) -> FirmwareData:
         sisdk_artifactory_build=str(data.get("sisdk_artifactory_build", "")),
         sisdk_commit=str(data.get("sisdk_commit", "")),
         sisdk_hash=str(data.get("sisdk_hash", "")),
+        sisdk_metadata=dict(data.get("sisdk_metadata") or {}),
         role_images=tuple(firmware_role_image_from_dict(item) for item in raw_role_images),
         vcom=dict(raw_vcom),
     )

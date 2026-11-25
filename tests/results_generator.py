@@ -693,6 +693,7 @@ def write_result_json(
             "dut_sdk_source": firmware.get("sisdk_source"),
             "dut_sdk_commit": firmware.get("sisdk_commit"),
             "dut_sdk_hash": firmware.get("sisdk_hash"),
+            "sisdk_metadata": firmware.get("sisdk_metadata", {"status": "unavailable", "reason": "metadata missing"}),
             "dut_xapi_sha256": firmware.get("xapi_file_hash"),
             "dut_chip_id": slcp_meta["chip_id"],
             "tester_sdk_name": None,

@@ -1553,6 +1553,7 @@ def _prepare_pytest_runtime(
             "sisdk_artifactory_build": session.manifest.sisdk_artifactory_build,
             "sisdk_commit": session.manifest.sisdk_commit,
             "sisdk_hash": session.manifest.sisdk_hash,
+            "sisdk_metadata": session.manifest.sisdk_metadata,
             "xapi_file_hash": session.manifest.xapi_file_hash,
             "variant": session.variant,
             "dut_image": str(active_root / session.manifest.dut_img.name),

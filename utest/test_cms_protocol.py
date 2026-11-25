@@ -43,11 +43,23 @@ from cms_protocol import (
     measurement_result_to_dict,
     measurement_summary_from_dict,
     measurement_summary_to_dict,
+    firmware_data_to_dict,
+    firmware_data_from_dict,
     test_case_identity_from_dict as case_identity_from_dict,
     test_case_identity_to_dict as case_identity_to_dict,
     test_counts_from_dict as counts_from_dict,
     test_counts_to_dict as counts_to_dict,
 )
+
+
+def test_firmware_metadata_round_trip_preserves_build_and_lockfile_entries():
+    metadata = {"version": "2026.6.2", "build_number": "3270", "status": "complete",
+                "libraries": ["bluetooth/1.0@silabs/test#abc%123"]}
+    firmware = FirmwareData(dut_img=FirmwareImage(name="dut.s37", url="dut.s37"),
+                            tester_img=FirmwareImage(name="tester.s37", url="tester.s37"),
+                            sisdk_metadata=metadata)
+    restored = firmware_data_from_dict(firmware_data_to_dict(firmware))
+    assert restored.sisdk_metadata == metadata
 
 
 def test_test_case_states_are_stable_protocol_values():

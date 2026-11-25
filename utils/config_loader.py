@@ -279,6 +279,7 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
             ),
             "sisdk_commit": fw_metadata.get("sisdk_commit") or sdk.get("commit"),
             "sisdk_hash": fw_metadata.get("sisdk_hash") or sdk.get("hash"),
+            "sisdk_metadata": fw_metadata.get("sisdk_metadata", {}),
             "xapi_file_hash": fw_metadata.get("xapi_file_hash") or sdk.get("xapi_sha256"),
         },
         "vcom": metadata.get("vcom", runtime.get("vcom", {})),

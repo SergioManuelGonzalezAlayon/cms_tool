@@ -172,6 +172,7 @@ def Config(request: pytest.FixtureRequest) -> dict:
         "sisdk_artifactory_build",
         "sisdk_commit",
         "sisdk_hash",
+        "sisdk_metadata",
         "xapi_file_hash",
     ):
         value = dev_fw.get(key)

@@ -2701,6 +2701,33 @@ def _request_from_diff_build_manifest(args: argparse.Namespace, build_root: Path
             raise RuntimeError(f"Differential {name} build manifest has no firmware artifacts")
         xapi_path = str(build.get("xapi", ""))
         xapi_hash = str(sdk.get("xapi_sha256", ""))
+        metadata = variant.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {"status": "unavailable", "reason": "build metadata missing"}
+        else:
+            metadata = dict(metadata)
+            expected_build = str(sdk.get("build_number", ""))
+            if (metadata.get("version") != sdk.get("version")
+                    or str(metadata.get("build_number", "")) != expected_build or not expected_build):
+                raise RuntimeError(f"Differential {name} SDK metadata identity does not match firmware")
+            lock = metadata.get("conan_lock")
+            if isinstance(lock, dict) and lock.get("status") == "complete":
+                try:
+                    lock_path = Path(lock["path"])
+                    if _sha256_file(lock_path) != lock.get("sha256"):
+                        raise ValueError("lockfile hash mismatch")
+                    content = json.loads(lock_path.read_text(encoding="utf-8"))
+                    entries = content["requires"]
+                    if not isinstance(entries, list) or not all(isinstance(item, str) for item in entries):
+                        raise ValueError("invalid lockfile requires")
+                    metadata["libraries"] = entries
+                    metadata["status"] = "complete"
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    metadata["status"] = "unavailable"
+                    metadata["reason"] = str(error)
+            else:
+                metadata["status"] = "unavailable"
+                metadata["reason"] = "lockfile unavailable"
         all_role_images = tuple(
             FirmwareRoleImage(
                 role=str(item.get("role", "")),
@@ -2744,6 +2771,7 @@ def _request_from_diff_build_manifest(args: argparse.Namespace, build_root: Path
             sisdk_artifactory_build=str(sdk.get("artifactory_build", "")),
             sisdk_commit=str(sdk.get("commit", "")),
             sisdk_hash=str(sdk.get("hash", "")),
+            sisdk_metadata=metadata,
             role_images=tuple(item for item in all_role_images if item.role != "bootloader"),
         )
 
