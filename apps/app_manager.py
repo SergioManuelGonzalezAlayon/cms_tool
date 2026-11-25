@@ -35,6 +35,7 @@ from apps.sisdk_manager import (
     DEFAULT_OUTPUT_ROOT,
     SlidingWindow,
     download_sdk,
+    download_conan_lock,
     load_sdk_status,
     write_sdk_status,
 )
@@ -1954,6 +1955,7 @@ def write_diff_fw_data(
     parsed: argparse.Namespace,
     client_config: dict,
     selections: dict[str, SDKSelection],
+    metadata: dict[str, dict] | None = None,
 ) -> Path:
     """Persist the two complete isolated build manifests as one diff build record."""
 
@@ -2002,6 +2004,7 @@ def write_diff_fw_data(
             "manifest_sha256": _sha256(manifest_path),
             "manifest": manifest,
             "sdk": sdk_selection_provenance(selections[variant]),
+            "metadata": (metadata or {}).get(variant, {}),
         }
 
     command = [sys.executable, str(Path(__file__).resolve()), parsed.action, *parsed.targets, "--diff"]
@@ -2648,6 +2651,44 @@ def run_firmware_action(
     return 0
 
 
+def collect_diff_sdk_metadata(selection: SDKSelection, destination: Path) -> dict:
+    """Snapshot metadata for the SDK actually selected for one diff side."""
+    release = sisdk_release_from_version(selection.version)
+    build = selection.build_number
+    if not build.isdecimal():
+        raise RuntimeError("Differential SDK metadata requires a numeric build number")
+    lock_status = download_conan_lock(release, build, DEFAULT_OUTPUT_ROOT)
+
+    descriptor = selection.path / "simplicity_sdk.slcs"
+    descriptor_bytes = None
+    descriptor_source = str(descriptor)
+    if descriptor.is_file():
+        descriptor_bytes = descriptor.read_bytes()
+    elif selection.archive_path and selection.archive_path.is_file():
+        with zipfile.ZipFile(selection.archive_path) as archive:
+            matches = [name for name in archive.namelist() if name.rstrip("/").endswith("simplicity_sdk.slcs")]
+            if len(matches) == 1:
+                descriptor_bytes = archive.read(matches[0])
+                descriptor_source = f"{selection.archive_path}!{matches[0]}"
+    destination.mkdir(parents=True, exist_ok=True)
+    result = {"version": selection.version, "release": release, "build_number": build}
+    if lock_status.get("status") == "complete":
+        snapshot = destination / "conan.lock"
+        shutil.copyfile(lock_status["path"], snapshot)
+        result["conan_lock"] = {**lock_status, "path": str(snapshot.resolve())}
+    else:
+        result["conan_lock"] = lock_status
+    if descriptor_bytes is not None:
+        snapshot = destination / "simplicity_sdk.slcs"
+        snapshot.write_bytes(descriptor_bytes)
+        result["simplicity_sdk_slcs"] = {"status": "complete", "source": descriptor_source,
+                                          "path": str(snapshot.resolve()), "sha256": _sha256(snapshot)}
+    else:
+        result["simplicity_sdk_slcs"] = {"status": "unavailable", "source": descriptor_source,
+                                          "reason": "SDK descriptor not found in package or archive"}
+    return result
+
+
 def build_diff_variants(
     parsed: argparse.Namespace,
     client_config: dict,
@@ -2676,8 +2717,10 @@ def build_diff_variants(
             sort_keys=True,
         )
     )
+    metadata = {}
     for variant in ("version1", "version2"):
         selection = selections[variant]
+        metadata[variant] = collect_diff_sdk_metadata(selection, build_root / "diff" / variant / "sdk_metadata")
         variant_values = vars(parsed).copy()
         variant_values.update(
             diff=False,
@@ -2705,6 +2748,7 @@ def build_diff_variants(
         parsed=parsed,
         client_config=client_config,
         selections=selections,
+        metadata=metadata,
     )
     print(f"Differential build manifest={diff_fw_data_path}")
     return 0

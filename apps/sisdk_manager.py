@@ -382,6 +382,39 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def download_conan_lock(version: str, build: str, output_root: Path = DEFAULT_OUTPUT_ROOT) -> dict:
+    """Download or reuse the lockfile for one exact SiSDK release and build."""
+    if not re.fullmatch(r"\d{4}\.\d+", version) or not build.isdecimal():
+        raise ValueError("SiSDK lockfile requires a release and numeric build")
+    cache = output_root / version / build
+    status_path = cache / STATUS_FILENAME
+    status = load_sdk_status(status_path)
+    if status.get("version") != version or status.get("build") != build:
+        status = {}
+    status.update({"schema_version": 1, "version": version, "build": build})
+    lock_path = cache / "conan.lock"
+    url = download_url(f"sisdk-{version}/{build}/conan.lock")
+    entry = status.get("conan_lock", {})
+    if (isinstance(entry, dict) and entry.get("status") == "complete"
+            and entry.get("source") == url and lock_path.is_file()
+            and entry.get("sha256") == _sha256_file(lock_path)):
+        return {**entry, "path": str(lock_path.resolve())}
+    try:
+        with open_artifact(url) as response:
+            content = response.read()
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("requires"), list):
+            raise ValueError("lockfile has no requires list")
+        cache.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(content)
+        entry = {"status": "complete", "source": url, "sha256": _sha256_file(lock_path)}
+    except (ArtifactoryError, OSError, ValueError) as error:
+        entry = {"status": "unavailable", "source": url, "reason": str(error)}
+    status["conan_lock"] = entry
+    write_sdk_status(status_path, status)
+    return {**entry, **({"path": str(lock_path.resolve())} if entry["status"] == "complete" else {})}
+
+
 def _write_download_status(
     status_path: Path,
     version: str,

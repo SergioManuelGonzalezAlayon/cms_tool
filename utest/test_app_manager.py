@@ -2,12 +2,31 @@ import subprocess
 import argparse
 import json
 import shutil
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from apps import app_manager, sisdk_manager
 from utils import config_loader
+
+
+def test_diff_metadata_missing_lock_and_pruned_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(app_manager, "DEFAULT_OUTPUT_ROOT", tmp_path / "cache")
+    archive = tmp_path / "sdk.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr("sdk/simplicity_sdk.slcs", "sdk_version: 2026.6.2\n")
+    selection = app_manager.SDKSelection(path=tmp_path / "pruned", version="2026.6.2", source="artifactory", build_number="3270", archive_path=archive)
+    def unavailable(url):
+        raise sisdk_manager.ArtifactoryError("not found")
+    monkeypatch.setattr(sisdk_manager, "open_artifact", unavailable)
+
+    metadata = app_manager.collect_diff_sdk_metadata(selection, tmp_path / "evidence")
+    assert metadata["conan_lock"]["status"] == "unavailable"
+    assert "not found" in metadata["conan_lock"]["reason"]
+    assert not (tmp_path / "evidence/conan.lock").exists()
+    assert Path(metadata["simplicity_sdk_slcs"]["path"]).read_text() == "sdk_version: 2026.6.2\n"
+    assert "sdk.zip!sdk/simplicity_sdk.slcs" in metadata["simplicity_sdk_slcs"]["source"]
 
 
 def test_run_accepts_noop_slc_upgrade_result(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -618,6 +637,7 @@ def test_build_diff_variants_uses_isolated_roots_and_sdk_configuration(
         "resolve_diff_sdk_selections",
         lambda config, parsed=None: selections,
     )
+    monkeypatch.setattr(app_manager, "collect_diff_sdk_metadata", lambda selection, destination: {})
     monkeypatch.setattr(
         app_manager,
         "run_firmware_action",
@@ -663,6 +683,7 @@ def test_build_diff_variants_uses_isolated_roots_and_sdk_configuration(
         "parsed": parsed,
         "client_config": client_config,
         "selections": selections,
+        "metadata": {"version1": {}, "version2": {}},
     }]
 
 
