@@ -734,6 +734,8 @@ def write_result_json(
         "test_result_window": window_rows,
         "artifact_ref": artifact_refs,
     }
+    if "variant" in firmware:
+        record["firmware"]["variant"] = firmware["variant"]
     if sample_index:
         record["test_run"]["sample_index"] = sample_index
     result_json_path.write_text(json.dumps(_json_ready(record), indent=2) + "\n", encoding="utf-8")

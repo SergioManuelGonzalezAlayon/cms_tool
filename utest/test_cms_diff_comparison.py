@@ -450,6 +450,24 @@ def test_rejects_result_with_wrong_firmware_variant(tmp_path: Path) -> None:
         pair_downloaded_differential_results(version1_root, version2_root, plan_path)
 
 
+@pytest.mark.parametrize("variant_value", [None, "", "   "], ids=["missing", "empty", "whitespace"])
+def test_rejects_result_without_nonempty_firmware_variant(
+    tmp_path: Path,
+    variant_value: str | None,
+) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+    path = version2_root / "dcdc_sample_001.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if variant_value is None:
+        payload["firmware"].pop("variant")
+    else:
+        payload["firmware"]["variant"] = variant_value
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(DifferentialPairingError, match="no non-empty 'variant' field"):
+        pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+
 @pytest.mark.parametrize(
     ("section", "field", "value", "message"),
     [

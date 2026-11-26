@@ -2,6 +2,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 from cms_protocol import (
     Artifacts,
     MeasurementResult,
@@ -59,7 +61,8 @@ def test_debug_manifest_publishes_overall_result_as_campaign(tmp_path):
     assert payload["result_type"] == "campaign"
 
 
-def test_generated_json_declares_current_measurement_result_type(tmp_path, monkeypatch):
+@pytest.mark.parametrize("variant", [None, "version1", "version2"])
+def test_generated_json_preserves_campaign_variant(tmp_path, monkeypatch, variant):
     config_path = tmp_path / "default.json"
     config_path.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(
@@ -77,6 +80,7 @@ def test_generated_json_declares_current_measurement_result_type(tmp_path, monke
         config_path=config_path,
         config_data={
             "firmware": {
+                **({"variant": variant} if variant is not None else {}),
                 "sisdk_name": "com.silabs.sdk.stack.sisdk",
                 "sisdk_version": "2025.12.3",
                 "sisdk_source": "client_config_package_path",
@@ -101,6 +105,10 @@ def test_generated_json_declares_current_measurement_result_type(tmp_path, monke
 
     payload = json.loads(result_path.read_text(encoding="utf-8"))
     assert payload["result_type"] == "current_measurement"
+    if variant is None:
+        assert "variant" not in payload["firmware"]
+    else:
+        assert payload["firmware"]["variant"] == variant
     assert payload["dataset"]["sdk_name"] == "com.silabs.sdk.stack.sisdk"
     assert payload["dataset"]["sdk_version"] == "2025.12.3"
     assert payload["firmware"]["dut_sdk_source"] == "client_config_package_path"

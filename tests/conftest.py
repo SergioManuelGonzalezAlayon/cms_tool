@@ -173,6 +173,7 @@ def Config(request: pytest.FixtureRequest) -> dict:
         "sisdk_commit",
         "sisdk_hash",
         "sisdk_metadata",
+        "variant",
         "xapi_file_hash",
     ):
         value = dev_fw.get(key)

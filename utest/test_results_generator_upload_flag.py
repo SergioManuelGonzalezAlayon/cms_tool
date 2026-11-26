@@ -1,6 +1,7 @@
+import importlib.util
 import json
 from pathlib import Path
-import importlib.util
+from types import SimpleNamespace
 
 import pytest
 
@@ -71,6 +72,49 @@ def test_cms_pytest_fixture_disables_environment_upload_without_opt_in(monkeypat
     tests_conftest.ResultGeneratorFixture.__wrapped__(Request())
 
     assert captured["upload_results_to_database"] is False
+
+
+def test_cms_config_fixture_copies_differential_variant(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config_path = Path("tests/configs/ble/beacon/default.json")
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps({"firmware": {"dut_slcp": "apps/ncp_ble_dut_dcdc.slcp"}}),
+        encoding="utf-8",
+    )
+    runtime_path = tmp_path / "cms_bench_runtime.json"
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "devices": {
+                    "board": "brd4182a",
+                    "board_rev": "b06",
+                    "device": "EFR32MG22",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    metadata_path = tmp_path / "cms_fw_metadata.json"
+    metadata_path.write_text(json.dumps({"variant": "version1"}), encoding="utf-8")
+
+    class RequestConfig:
+        def getoption(self, option):
+            return {
+                "--cfg": "default.json",
+                "--cms-runtime-config": str(runtime_path),
+                "--cms-fw-metadata": str(metadata_path),
+                "--cms-dut-role": None,
+            }[option]
+
+    request = SimpleNamespace(
+        config=RequestConfig(),
+        node=SimpleNamespace(nodeid="tests/ble.py::test_beacon"),
+    )
+
+    config = tests_conftest.Config.__wrapped__(request)
+
+    assert config["firmware"]["variant"] == "version1"
 
 
 def test_result_generator_records_upload_phase_failure(tmp_path, monkeypatch):

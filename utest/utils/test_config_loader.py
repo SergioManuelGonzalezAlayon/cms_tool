@@ -62,6 +62,7 @@ def test_effective_dev_config_accepts_pytest_string_paths(tmp_path: Path) -> Non
     metadata_path.write_text(
         json.dumps(
             {
+                "variant": "version1",
                 "firmware": {"sisdk": "2025.12.3"},
                 "vcom": {
                     "enabled": True,
@@ -83,6 +84,7 @@ def test_effective_dev_config_accepts_pytest_string_paths(tmp_path: Path) -> Non
     assert config["tools"]["commander"] == "/opt/silabs/commander"
     assert config["tools"]["jlink_library"] == "/opt/silabs/libjlinkarm.so"
     assert config["firmware"]["board"] == "brd4182a"
+    assert config["firmware"]["variant"] == "version1"
     assert config["bench"]["bench_id"] == "cms-bench-001"
     assert config["firmware"]["sisdk"] == "2025.12.3"
     assert config["firmware"]["sisdk_name"] == "com.silabs.sdk.stack.sisdk"

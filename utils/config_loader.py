@@ -250,6 +250,7 @@ def effective_dev_config(*, runtime_path=None, metadata_path=None) -> dict:
             "profile": bench.get("profile"),
         },
         "firmware": {
+            "variant": fw_metadata.get("variant") or metadata.get("variant"),
             "build_root": fw_metadata.get("build_root"),
             "provision_state_root": fw_metadata.get("provision_state_root"),
             "bootloader_image": fw_metadata.get("bootloader_image"),
