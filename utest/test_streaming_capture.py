@@ -17,7 +17,7 @@ import instruments.joulescope.read_pyjoulescope_driver as driver_module
 import pipeline.streaming as streaming
 import results_generator as result_generation
 from algorithms.single_pattern_analysis import SinglePatternCurrentProfileAnalyzer
-from joulescope_interface import WakePinJoulescope
+from joulescope_interface import JoulescopeConfig, WakePinJoulescope
 from pipeline.sequential import AnalysisConfig, OutputConfig, ProfileResult
 from results_generator import StreamingProfileConfig
 
@@ -216,6 +216,8 @@ def session_source(monkeypatch, output):
         duration=1.0,
         frequency=SAMPLE_RATE,
         open_mode="defaults",
+        vref=JoulescopeConfig().vref,
+        irange=JoulescopeConfig().irange,
     )
     js.create_driver()
     js.open_devices()
@@ -227,6 +229,37 @@ def session_source(monkeypatch, output):
         yield js, driver, reads
     finally:
         js.close_driver()
+
+
+def test_streaming_session_uses_external_vref_and_18ma_irange_defaults(
+    monkeypatch, session_source,
+):
+    js, _driver, _reads = session_source
+    captured = {}
+    result = SimpleNamespace(
+        consolidated_csv=None,
+        deep_dive_csv=None,
+        html_report=None,
+        outlier_plot=None,
+        event_stats={},
+        interval_stats={},
+        subevent_stats={},
+    )
+
+    class CaptureSession:
+        def __init__(self, *, capture, **_kwargs):
+            captured["capture"] = capture
+
+        def run(self, on_progress=None):
+            return result
+
+    monkeypatch.setattr(streaming, "StreamingPowerProfileSession", CaptureSession)
+
+    assert JoulescopeConfig().vref == "external"
+    assert JoulescopeConfig().irange == "18mA"
+    assert js.startPowerProfilingSession(0.01) is result
+    assert captured["capture"].vref == "external"
+    assert captured["capture"].irange == "18mA"
 
 
 @pytest.fixture

@@ -440,9 +440,9 @@ class JoulescopeConfig:
     duration: str | float = 1
     frequency: int = 1_000_000
     open_mode: str = "defaults"
-    vref: str = "3v3"
+    vref: str = "external"
     post_process: str = "profile"
-    irange: str = "auto"
+    irange: str = "18mA"
     use_wake_pin: bool = True
     dut_sleep_settle_ms: float = 500
     dut_wake_gpio: int = DUT_WAKE_GPIO
