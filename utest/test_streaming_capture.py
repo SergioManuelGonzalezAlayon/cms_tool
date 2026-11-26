@@ -256,10 +256,10 @@ def test_streaming_session_uses_external_vref_and_18ma_irange_defaults(
     monkeypatch.setattr(streaming, "StreamingPowerProfileSession", CaptureSession)
 
     assert JoulescopeConfig().vref == "external"
-    assert JoulescopeConfig().irange == "18mA"
+    assert JoulescopeConfig().irange == "18 mA"
     assert js.startPowerProfilingSession(0.01) is result
     assert captured["capture"].vref == "external"
-    assert captured["capture"].irange == "18mA"
+    assert captured["capture"].irange == "18 mA"
 
 
 @pytest.fixture
