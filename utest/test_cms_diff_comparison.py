@@ -22,6 +22,8 @@ from cms_diff_comparison import (
 
 def test_workbook_links_each_result_side_to_its_sdk_metadata(tmp_path: Path) -> None:
     record = _normalized_report_record("beacon", "PASS")
+    record["version1"]["test_configuration"] = {"advertiser": {"interval": 200, "tx_power": 0}}
+    record["version1"]["artifact_path"] = "version1/result.json"
     for side, version, build, revision in (("version1", "2026.6.1", "101", "aaaa"),
                                            ("version2", "2026.6.2", "202", "bbbb")):
         record[side]["provenance"]["sisdk_metadata"] = {
@@ -32,12 +34,16 @@ def test_workbook_links_each_result_side_to_its_sdk_metadata(tmp_path: Path) -> 
     output = write_diff_excel_report({"records": [record]}, tmp_path / "report.xlsx")
     workbook = load_workbook(output)
     try:
-        assert workbook.sheetnames == ["Differential Results", "SiSDK_2026.6.1_101", "SiSDK_2026.6.2_202"]
+        assert workbook.sheetnames == ["Differential Results", "Comparison rules", "SiSDK_2026.6.1_101", "SiSDK_2026.6.2_202"]
         assert workbook["SiSDK_2026.6.1_101"]["C6"].value == "aaaa"
         assert workbook["SiSDK_2026.6.2_202"]["C6"].value == "bbbb"
         results = workbook["Differential Results"]
         assert "SiSDK_2026.6.1_101" in results["K2"].hyperlink.target
         assert "SiSDK_2026.6.2_202" in results["L2"].hyperlink.target
+        assert '"interval": 200' in results["N2"].value
+        assert "V2: configuration unavailable" in results["N2"].value
+        assert "version1/result.json" in results["O2"].value
+        assert "V2 − V1" in workbook["Comparison rules"]["B1"].value
     finally:
         workbook.close()
 
@@ -376,6 +382,26 @@ def test_incomplete_sample_metric_cannot_be_classified_pass(tmp_path: Path) -> N
     version2_sleep = dcdc_report["version2"]["metrics"]["sleep_current_ma"]
     assert version2_sleep["available"] is False
     assert version2_sleep["availability_reason"] == "incomplete_sample_metric_set"
+
+
+def test_sampled_pairing_uses_plan_partition_when_result_partition_is_null(
+    tmp_path: Path,
+) -> None:
+    version1_root, version2_root, plan_path = _write_sampled_campaign(tmp_path, samples=2)
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    for job in plan["jobs"]:
+        job["partition"] = "planned-partition"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    for root in (version1_root, version2_root):
+        for path in root.glob("*.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["dataset"]["partition"] = None
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+    pairing = pair_downloaded_differential_results(version1_root, version2_root, plan_path)
+
+    assert {pair.identity.partition for pair in pairing.pairs} == {"planned-partition"}
 
 
 def test_rejects_incomplete_sample_set(tmp_path: Path) -> None:

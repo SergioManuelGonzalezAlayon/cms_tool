@@ -708,6 +708,8 @@ def write_result_json(
             "tx_payload_length_bytes": advertiser.get("payload") or connection.get("tx_payload_length"),
             "rx_payload_length_bytes": connection.get("rx_payload_length") or pawr.get("rx_payload_length"),
         },
+        "test_configuration": {key: value for key, value in config_data.items()
+                               if key not in ("firmware", "bench")},
         "result_metric": {
             "avg_current_ma": avg_current_ma,
             "peak_current_ma": peak_current_ma,

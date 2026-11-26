@@ -666,6 +666,8 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         "V1 Run",
         "V2 Run",
         "Reason",
+        "Configuration",
+        "Measurement evidence",
     )
 
     workbook = Workbook()
@@ -678,6 +680,16 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         cell.fill = PatternFill(fill_type="solid", fgColor="243746")
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     worksheet.row_dimensions[1].height = 30
+    rules = workbook.create_sheet("Comparison rules")
+    thresholds = report.get("thresholds") or {}
+    rules.append(["Comparison", "Change (%) = 100 × (V2 − V1) / V1; V1 is the baseline."])
+    rules.append(["Warning", f"Increase ≥ {thresholds.get('warning_percent', 1.5)}% and below the failure threshold."])
+    rules.append(["Failure", f"Increase ≥ {thresholds.get('failure_percent', 2.0)}%, or absolute change ≥ 10%."])
+    rules.append(["Pass", "All other available changes."])
+    rules.append(["Unavailable", "A zero baseline or missing metric prevents comparison."])
+    rules.append(["Evidence", "Result paths identify the measurement evidence for each side."])
+    rules.column_dimensions["A"].width = 20
+    rules.column_dimensions["B"].width = 90
     sdk_sheets: dict[str, dict[str, Any]] = {}
 
     valid_records: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
@@ -861,6 +873,14 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
                 run_details["version1"],
                 run_details["version2"],
                 "; ".join(dict.fromkeys(reasons)),
+                "\n".join(
+                    f"{label}: {json.dumps(variants[name].get('test_configuration'), sort_keys=True)}"
+                    if isinstance(variants[name].get('test_configuration'), dict)
+                    else f"{label}: configuration unavailable"
+                    for name, label in (("version1", "V1"), ("version2", "V2"))
+                ),
+                "\n".join(f"{label}: {variants[name].get('artifact_path') or 'unavailable'}"
+                          for name, label in (("version1", "V1"), ("version2", "V2"))),
             ]
             worksheet.append(row)
             for variant_name, column in (("version1", 11), ("version2", 12)):
@@ -930,14 +950,18 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
         "K": 36,
         "L": 36,
         "M": 42,
+        "N": 70,
+        "O": 70,
     }
     for column, width in column_widths.items():
         worksheet.column_dimensions[column].width = width
     worksheet.column_dimensions.group("I", "J", outline_level=1, hidden=True)
     for row in worksheet.iter_rows(min_row=2):
-        worksheet.row_dimensions[row[0].row].height = 22
+        worksheet.row_dimensions[row[0].row].height = 60
         for cell in row:
             cell.alignment = Alignment(vertical="center")
+        for cell in row[13:15]:
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
     for start_row, end_row in mode_ranges:
         worksheet.cell(row=start_row, column=2).alignment = Alignment(
             horizontal="center", vertical="center", wrap_text=True
@@ -1498,6 +1522,7 @@ def _report_variant_input(result: VariantResult) -> dict[str, Any]:
         "measured_at": test_run.get("measured_at"),
         "cms_bench_id": storage.get("cms_bench_id"),
         "provenance": result.payload.get("firmware", {}),
+        "test_configuration": result.payload.get("test_configuration"),
         **(
             {"sample_count": result.sample_count}
             if result.sample_count is not None
@@ -1929,9 +1954,11 @@ def _validate_differential_sample_sets(
             samples_for_identity.add(sample_index)
 
             partition, planned_board, _, planned_supply = planned_metadata
-            observed_partition = _text_or_empty(dataset, "partition", source=str(path))
-            if observed_partition != partition:
-                raise DifferentialPairingError(f"{path} partition does not match its paired-plan job")
+            raw_partition = dataset.get("partition")
+            if raw_partition is not None:
+                observed_partition = _text_or_empty(dataset, "partition", source=str(path))
+                if observed_partition != partition:
+                    raise DifferentialPairingError(f"{path} partition does not match its paired-plan job")
             board = _required_text(firmware, "board", source=str(path))
             device = _required_text(firmware, "device", source=str(path))
             if planned_board and board != planned_board:
