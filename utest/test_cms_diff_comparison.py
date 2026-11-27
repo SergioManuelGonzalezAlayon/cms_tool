@@ -144,8 +144,12 @@ def _write_sampled_result(
     path.parent.mkdir(parents=True, exist_ok=True)
     scale = 1.0 if variant == "version1" else 1.1
     interval_current = float(sample_index * 2 - 1) * scale
+    avg_current = float(sample_index + 1) * scale
+    peak_current = float(sample_index * 2 + 8) * scale
     event_energy = float(10 + (sample_index - 1) * 4) * scale
     interval_energy = float(20 + (sample_index - 1) * 4) * scale
+    rx_current = None if role == "dcdc" else float(sample_index + 2) * scale
+    tx_current = None if role == "dcdc" else float(sample_index + 3) * scale
     path.write_text(
         json.dumps(
             {
@@ -169,6 +173,18 @@ def _write_sampled_result(
                     "dut_sdk_version": sdk_version,
                 },
                 "parameters": {"supply_voltage_v": 3.3},
+                "result_metric": {
+                    "avg_current_ma": avg_current,
+                    "peak_current_ma": peak_current,
+                    "rx_current_ma": rx_current,
+                    "tx_current_ma": tx_current,
+                    "metric_status": {
+                        "avg_current_ma": "measured",
+                        "peak_current_ma": "measured",
+                        "rx_current_ma": "unavailable" if rx_current is None else "measured",
+                        "tx_current_ma": "unavailable" if tx_current is None else "measured",
+                    },
+                },
                 "result_summary": [
                     {"meas_type": "Event", "e_mean_nj": event_energy},
                     {
@@ -310,8 +326,19 @@ def test_aggregates_samples_and_reports_statistics(tmp_path: Path) -> None:
         for metric in inputs.metrics
         if metric.identity.firmware_role == "dcdc"
     }
+    no_dcdc_metrics = {
+        metric.variable: metric
+        for metric in inputs.metrics
+        if metric.identity.firmware_role == "no_dcdc"
+    }
     sleep = dcdc_metrics["sleep_current_ma"]
+    avg = dcdc_metrics["avg_current_ma"]
+    peak = dcdc_metrics["peak_current_ma"]
     assert dcdc_pair.version1.sample_count == 2
+    assert avg.version1_value == pytest.approx(2.5)
+    assert avg.version2_value == pytest.approx(2.75)
+    assert peak.version1_value == pytest.approx(11.0)
+    assert peak.version2_value == pytest.approx(12.1)
     assert sleep.version1_value == pytest.approx(2.0)
     assert sleep.version2_value == pytest.approx(2.2)
     assert sleep.version1_statistics == SampleStatistics(
@@ -343,6 +370,44 @@ def test_aggregates_samples_and_reports_statistics(tmp_path: Path) -> None:
         "maximum": 3.0,
     }
     assert dcdc_report["version1"]["sample_count"] == 2
+    assert set(dcdc_report["version1"]["metrics"]) == {
+        "avg_current_ma",
+        "peak_current_ma",
+        "rx_current_ma",
+        "tx_current_ma",
+        "sleep_current_ma",
+        "event_energy_nj",
+        "interval_energy_nj",
+    }
+    assert dcdc_report["version1"]["metrics"]["rx_current_ma"] == {
+        "value": None,
+        "available": False,
+        "availability_reason": "unavailable",
+    }
+    assert set(no_dcdc_metrics) == {
+        "avg_current_ma",
+        "peak_current_ma",
+        "rx_current_ma",
+        "tx_current_ma",
+        "sleep_current_ma",
+        "event_energy_nj",
+        "interval_energy_nj",
+    }
+    assert all(
+        dcdc_report[variant]["metrics"][variable]["available"] is False
+        for variant in ("version1", "version2")
+        for variable in ("rx_current_ma", "tx_current_ma")
+    )
+    assert not any(
+        diagnostic["variable"] in {"rx_current_ma", "tx_current_ma"}
+        for diagnostic in dcdc_report["diagnostics"]
+    )
+    no_dcdc_report = next(
+        record for record in report["records"]
+        if record["identity"]["firmware_role"] == "no_dcdc"
+    )
+    assert no_dcdc_report["version1"]["metrics"]["rx_current_ma"]["value"] == pytest.approx(3.5)
+    assert no_dcdc_report["version2"]["metrics"]["tx_current_ma"]["value"] == pytest.approx(4.95)
 
     terminal = render_diff_comparison_table(report)
     assert "2.2" in terminal
@@ -362,6 +427,8 @@ def test_incomplete_sample_metric_cannot_be_classified_pass(tmp_path: Path) -> N
             entry for entry in sample_payload["result_summary"]
             if entry["meas_type"] == "Interval"
         )
+        sample_payload["result_metric"]["avg_current_ma"] = float(sample_index + 1)
+        sample_payload["result_metric"]["peak_current_ma"] = float(sample_index * 2 + 8)
         event["e_mean_nj"] = float(10 + sample_offset * 4)
         interval["e_mean_nj"] = float(20 + sample_offset * 4)
         if sample_index == 2:

@@ -299,7 +299,7 @@ def _sample_statistics_to_dict(summary: SampleStatistics | None) -> dict[str, An
 def _aggregate_sample_results(
     results: list[VariantResult], sample_count: int
 ) -> list[VariantResult]:
-    """Aggregate the result-summary metrics for each validated sample identity."""
+    """Aggregate all differential metrics for each validated sample identity."""
 
     grouped: dict[PairingIdentity, list[VariantResult]] = {}
     for result in results:
@@ -315,22 +315,30 @@ def _aggregate_sample_results(
         ordered_samples = sorted(samples, key=_sample_result_index)
         statistics_by_metric: dict[str, SampleStatistics] = {}
         issues_by_metric: dict[str, str] = {}
-        for variable, (meas_type, field) in _SAMPLED_SUMMARY_METRICS.items():
+        for variable in _METRIC_FIELDS:
             values: list[float] = []
             issues: list[str] = []
             for result in ordered_samples:
                 try:
-                    summary = _summary_entry(result.payload, meas_type)
-                    if summary is None:
-                        issues.append(f"missing_{meas_type.lower()}_summary")
-                    elif field not in summary:
-                        issues.append("missing_metric")
+                    omission_reason = _metric_omission_reason(result.payload, variable)
+                    if omission_reason is not None:
+                        issues.append(omission_reason)
+                        continue
+
+                    if variable in _SAMPLED_SUMMARY_METRICS:
+                        value = _summary_metric(
+                            result.payload, *_SAMPLED_SUMMARY_METRICS[variable]
+                        )
                     else:
-                        value = _optional_number(summary, field)
-                        if value is None:
-                            issues.append("null_metric")
-                        else:
-                            values.append(value)
+                        result_metric = result.payload.get("result_metric")
+                        if not isinstance(result_metric, dict):
+                            issues.append("missing_result_metric")
+                            continue
+                        value = _optional_number(result_metric, variable)
+                    if value is None:
+                        issues.append("null_metric")
+                    else:
+                        values.append(value)
                 except ResultMetricParseError as exc:
                     issues.append(str(exc))
 
@@ -398,11 +406,17 @@ def prepare_comparison_inputs(pairing: PairingResult) -> ComparisonInputs:
             version2_statistics = dict(pair.version2.sample_statistics)
             version1_issues = dict(pair.version1.sample_metric_issues)
             version2_issues = dict(pair.version2.sample_metric_issues)
-            for variable in _SAMPLED_SUMMARY_METRICS:
+            for variable in _METRIC_FIELDS:
                 first = version1_statistics.get(variable)
                 second = version2_statistics.get(variable)
                 first_issue = version1_issues.get(variable)
                 second_issue = version2_issues.get(variable)
+                if (
+                    first is None
+                    and second is None
+                    and first_issue == second_issue == "marked_unavailable"
+                ):
+                    continue
                 if (
                     variable in {"event_energy_nj", "interval_energy_nj"}
                     and first is None
@@ -1540,7 +1554,7 @@ def _report_variant_metrics(result: VariantResult) -> dict[str, dict[str, Any]]:
         statistics_by_metric = dict(result.sample_statistics)
         issues_by_metric = dict(result.sample_metric_issues)
         observations: dict[str, dict[str, Any]] = {}
-        for variable in _SAMPLED_SUMMARY_METRICS:
+        for variable in _METRIC_FIELDS:
             summary = statistics_by_metric.get(variable)
             if summary is not None:
                 observations[variable] = {
@@ -1549,12 +1563,17 @@ def _report_variant_metrics(result: VariantResult) -> dict[str, dict[str, Any]]:
                     "availability_reason": None,
                 }
             else:
+                availability_reason = issues_by_metric.get(
+                    variable, "missing_sample_statistics"
+                )
+                if availability_reason == "marked_unavailable":
+                    availability_reason = _metric_status_reason(
+                        result.payload, variable
+                    ) or availability_reason
                 observations[variable] = {
                     "value": None,
                     "available": False,
-                    "availability_reason": issues_by_metric.get(
-                        variable, "missing_sample_statistics"
-                    ),
+                    "availability_reason": availability_reason,
                 }
         return observations
 
@@ -1594,12 +1613,8 @@ def _report_variant_metrics(result: VariantResult) -> dict[str, dict[str, Any]]:
             }
             continue
 
-        if reason == "marked_unavailable" and isinstance(result_metric, dict):
-            metric_status = result_metric.get("metric_status")
-            if isinstance(metric_status, dict):
-                status = metric_status.get(variable)
-                if isinstance(status, str) and status:
-                    reason = status
+        if reason == "marked_unavailable":
+            reason = _metric_status_reason(payload, variable) or reason
         observations[variable] = {
             "value": None,
             "available": False,
@@ -1709,6 +1724,17 @@ def _metric_omission_reason(payload: dict[str, Any], variable: str) -> str | Non
     if result_metric[variable] is None:
         return "null_metric"
     return None
+
+
+def _metric_status_reason(payload: dict[str, Any], variable: str) -> str | None:
+    result_metric = payload.get("result_metric")
+    if not isinstance(result_metric, dict):
+        return None
+    metric_status = result_metric.get("metric_status")
+    if not isinstance(metric_status, dict):
+        return None
+    status = metric_status.get(variable)
+    return status if isinstance(status, str) and status else None
 
 
 def _omission_diagnostic(
