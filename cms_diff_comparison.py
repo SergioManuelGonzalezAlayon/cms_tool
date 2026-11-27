@@ -819,15 +819,8 @@ def write_diff_excel_report(report: dict[str, Any], output_path: Path) -> Path:
             for metric in record.get("metrics", [])
             if isinstance(metric, dict)
         }
-        sampled_record = any(
-            variant.get("sample_count") is not None for variant in variants.values()
-        )
         record_start_row = worksheet.max_row + 1
-        metric_order = (
-            tuple(_SAMPLED_SUMMARY_METRICS)
-            if sampled_record
-            else _TABLE_METRIC_ORDER
-        )
+        metric_order = _TABLE_METRIC_ORDER
         for variable in metric_order:
             row_key = (identity_key, variable)
             if row_key in row_keys:
@@ -1187,14 +1180,8 @@ def render_diff_comparison_table(report: dict[str, Any]) -> str:
             name: record.get(name) if isinstance(record.get(name), dict) else {}
             for name in ("version1", "version2")
         }
-        sampled = any(variant.get("sample_count") is not None for variant in variants.values())
         table_rows: list[tuple[str, ...]] = []
-        metric_order = (
-            tuple(_SAMPLED_SUMMARY_METRICS)
-            if sampled
-            else _TABLE_METRIC_ORDER
-        )
-        for variable in metric_order:
+        for variable in _TABLE_METRIC_ORDER:
             comparison = comparisons.get(variable, {})
             version2_value, version2_reason = _normalized_metric_observation(
                 variants["version2"], variable, comparison, "version2", "V2"
@@ -1452,7 +1439,7 @@ def _format_status(status: str) -> str:
         "PASS": "✓ PASS",
         "WARNING": "! WARN",
         "FAIL": "✗ FAIL",
-        "UNAVAILABLE": "— N/A",
+        "UNAVAILABLE": "UNAVAILABLE",
     }.get(status, status)
 
 

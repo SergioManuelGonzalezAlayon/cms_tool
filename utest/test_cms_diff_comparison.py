@@ -410,7 +410,48 @@ def test_aggregates_samples_and_reports_statistics(tmp_path: Path) -> None:
     assert no_dcdc_report["version2"]["metrics"]["tx_current_ma"]["value"] == pytest.approx(4.95)
 
     terminal = render_diff_comparison_table(report)
-    assert "2.2" in terminal
+    metric_labels = [
+        "avg [mA]",
+        "peak [mA]",
+        "rx [mA]",
+        "tx [mA]",
+        "sleep [mA]",
+        "event [nJ]",
+        "interval [nJ]",
+    ]
+    assert all(terminal.count(label) == 2 for label in metric_labels)
+    assert [terminal.index(label) for label in metric_labels] == sorted(
+        terminal.index(label) for label in metric_labels
+    )
+    assert terminal.count("UNAVAILABLE") == 2
+
+    workbook_path = write_diff_excel_report(report, tmp_path / "sampled-report.xlsx")
+    workbook = load_workbook(workbook_path)
+    try:
+        rows = list(
+            workbook["Differential Results"].iter_rows(
+                min_row=2, max_col=9, values_only=True
+            )
+        )
+        expected_excel_metrics = [
+            "avg [mA]",
+            "peak [mA]",
+            "rx [mA]",
+            "tx [mA]",
+            "sleep [mA]",
+            "event [nJ]",
+            "interval [nJ]",
+        ]
+        assert len(rows) == 14
+        assert [row[2] for row in rows[:7]] == expected_excel_metrics
+        assert [row[2] for row in rows[7:]] == expected_excel_metrics
+        assert rows[0][1] == "DCDC"
+        assert rows[7][1] == "NO_DCDC"
+        for row in (rows[2], rows[3]):
+            assert row[3:7] == ("N/A", "N/A", "N/A", "N/A")
+            assert row[7] == "UNAVAILABLE"
+    finally:
+        workbook.close()
 
 
 def test_incomplete_sample_metric_cannot_be_classified_pass(tmp_path: Path) -> None:
